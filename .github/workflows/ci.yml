@@ -1,7 +1,9 @@
-name: Deploy to production
+name: CI
 
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -10,15 +12,130 @@ on:
         required: false
         default: 'main'
 
-concurrency:
-  group: deploy-prod
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
+  laravel:
+    name: Laravel — composer test + vite build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: bexlogs
+          POSTGRES_USER: bexlogs
+          POSTGRES_PASSWORD: bexlogs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bexlogs -d bexlogs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    defaults:
+      run:
+        working-directory: laravel
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          tools: composer:v2
+          extensions: pdo_pgsql, intl, zip, bcmath, pcntl, sockets
+          coverage: none
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: laravel/package-lock.json
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Install Node dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Copy environment
+        run: cp .env.example .env
+
+      - name: Generate APP_KEY
+        run: php artisan key:generate
+
+      - name: Migrate
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: bexlogs
+          DB_USERNAME: bexlogs
+          DB_PASSWORD: bexlogs
+        run: php artisan migrate --force
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run composer test
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: bexlogs
+          DB_USERNAME: bexlogs
+          DB_PASSWORD: bexlogs
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+        run: composer test
+
+  scraper:
+    name: Scraper — typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: scraper
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: scraper/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
   deploy:
     name: Pull, build, redeploy
+    needs: [laravel, scraper]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, linux, bexlogs]
     timeout-minutes: 25
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
 
     env:
       APP_DIR: /opt/bexlogs
