@@ -60,6 +60,11 @@ ARG VITE_REVERB_SCHEME=https
 ARG VITE_APP_NAME=BexLogs
 
 COPY --from=mlocati/php-extension-installer:2 /usr/bin/install-php-extensions /usr/local/bin/
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+ENV COMPOSER_ALLOW_SUPERUSER=1 \
+    COMPOSER_NO_INTERACTION=1 \
+    COMPOSER_HOME=/tmp/composer
 
 RUN apk add --no-cache nodejs npm git unzip \
     && install-php-extensions intl zip bcmath
@@ -73,11 +78,17 @@ RUN npm ci --no-audit --no-fund
 COPY laravel/ ./
 COPY --from=vendor /app/vendor ./vendor
 
-# Build-time .env. We need APP_KEY for Laravel to boot (wayfinder:generate
-# boots the container to discover routes) and neutral drivers so nothing
-# tries to open a DB/Redis/mail connection during static route discovery.
-# APP_KEY value is never used for encryption at build time — it just needs
-# to exist and parse as base64.
+# The vendor stage ran `composer install --no-autoloader` because it
+# didn't have the app source yet. Now that we have both vendor and app
+# source in the same tree, regenerate a real autoloader so `php artisan`
+# can boot Laravel and discover routes.
+RUN composer dump-autoload --no-scripts --no-interaction
+
+# Build-time .env. Laravel refuses to boot without APP_KEY, and
+# wayfinder:generate boots the container to discover routes. We use
+# neutral drivers (array/sync/log/sqlite) so route discovery can't
+# accidentally open a DB/Redis/mail connection during build.
+# APP_KEY is never used for actual encryption at build time.
 RUN printf '%s\n' \
         "APP_NAME=${VITE_APP_NAME}" \
         "APP_ENV=production" \
