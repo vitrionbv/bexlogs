@@ -7,7 +7,7 @@ import {
     Pause,
     RefreshCw,
 } from 'lucide-vue-next';
-import { computed, onMounted, onBeforeUnmount } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import {
     SidebarGroup,
     SidebarGroupAction,
@@ -28,6 +28,7 @@ type RecentJob = {
     completed_at: string | null;
     error: string | null;
     rows: number | null;
+    rows_received: number | null;
 };
 
 type JobSummary = {
@@ -44,10 +45,20 @@ type JobSummary = {
 
 const page = usePage();
 
-const summary = computed<JobSummary | null>(() => (page.props as any).jobSummary ?? null);
+const summaryLocal = ref<JobSummary | null>(null);
 
-const counts = computed(() => summary.value?.counts ?? { queued: 0, running: 0, completed_24h: 0, failed: 0 });
-const recent = computed(() => summary.value?.recent ?? []);
+watch(
+    () => (page.props as { jobSummary?: JobSummary | null }).jobSummary,
+    (s) => {
+        summaryLocal.value = s
+            ? (JSON.parse(JSON.stringify(s)) as JobSummary)
+            : null;
+    },
+    { immediate: true, deep: true },
+);
+
+const counts = computed(() => summaryLocal.value?.counts ?? { queued: 0, running: 0, completed_24h: 0, failed: 0 });
+const recent = computed(() => summaryLocal.value?.recent ?? []);
 
 const STATUS_META = {
     queued: { label: 'queued', variant: 'secondary' as const, icon: Pause },
@@ -64,8 +75,74 @@ function refresh() {
     router.reload({ only: ['jobSummary'] });
 }
 
+function compactSidebar(n: number): string {
+    if (n >= 1_000_000) {
+        return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+    }
+
+    if (n >= 1000) {
+        return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+    }
+
+    return String(n);
+}
+
+function runningRowsHint(job: RecentJob): string {
+    if (job.status !== 'running') {
+        return '';
+    }
+
+    if (job.rows != null && job.rows_received != null && job.rows_received > job.rows) {
+        return `${compactSidebar(job.rows)}/${compactSidebar(job.rows_received)}`;
+    }
+
+    if (job.rows != null) {
+        return compactSidebar(job.rows);
+    }
+
+    return '';
+}
+
 useUserChannel({
-    'scrape-job-updated': () => refresh(),
+    'scrape-job-updated': (payload: Record<string, unknown>) => {
+        const jobId = payload.job_id;
+        const rawStats = payload.stats;
+        const status = payload.status as RecentJob['status'] | undefined;
+
+        if (typeof jobId === 'number' && rawStats && typeof rawStats === 'object' && summaryLocal.value) {
+            const stats = rawStats as {
+                rows?: number;
+                rows_inserted?: number;
+                rows_received?: number;
+            };
+            const row = summaryLocal.value.recent.find((j) => j.id === jobId);
+
+            if (row) {
+                if (status === 'running' && typeof stats.rows_inserted === 'number') {
+                    row.rows = stats.rows_inserted;
+                } else if (typeof stats.rows === 'number') {
+                    row.rows = stats.rows;
+                }
+
+                if (typeof stats.rows_received === 'number') {
+                    row.rows_received = stats.rows_received;
+                }
+
+                if (status) {
+                    row.status = status;
+                }
+
+                summaryLocal.value = {
+                    ...summaryLocal.value,
+                    recent: [...summaryLocal.value.recent],
+                };
+
+                return;
+            }
+        }
+
+        refresh();
+    },
     'log-batch-inserted': () => refresh(),
 });
 
@@ -168,8 +245,9 @@ return `${hr}h`;
                                 />
                                 <span class="min-w-0 flex-1 truncate text-xs">{{ job.subscription_name }}</span>
                             </div>
-                            <span class="text-muted-foreground shrink-0 text-[10px] tabular-nums">
-                                {{ relative(job.completed_at ?? job.created_at) }}
+                            <span class="text-muted-foreground shrink-0 text-[10px] tabular-nums text-right leading-tight">
+                                <span v-if="runningRowsHint(job)" class="block">{{ runningRowsHint(job) }}</span>
+                                <span class="block">{{ relative(job.completed_at ?? job.created_at) }}</span>
                             </span>
                         </Link>
                     </SidebarMenuButton>

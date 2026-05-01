@@ -98,7 +98,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             log.warn('no rows on initial page — selector resolution may need an update', initial.diagnostics);
         }
 
-        const initialStats = await flushRows(job, initial.rows, (n) => (rowCount += n));
+        const initialStats = await flushRows(job, initial.rows, (n) => (rowCount += n), 1);
         totalDuplicatesObserved += initialStats.duplicates;
         pageCount++;
 
@@ -257,7 +257,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     rows: rows.length,
                 });
             }
-            const pageStats = await flushRows(job, rows, (n) => (rowCount += n));
+            const pageStats = await flushRows(job, rows, (n) => (rowCount += n), pageCount + 1);
             pageCount++;
 
             // Track duplicate-density to detect re-walking already-scraped
@@ -368,6 +368,7 @@ async function flushRows(
     job: ScrapeJob,
     rows: RawRow[],
     track: (n: number) => void,
+    pagesProcessed?: number,
 ): Promise<FlushStats> {
     if (rows.length === 0) return { received: 0, inserted: 0, duplicates: 0 };
     // Drop rows missing a timestamp or type before posting — Laravel's batch
@@ -390,7 +391,7 @@ async function flushRows(
     let inserted = 0;
     for (let i = 0; i < messages.length; i += config.BATCH_SIZE) {
         const chunk = messages.slice(i, i + config.BATCH_SIZE);
-        const result = await postBatch(job.id, chunk);
+        const result = await postBatch(job.id, chunk, pagesProcessed);
         track(chunk.length);
         received += result.received;
         inserted += result.inserted;

@@ -54,6 +54,7 @@ class JobSummary
      *   completed_at:?string,
      *   error:?string,
      *   rows:?int,
+     *   rows_received:?int,
      * }>
      */
     public static function recentForUser(User $user, int $limit = 5): array
@@ -63,16 +64,23 @@ class JobSummary
             ->orderByDesc('scrape_jobs.id')
             ->limit($limit)
             ->get(['scrape_jobs.*'])
-            ->map(fn (ScrapeJob $j) => [
-                'id' => $j->id,
-                'subscription_id' => $j->subscription_id,
-                'subscription_name' => $j->subscription?->name ?? $j->subscription_id,
-                'status' => $j->status,
-                'created_at' => $j->created_at?->toIso8601String() ?? '',
-                'completed_at' => $j->completed_at?->toIso8601String(),
-                'error' => $j->error,
-                'rows' => isset($j->stats['rows']) ? (int) $j->stats['rows'] : null,
-            ])
+            ->map(function (ScrapeJob $j) {
+                $st = $j->stats;
+
+                return [
+                    'id' => $j->id,
+                    'subscription_id' => $j->subscription_id,
+                    'subscription_name' => $j->subscription?->name ?? $j->subscription_id,
+                    'status' => $j->status,
+                    'created_at' => $j->created_at?->toIso8601String() ?? '',
+                    'completed_at' => $j->completed_at?->toIso8601String(),
+                    'error' => $j->error,
+                    'rows' => self::sidebarRowCount($j),
+                    'rows_received' => isset($st['rows_received'])
+                        ? (int) $st['rows_received']
+                        : null,
+                ];
+            })
             ->all();
     }
 
@@ -121,6 +129,23 @@ class JobSummary
             'logs_total' => $logsTotal,
             'recent' => self::recentForUser($user, 8),
         ];
+    }
+
+    /**
+     * Prefer live `rows_inserted` while running; else final `rows` from completion.
+     */
+    private static function sidebarRowCount(ScrapeJob $j): ?int
+    {
+        $stats = $j->stats;
+        if ($stats === null) {
+            return null;
+        }
+
+        if ($j->status === ScrapeJob::STATUS_RUNNING && isset($stats['rows_inserted'])) {
+            return (int) $stats['rows_inserted'];
+        }
+
+        return isset($stats['rows']) ? (int) $stats['rows'] : null;
     }
 
     private static function baseQuery(User $user): Builder

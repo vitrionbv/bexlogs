@@ -11,9 +11,9 @@ use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
 /**
- * Fired whenever a scrape job changes lifecycle state (queued -> running ->
- * completed | failed | cancelled). Used by the sidebar, the Jobs page, and
- * any per-job UI elements to refresh their relevant Inertia props.
+ * Fired when a scrape job changes lifecycle state or receives worker batch
+ * progress. Used by the sidebar, the Jobs page, and any per-job UI elements
+ * to update Inertia props or merge incremental `stats` from Echo.
  */
 class ScrapeJobUpdated implements ShouldBroadcast
 {
@@ -24,6 +24,7 @@ class ScrapeJobUpdated implements ShouldBroadcast
         public int $jobId,
         public string $subscriptionId,
         public string $status,
+        public ?array $stats = null,
     ) {}
 
     /**
@@ -47,12 +48,18 @@ class ScrapeJobUpdated implements ShouldBroadcast
      */
     public function broadcastWith(): array
     {
-        return [
+        $payload = [
             'job_id' => $this->jobId,
             'subscription_id' => $this->subscriptionId,
             'status' => $this->status,
             'at' => now()->toIso8601String(),
         ];
+
+        if ($this->stats !== null) {
+            $payload['stats'] = $this->stats;
+        }
+
+        return $payload;
     }
 
     /**
@@ -74,6 +81,7 @@ class ScrapeJobUpdated implements ShouldBroadcast
             jobId: $job->id,
             subscriptionId: (string) $job->subscription_id,
             status: $job->status,
+            stats: $job->stats,
         );
     }
 }

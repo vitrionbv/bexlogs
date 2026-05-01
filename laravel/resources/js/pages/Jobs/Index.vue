@@ -11,7 +11,7 @@ import {
     Trash2,
     XCircle,
 } from 'lucide-vue-next';
-import { computed, defineComponent, h, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, defineComponent, h, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { toast } from 'vue-sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -47,6 +47,18 @@ import {
 } from '@/components/ui/table';
 import { useUserChannel } from '@/composables/useRealtime';
 
+type ScrapeJobStats = {
+    rows?: number;
+    rows_received?: number;
+    rows_inserted?: number;
+    batches?: number;
+    last_batch_at?: string;
+    pages_processed?: number;
+    pages?: number;
+    duration_ms?: number;
+    [key: string]: unknown;
+};
+
 type Job = {
     id: number;
     subscription_id: string;
@@ -60,7 +72,7 @@ type Job = {
     completed_at: string | null;
     last_heartbeat_at: string | null;
     error: string | null;
-    stats: Record<string, unknown> | null;
+    stats: ScrapeJobStats | null;
     params: Record<string, unknown> | null;
 };
 
@@ -84,6 +96,42 @@ const props = defineProps<{
 defineOptions({
     layout: { breadcrumbs: [{ title: 'Jobs', href: '/jobs' }] },
 });
+
+const tableJobs = ref<Job[]>(props.jobs.data.map((j) => ({ ...j })));
+
+watch(
+    () => props.jobs.data,
+    (d) => {
+        tableJobs.value = d.map((j) => ({ ...j }));
+    },
+    { deep: true },
+);
+
+function mergeJobFromPayload(jobId: number, status: Job['status'] | undefined, stats: ScrapeJobStats) {
+    const idx = tableJobs.value.findIndex((j) => j.id === jobId);
+
+    if (idx === -1) {
+        return false;
+    }
+
+    const cur = tableJobs.value[idx];
+    tableJobs.value[idx] = {
+        ...cur,
+        ...(status ? { status } : {}),
+        stats: { ...stats },
+    };
+    tableJobs.value = [...tableJobs.value];
+
+    if (focused.value?.id === jobId) {
+        focused.value = {
+            ...focused.value,
+            ...(status ? { status } : {}),
+            stats: { ...stats },
+        };
+    }
+
+    return true;
+}
 
 const statusFilter = ref(props.filters.status || 'all');
 const subscriptionFilter = ref(props.filters.subscription || 'all');
@@ -171,8 +219,39 @@ focused.value = match;
 });
 
 useUserChannel({
-    'scrape-job-updated': () => refresh(),
-    'log-batch-inserted': () => refresh(),
+    'scrape-job-updated': (payload: Record<string, unknown>) => {
+        const jobId = payload.job_id;
+        const status = payload.status as Job['status'] | undefined;
+        const rawStats = payload.stats;
+
+        if (typeof jobId === 'number' && rawStats && typeof rawStats === 'object') {
+            const merged = mergeJobFromPayload(jobId, status, rawStats as ScrapeJobStats);
+
+            if (!merged) {
+                refresh();
+            }
+
+            return;
+        }
+
+        if (typeof jobId === 'number' && status) {
+            const idx = tableJobs.value.findIndex((j) => j.id === jobId);
+
+            if (idx !== -1) {
+                tableJobs.value[idx] = { ...tableJobs.value[idx], status };
+                tableJobs.value = [...tableJobs.value];
+
+                if (focused.value?.id === jobId) {
+                    focused.value = { ...focused.value, status };
+                }
+
+                return;
+            }
+        }
+
+        refresh();
+    },
+    'log-batch-inserted': () => {},
 });
 
 let safetyTimer: ReturnType<typeof setInterval> | null = null;
@@ -244,6 +323,48 @@ return `${sec}s`;
     return `${min}m ${sec - min * 60}s`;
 }
 
+function compactCount(n: number): string {
+    if (n >= 1_000_000) {
+        return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+    }
+
+    if (n >= 1000) {
+        return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+    }
+
+    return String(n);
+}
+
+function displayRows(job: Job): string {
+    const s = job.stats;
+
+    if (!s || typeof s !== 'object') {
+        return '—';
+    }
+
+    const ins = typeof s.rows_inserted === 'number' ? s.rows_inserted : undefined;
+    const rec = typeof s.rows_received === 'number' ? s.rows_received : undefined;
+    const finalRows = typeof s.rows === 'number' ? s.rows : undefined;
+
+    if (job.status === 'running' && ins !== undefined) {
+        if (rec !== undefined && rec !== ins) {
+            return `${compactCount(ins)} / ${compactCount(rec)}`;
+        }
+
+        return compactCount(ins);
+    }
+
+    if (finalRows !== undefined) {
+        return compactCount(finalRows);
+    }
+
+    if (ins !== undefined) {
+        return compactCount(ins);
+    }
+
+    return '—';
+}
+
 const filterChips = computed(() =>
     (['all', 'queued', 'running', 'completed', 'failed', 'cancelled'] as const).map((status) => ({
         status,
@@ -278,6 +399,10 @@ const Field = defineComponent({
                     <h1 class="text-2xl font-semibold tracking-tight">Scrape jobs</h1>
                     <p class="text-muted-foreground text-sm">
                         Background work driven by the Playwright worker. Updates live over WebSocket.
+                    </p>
+                    <p class="text-muted-foreground text-xs max-w-xl">
+                        Rows are written on each <code class="text-xs">POST …/batch</code> (not only when the job completes); running jobs show
+                        inserted vs received when they differ (duplicates overlap).
                     </p>
                 </div>
                 <div class="flex items-center gap-2">
@@ -359,7 +484,7 @@ const Field = defineComponent({
                         </TableHeader>
                         <TableBody>
                             <TableRow
-                                v-for="job in jobs.data"
+                                v-for="job in tableJobs"
                                 :key="job.id"
                                 class="cursor-pointer"
                                 @click="focused = job"
@@ -390,7 +515,7 @@ const Field = defineComponent({
                                 </TableCell>
                                 <TableCell class="text-muted-foreground tabular-nums text-xs">{{ duration(job) }}</TableCell>
                                 <TableCell class="tabular-nums">
-                                    {{ (job.stats as any)?.rows ?? '—' }}
+                                    {{ displayRows(job) }}
                                 </TableCell>
                                 <TableCell class="text-right" @click.stop>
                                     <div class="flex justify-end gap-1">

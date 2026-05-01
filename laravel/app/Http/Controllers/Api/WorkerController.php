@@ -95,6 +95,7 @@ class WorkerController extends Controller
     {
         $data = $request->validate([
             'messages' => 'required|array',
+            'pages_processed' => 'nullable|integer|min:0',
             'messages.*.timestamp' => 'required|string',
             'messages.*.type' => 'required|string',
             'messages.*.action' => 'required|string',
@@ -173,15 +174,42 @@ class WorkerController extends Controller
             ->values()
             ->all();
 
-        $stored = empty($rows)
-            ? 0
-            : LogMessage::query()->upsert(
-                $rows,
-                ['page_id', 'content_hash'],
-                [] // never overwrite existing — dedup only
-            );
+        $receivedInBatch = count($rows);
+        $pagesProcessed = isset($data['pages_processed']) ? (int) $data['pages_processed'] : null;
 
-        $job->update(['last_heartbeat_at' => now()]);
+        [$stored, $mergedStats] = DB::transaction(function () use ($job, $rows, $receivedInBatch, $pagesProcessed) {
+            $locked = ScrapeJob::query()->whereKey($job->id)->lockForUpdate()->firstOrFail();
+
+            $stored = empty($rows)
+                ? 0
+                : LogMessage::query()->upsert(
+                    $rows,
+                    ['page_id', 'content_hash'],
+                    [] // never overwrite existing — dedup only
+                );
+
+            $prev = $locked->stats ?? [];
+            $merged = array_merge($prev, [
+                'rows_received' => (int) ($prev['rows_received'] ?? 0) + $receivedInBatch,
+                'rows_inserted' => (int) ($prev['rows_inserted'] ?? 0) + (int) $stored,
+                'batches' => (int) ($prev['batches'] ?? 0) + 1,
+                'last_batch_at' => now()->toIso8601String(),
+            ]);
+
+            if ($pagesProcessed !== null) {
+                $merged['pages_processed'] = max(
+                    (int) ($prev['pages_processed'] ?? 0),
+                    $pagesProcessed,
+                );
+            }
+
+            $locked->update([
+                'last_heartbeat_at' => now(),
+                'stats' => $merged,
+            ]);
+
+            return [$stored, $merged];
+        });
 
         if ($stored > 0) {
             $latestTimestamp = collect($rows)->pluck('timestamp')->max();
@@ -197,8 +225,16 @@ class WorkerController extends Controller
             ));
         }
 
+        broadcast(new ScrapeJobUpdated(
+            userId: (int) $org->user_id,
+            jobId: $job->id,
+            subscriptionId: (string) $job->subscription_id,
+            status: $job->fresh()->status,
+            stats: $mergedStats,
+        ));
+
         return response()->json([
-            'received' => count($rows),
+            'received' => $receivedInBatch,
             'inserted' => $stored,
         ]);
     }
@@ -214,17 +250,21 @@ class WorkerController extends Controller
             'total_duplicates' => 'nullable|integer',
         ]);
 
-        $job->update([
+        $incoming = array_filter($stats, fn ($v) => $v !== null);
+        $current = $job->fresh();
+        $mergedStats = array_merge($current->stats ?? [], $incoming);
+
+        $current->update([
             'status' => ScrapeJob::STATUS_COMPLETED,
             'completed_at' => now(),
-            'stats' => $stats,
+            'stats' => $mergedStats,
         ]);
 
-        Subscription::where('id', $job->subscription_id)->update([
+        Subscription::where('id', $current->subscription_id)->update([
             'last_scraped_at' => now(),
         ]);
 
-        broadcast(ScrapeJobUpdated::fromJob($job->fresh()));
+        broadcast(ScrapeJobUpdated::fromJob($current->fresh()));
 
         return response()->noContent();
     }

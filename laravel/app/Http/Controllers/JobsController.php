@@ -105,6 +105,7 @@ class JobsController extends Controller
             'completed_at' => null,
             'last_heartbeat_at' => null,
             'error' => null,
+            'stats' => null,
         ])->save();
 
         broadcast(ScrapeJobUpdated::fromJob($job->fresh()));

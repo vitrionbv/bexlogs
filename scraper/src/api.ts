@@ -37,11 +37,16 @@ export async function heartbeat(jobId: number): Promise<void> {
 export async function postBatch(
     jobId: number,
     messages: ParsedLogMessage[],
+    pagesProcessed?: number,
 ): Promise<{ received: number; inserted: number }> {
+    const body: Record<string, unknown> = { messages };
+    if (pagesProcessed != null) {
+        body.pages_processed = pagesProcessed;
+    }
     const res = await fetch(url(`/api/worker/jobs/${jobId}/batch`), {
         method: 'POST',
         headers: jsonHeaders(),
-        body: JSON.stringify({ messages }),
+        body: JSON.stringify(body),
     });
     if (!res.ok) {
         throw new Error(`postBatch failed: ${res.status} ${await res.text()}`);
