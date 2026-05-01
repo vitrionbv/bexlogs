@@ -185,8 +185,13 @@ services:
       POSTGRES_DB: ${DB_DATABASE:?DB_DATABASE must be set}
       POSTGRES_USER: ${DB_USERNAME:?DB_USERNAME must be set}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+    # Postgres 18's docker image expects the mount at /var/lib/postgresql,
+    # NOT /var/lib/postgresql/data — data now lives at
+    # /var/lib/postgresql/18/docker/ inside the mount, which lets
+    # pg_upgrade --link work across major versions without mount-point
+    # boundary issues. (See github.com/docker-library/postgres/pull/1259.)
     volumes:
-      - bexlogs_pg_data:/var/lib/postgresql/data
+      - bexlogs_pg_data:/var/lib/postgresql
     networks:
       - bexlogs
     healthcheck:
