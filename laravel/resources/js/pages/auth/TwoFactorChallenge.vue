@@ -12,6 +12,14 @@ import {
 import { store } from '@/routes/two-factor/login';
 import type { TwoFactorConfigContent } from '@/types';
 
+// IMPORTANT: declare refs BEFORE the computed/watchEffect that close over
+// them. `<script setup>` hoists imports but not `const` bindings, so a
+// `watchEffect` that runs synchronously during setup would otherwise hit a
+// temporal-dead-zone `ReferenceError` on `showRecoveryInput`, crash the
+// component, and render an empty page.
+const showRecoveryInput = ref<boolean>(false);
+const code = ref<string>('');
+
 const authConfigContent = computed<TwoFactorConfigContent>(() => {
     if (showRecoveryInput.value) {
         return {
@@ -37,15 +45,11 @@ watchEffect(() => {
     });
 });
 
-const showRecoveryInput = ref<boolean>(false);
-
 const toggleRecoveryMode = (clearErrors: () => void): void => {
     showRecoveryInput.value = !showRecoveryInput.value;
     clearErrors();
     code.value = '';
 };
-
-const code = ref<string>('');
 </script>
 
 <template>
