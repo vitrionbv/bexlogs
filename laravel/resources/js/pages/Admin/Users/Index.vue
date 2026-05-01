@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { Head, useForm, usePage } from '@inertiajs/vue3';
 import {
-    AlertTriangle,
+    BadgeCheck,
+    BadgeX,
     Check,
     Copy,
     KeyRound,
@@ -15,7 +16,6 @@ import {
 } from 'lucide-vue-next';
 import { computed, reactive, ref, watch } from 'vue';
 import { toast } from 'vue-sonner';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -81,7 +81,6 @@ interface FlashData {
 
 const props = defineProps<{
     users: Paginator<UserRow>;
-    allowRegistration: boolean;
     flash: FlashData;
 }>();
 
@@ -368,17 +367,6 @@ return `${hr}h ago`;
             </Button>
         </header>
 
-        <Alert v-if="allowRegistration" variant="destructive">
-            <AlertTriangle class="size-4" />
-            <AlertTitle>Public registration is enabled</AlertTitle>
-            <AlertDescription>
-                Anyone with the URL can sign up at
-                <code class="bg-muted rounded px-1 text-xs">/register</code>. In production,
-                set <code class="bg-muted rounded px-1 text-xs">ALLOW_REGISTRATION=false</code>
-                in your environment file and restart the app.
-            </AlertDescription>
-        </Alert>
-
         <Card v-if="showGeneratedPassword" class="border-primary/40 bg-primary/5">
             <CardHeader class="pb-2">
                 <CardTitle class="flex items-center gap-2 text-base">
@@ -414,7 +402,7 @@ return `${hr}h ago`;
                             <TableHead>Email</TableHead>
                             <TableHead class="w-24">Admin</TableHead>
                             <TableHead class="w-44">Joined</TableHead>
-                            <TableHead class="w-44">Last seen</TableHead>
+                            <TableHead class="w-44">Updated</TableHead>
                             <TableHead class="w-44 text-right">Actions</TableHead>
                         </TableRow>
                     </TableHeader>
@@ -429,7 +417,28 @@ return `${hr}h ago`;
                                 </span>
                             </TableCell>
                             <TableCell class="text-muted-foreground">
-                                {{ user.email }}
+                                <span class="flex items-center gap-2">
+                                    {{ user.email }}
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <BadgeCheck
+                                                v-if="user.email_verified_at"
+                                                class="text-emerald-500 size-3.5 shrink-0"
+                                            />
+                                            <BadgeX
+                                                v-else
+                                                class="text-muted-foreground/60 size-3.5 shrink-0"
+                                            />
+                                        </TooltipTrigger>
+                                        <TooltipContent>
+                                            {{
+                                                user.email_verified_at
+                                                    ? `Email verified ${fmtDate(user.email_verified_at)}`
+                                                    : 'Email not verified'
+                                            }}
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </span>
                             </TableCell>
                             <TableCell>
                                 <Badge

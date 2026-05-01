@@ -5,9 +5,7 @@ import { defineComponent, h } from 'vue';
 import type { Component } from 'vue';
 import AppLogoIcon from '@/components/AppLogoIcon.vue';
 import { Button } from '@/components/ui/button';
-import { dashboard, login, register } from '@/routes';
-
-withDefaults(defineProps<{ canRegister: boolean }>(), { canRegister: true });
+import { dashboard, login } from '@/routes';
 
 const FeatureRow = defineComponent({
     name: 'FeatureRow',
@@ -52,14 +50,9 @@ const FeatureRow = defineComponent({
                     <Button v-if="$page.props.auth.user" as-child variant="default">
                         <Link :href="dashboard()">Open dashboard</Link>
                     </Button>
-                    <template v-else>
-                        <Button as-child variant="ghost">
-                            <Link :href="login()">Sign in</Link>
-                        </Button>
-                        <Button v-if="canRegister" as-child>
-                            <Link :href="register()">Create account</Link>
-                        </Button>
-                    </template>
+                    <Button v-else as-child variant="default">
+                        <Link :href="login()">Sign in</Link>
+                    </Button>
                 </nav>
             </div>
         </header>
@@ -84,14 +77,9 @@ const FeatureRow = defineComponent({
                         <Button v-if="$page.props.auth.user" as-child size="lg">
                             <Link :href="dashboard()">Go to dashboard</Link>
                         </Button>
-                        <template v-else>
-                            <Button as-child size="lg">
-                                <Link :href="login()">Sign in to start</Link>
-                            </Button>
-                            <Button v-if="canRegister" as-child size="lg" variant="outline">
-                                <Link :href="register()">Create an account</Link>
-                            </Button>
-                        </template>
+                        <Button v-else as-child size="lg">
+                            <Link :href="login()">Sign in to start</Link>
+                        </Button>
                     </div>
                 </div>
 

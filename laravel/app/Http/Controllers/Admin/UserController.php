@@ -41,7 +41,6 @@ class UserController extends Controller
 
         return Inertia::render('Admin/Users/Index', [
             'users' => $users,
-            'allowRegistration' => (bool) config('auth.allow_registration'),
             'flash' => (object) $flash,
         ]);
     }

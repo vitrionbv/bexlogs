@@ -9,11 +9,8 @@ use App\Http\Controllers\LogExportController;
 use App\Http\Controllers\ManageController;
 use App\Http\Controllers\PageController;
 use Illuminate\Support\Facades\Route;
-use Laravel\Fortify\Features;
 
-Route::inertia('/', 'Welcome', [
-    'canRegister' => Features::enabled(Features::registration()),
-])->name('home');
+Route::inertia('/', 'Welcome')->name('home');
 
 // Public endpoint to download the browser extension zip.
 Route::get('/extension/download', [ExtensionController::class, 'download'])

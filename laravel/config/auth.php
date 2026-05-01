@@ -22,22 +22,6 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Allow Public Registration
-    |--------------------------------------------------------------------------
-    |
-    | When false, the public Fortify registration routes (`/register` and
-    | `POST /register`) are not registered at all and the registration
-    | feature is fully disabled. Production should set
-    | `ALLOW_REGISTRATION=false` once the first admin has signed up; new
-    | accounts can then only be created via the admin UI at `/admin/users`
-    | or the `php artisan admin:make` console command.
-    |
-    */
-
-    'allow_registration' => (bool) env('ALLOW_REGISTRATION', true),
-
-    /*
-    |--------------------------------------------------------------------------
     | Authentication Guards
     |--------------------------------------------------------------------------
     |

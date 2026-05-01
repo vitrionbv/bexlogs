@@ -144,11 +144,11 @@ return [
     */
 
     'features' => [
-        // Public registration is gated by the same env var as
-        // `config('auth.allow_registration')`. When false, the
-        // `/register` GET/POST routes are not registered and the
-        // Fortify "registration" feature reports as disabled.
-        ...((bool) env('ALLOW_REGISTRATION', true) ? [Features::registration()] : []),
+        // Public self-registration is intentionally disabled — new accounts
+        // are created exclusively through the admin dashboard at
+        // `/admin/users` (see `App\Http\Controllers\Admin\UserController`)
+        // or the `php artisan admin:make` console command. There is no
+        // `/register` route on this app.
         Features::resetPasswords(),
         Features::emailVerification(),
         Features::twoFactorAuthentication([
