@@ -9,6 +9,7 @@ use App\Models\Organization;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use App\Services\BookingExpertsBrowser;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -147,28 +148,37 @@ class ManageController extends Controller
             'max_duration_minutes' => (int) ($subscription->max_duration_minutes ?? 10),
         ];
 
-        // Mirror ScrapeEnqueue's guard so double-clicking "Scrape now" does
-        // not stack identical jobs the worker would just re-run back-to-back.
+        // App-level fast-path so the common case (no overlap) doesn't have
+        // to round-trip an INSERT and roll back. The DB partial unique
+        // index `scrape_jobs_active_unique_idx` is the authoritative
+        // race-proof guard — it catches the SELECT-then-INSERT window
+        // that a double-click or scheduler-vs-click collision can drive
+        // through this check.
         $alreadyQueued = ScrapeJob::query()
             ->where('subscription_id', $subscription->id)
             ->whereIn('status', [ScrapeJob::STATUS_QUEUED, ScrapeJob::STATUS_RUNNING])
             ->exists();
 
         if ($alreadyQueued) {
-            Inertia::flash('toast', [
-                'type' => 'warning',
-                'message' => 'A scrape is already running for this subscription. Wait for it to finish.',
-            ]);
-
-            return back()->with('status', 'scrape-already-queued');
+            return $this->scrapeAlreadyQueuedResponse();
         }
 
-        $job = ScrapeJob::create([
-            'subscription_id' => $subscription->id,
-            'bex_session_id' => $session->id,
-            'status' => ScrapeJob::STATUS_QUEUED,
-            'params' => array_merge($defaults, array_filter($overrides, fn ($v) => $v !== null)),
-        ]);
+        try {
+            $job = ScrapeJob::create([
+                'subscription_id' => $subscription->id,
+                'bex_session_id' => $session->id,
+                'status' => ScrapeJob::STATUS_QUEUED,
+                'params' => array_merge($defaults, array_filter($overrides, fn ($v) => $v !== null)),
+            ]);
+        } catch (QueryException $e) {
+            // The partial unique index fired — another request beat us
+            // to the insert. Treat it identically to the fast-path
+            // "already queued" response so the UX is consistent.
+            if ($this->isUniqueViolation($e)) {
+                return $this->scrapeAlreadyQueuedResponse();
+            }
+            throw $e;
+        }
 
         broadcast(new ScrapeJobUpdated(
             userId: (int) $request->user()->id,
@@ -178,6 +188,25 @@ class ManageController extends Controller
         ));
 
         return back()->with('status', 'scrape-enqueued');
+    }
+
+    private function scrapeAlreadyQueuedResponse(): RedirectResponse
+    {
+        Inertia::flash('toast', [
+            'type' => 'warning',
+            'message' => 'A scrape is already running for this subscription. Wait for it to finish.',
+        ]);
+
+        return back()->with('status', 'scrape-already-queued');
+    }
+
+    /**
+     * Detect Postgres SQLSTATE 23505 (unique_violation). Other QueryExceptions
+     * (FK failures, deadlocks) keep bubbling so we don't swallow real bugs.
+     */
+    private function isUniqueViolation(QueryException $e): bool
+    {
+        return $e->getCode() === '23505';
     }
 
     // ─── Browse endpoints (Add Subscription → Browse tab, app-first cascade) ────────

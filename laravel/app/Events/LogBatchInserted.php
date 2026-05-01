@@ -5,7 +5,7 @@ namespace App\Events;
 use Illuminate\Broadcasting\Channel;
 use Illuminate\Broadcasting\InteractsWithSockets;
 use Illuminate\Broadcasting\PrivateChannel;
-use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
@@ -15,8 +15,14 @@ use Illuminate\Queue\SerializesModels;
  * Broadcast on:
  *   - private-page.{pageId}   — the live log feed (Logs/Show.vue)
  *   - private-user.{userId}   — sidebar / dashboard / Logs index refresh
+ *
+ * `ShouldBroadcastNow` (not the queued variant): the worker ships batches
+ * in tight succession during a scrape; if these went through the queue the
+ * WS could deliver `inserted=10, total=10` after `inserted=5, total=15`
+ * and the Logs/Show feed would flicker backwards. Inline broadcast
+ * preserves arrival order at a few-ms cost per batch.
  */
-class LogBatchInserted implements ShouldBroadcast
+class LogBatchInserted implements ShouldBroadcastNow
 {
     use Dispatchable, InteractsWithSockets, SerializesModels;
 

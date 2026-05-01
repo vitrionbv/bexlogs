@@ -302,6 +302,105 @@ class ScrapeReapStaleTest extends TestCase
             ->once();
     }
 
+    /**
+     * Endpoint check on the new atomic UPDATE. A row that flipped to
+     * `completed` before the reaper SELECTs is invisible to the stale
+     * query (status filter), so it can't be touched. This is the easy
+     * half of the race-protection contract.
+     */
+    public function test_completed_job_is_not_overwritten_when_status_flipped_before_reaper(): void
+    {
+        Event::fake([ScrapeJobUpdated::class]);
+
+        $job = $this->makeJob([
+            'status' => ScrapeJob::STATUS_RUNNING,
+            'started_at' => now()->subMinutes(15),
+            'last_heartbeat_at' => now()->subMinutes(10),
+            'stats' => ['rows_inserted' => 42, 'batches' => 3],
+        ]);
+
+        // Worker /complete lands before the reaper tick.
+        $job->update([
+            'status' => ScrapeJob::STATUS_COMPLETED,
+            'completed_at' => now(),
+            'stats' => ['rows_inserted' => 42, 'batches' => 3, 'stop_reason' => 'natural_end'],
+        ]);
+
+        $this->artisan('scrape:reap-stale')
+            ->expectsOutputToContain('reaped=0')
+            ->assertSuccessful();
+
+        $job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_COMPLETED, $job->status);
+        $this->assertSame('natural_end', $job->stats['stop_reason']);
+        $this->assertNull($job->error);
+        Event::assertNotDispatched(ScrapeJobUpdated::class);
+    }
+
+    /**
+     * Hard race: the worker's /complete lands AFTER the reaper has
+     * already SELECTed the row into `$stale` but BEFORE the per-row
+     * atomic UPDATE fires. With the old `$job->save()` flow this
+     * silently flipped `completed` back to `failed`. With the atomic
+     * `where status=running` UPDATE the affected-rows count is 0, the
+     * broadcast is skipped, and a "skipped (worker won the race)" log
+     * is emitted.
+     *
+     * Implementation: a model `retrieved` listener flips the row in DB
+     * the first time the reaper's stale query loads it. By the time
+     * the foreach reaches the UPDATE statement, the row's status is
+     * already `completed`.
+     */
+    public function test_atomic_update_skips_row_when_worker_completes_mid_handler(): void
+    {
+        Event::fake([ScrapeJobUpdated::class]);
+        Log::spy();
+
+        $job = $this->makeJob([
+            'status' => ScrapeJob::STATUS_RUNNING,
+            'started_at' => now()->subMinutes(15),
+            'last_heartbeat_at' => now()->subMinutes(10),
+            'stats' => ['rows_inserted' => 7, 'batches' => 1],
+        ]);
+
+        $flipped = false;
+        ScrapeJob::retrieved(function (ScrapeJob $loaded) use ($job, &$flipped) {
+            if ($flipped || $loaded->id !== $job->id) {
+                return;
+            }
+            $flipped = true;
+
+            // Bypass model events so this looks exactly like a concurrent
+            // worker /complete writing through the WorkerController path.
+            ScrapeJob::query()
+                ->where('id', $job->id)
+                ->update([
+                    'status' => ScrapeJob::STATUS_COMPLETED,
+                    'completed_at' => now(),
+                    'stats' => ['rows_inserted' => 7, 'batches' => 1, 'stop_reason' => 'natural_end'],
+                ]);
+        });
+
+        $this->artisan('scrape:reap-stale')
+            ->expectsOutputToContain('reaped=0')
+            ->assertSuccessful();
+
+        $job->refresh();
+        $this->assertTrue($flipped, 'retrieved listener should have fired');
+        $this->assertSame(ScrapeJob::STATUS_COMPLETED, $job->status);
+        $this->assertSame('natural_end', $job->stats['stop_reason']);
+        $this->assertNull($job->error);
+
+        Event::assertNotDispatched(ScrapeJobUpdated::class);
+
+        Log::shouldHaveReceived('info')
+            ->withArgs(function (string $message, array $context) use ($job) {
+                return $message === 'scrape:reap-stale skipped (worker won the race)'
+                    && $context['job_id'] === $job->id;
+            })
+            ->once();
+    }
+
     /** @param array<string, mixed> $overrides */
     private function makeJob(array $overrides = []): ScrapeJob
     {

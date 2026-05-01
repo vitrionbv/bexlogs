@@ -68,18 +68,58 @@ class ScrapeReapStale extends Command
                 ? (int) round($reference->diffInSeconds(now()) / 60)
                 : null;
 
-            $job->status = ScrapeJob::STATUS_FAILED;
-            $job->completed_at = now();
-            $job->error = $errorMessage;
             // Stamp `stop_reason` into the existing stats blob so the Jobs
             // UI can show the "Worker reaped" badge alongside whatever
             // partial per-batch counters the worker managed to ship before
             // it died. Preserves prior keys (rows_received, batches, etc.).
-            $job->stats = array_merge(
+            // Note: a worker batch landing between SELECT and UPDATE could
+            // grow `stats` further; we'd lose those new counters here.
+            // Acceptable trade-off — the bug we're fixing is much worse
+            // (overwriting `completed` back to `failed`).
+            $newStats = array_merge(
                 $job->stats ?? [],
                 ['stop_reason' => 'worker_reaped'],
             );
-            $job->save();
+
+            // Atomic compare-and-set on `status='running'`. If a worker
+            // /complete or /fail landed between our SELECT above and this
+            // UPDATE, the row is no longer `running` and `affected` is 0
+            // — the worker's terminal state stands and we skip the
+            // broadcast/log so the UI doesn't see a `failed` event for a
+            // job that already settled as `completed`.
+            //
+            // `stats` is JSON-encoded explicitly because Eloquent\Builder
+            // ::update() bypasses model casts; passing a PHP array would
+            // bind through PDO as text and Postgres would reject it for
+            // the json column.
+            $affected = ScrapeJob::query()
+                ->where('id', $job->id)
+                ->where('status', ScrapeJob::STATUS_RUNNING)
+                ->update([
+                    'status' => ScrapeJob::STATUS_FAILED,
+                    'completed_at' => now(),
+                    'error' => $errorMessage,
+                    'stats' => json_encode($newStats),
+                    'updated_at' => now(),
+                ]);
+
+            if ($affected !== 1) {
+                Log::info('scrape:reap-stale skipped (worker won the race)', [
+                    'job_id' => $job->id,
+                    'subscription_id' => $job->subscription_id,
+                ]);
+
+                continue;
+            }
+
+            // Reflect the freshly-applied state in the in-memory model
+            // so fromJob() emits the post-reap snapshot without an extra
+            // SELECT (the relationship chain is already loaded eagerly
+            // by the stale query).
+            $job->status = ScrapeJob::STATUS_FAILED;
+            $job->completed_at = now();
+            $job->error = $errorMessage;
+            $job->stats = $newStats;
 
             // Match the rest of the app: dispatch via broadcast() so the
             // sidebar/Jobs page refresh on Echo just like they do for

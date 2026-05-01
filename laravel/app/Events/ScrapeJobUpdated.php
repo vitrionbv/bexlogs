@@ -6,7 +6,7 @@ use App\Models\ScrapeJob;
 use Illuminate\Broadcasting\Channel;
 use Illuminate\Broadcasting\InteractsWithSockets;
 use Illuminate\Broadcasting\PrivateChannel;
-use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
@@ -14,8 +14,16 @@ use Illuminate\Queue\SerializesModels;
  * Fired when a scrape job changes lifecycle state or receives worker batch
  * progress. Used by the sidebar, the Jobs page, and any per-job UI elements
  * to update Inertia props or merge incremental `stats` from Echo.
+ *
+ * `ShouldBroadcastNow` (not the queued variant) so the WS sees lifecycle
+ * transitions in the same order Laravel applies them. With the queued
+ * variant, two rapid-fire updates on the same job — `running` → `completed`,
+ * or two batch progress events — could land in the worker queue and be
+ * consumed out of order, which makes the Jobs UI flap (e.g. show
+ * "completed" then revert to "running"). Reverb is local on the same
+ * docker net; the inline HTTP hop costs a few ms per dispatch.
  */
-class ScrapeJobUpdated implements ShouldBroadcast
+class ScrapeJobUpdated implements ShouldBroadcastNow
 {
     use Dispatchable, InteractsWithSockets, SerializesModels;
 

@@ -6,6 +6,8 @@ use App\Models\BexSession;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use Illuminate\Console\Command;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Log;
 
 class ScrapeEnqueue extends Command
 {
@@ -67,6 +69,11 @@ class ScrapeEnqueue extends Command
                 continue;
             }
 
+            // Fast-path: skip the INSERT entirely if we can already see a
+            // queued/running row. The DB partial unique index
+            // `scrape_jobs_active_unique_idx` is the airtight guard for
+            // the SELECT-then-INSERT race (e.g. scheduler tick colliding
+            // with a manual "Scrape now" click within the same second).
             $alreadyQueued = ScrapeJob::query()
                 ->where('subscription_id', $sub->id)
                 ->whereIn('status', [ScrapeJob::STATUS_QUEUED, ScrapeJob::STATUS_RUNNING])
@@ -77,13 +84,26 @@ class ScrapeEnqueue extends Command
                 continue;
             }
 
-            ScrapeJob::create([
-                'subscription_id' => $sub->id,
-                'bex_session_id' => $session->id,
-                'status' => ScrapeJob::STATUS_QUEUED,
-                'params' => $this->buildParams($sub),
-            ]);
-            $queued++;
+            try {
+                ScrapeJob::create([
+                    'subscription_id' => $sub->id,
+                    'bex_session_id' => $session->id,
+                    'status' => ScrapeJob::STATUS_QUEUED,
+                    'params' => $this->buildParams($sub),
+                ]);
+                $queued++;
+            } catch (QueryException $e) {
+                if ($e->getCode() !== '23505') {
+                    throw $e;
+                }
+                // Concurrent request beat us to the insert; the partial
+                // unique index caught it. Same outcome as the fast-path
+                // above — skip cleanly, log for observability.
+                Log::info('scrape:enqueue skipped (active job already exists)', [
+                    'subscription_id' => $sub->id,
+                ]);
+                $skipped++;
+            }
         }
 
         $this->info("queued={$queued} skipped={$skipped}");
