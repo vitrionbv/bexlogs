@@ -1,0 +1,4 @@
+# Custom self-hosted runner labels registered by deploy/bootstrap.sh.
+self-hosted-runner:
+  labels:
+    - bexlogs

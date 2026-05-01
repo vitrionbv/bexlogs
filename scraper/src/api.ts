@@ -1,0 +1,95 @@
+import { fetch } from 'undici';
+import { config } from './config.js';
+import { log } from './log.js';
+import type { ParsedLogMessage, ScrapeJob } from './types.js';
+
+const headers = (): Record<string, string> => ({
+    Authorization: `Bearer ${config.WORKER_API_TOKEN}`,
+    Accept: 'application/json',
+});
+
+const jsonHeaders = (): Record<string, string> => ({
+    ...headers(),
+    'Content-Type': 'application/json',
+});
+
+const url = (path: string) => `${config.LARAVEL_BASE_URL.replace(/\/+$/, '')}${path}`;
+
+export async function fetchNextJob(): Promise<ScrapeJob | null> {
+    const res = await fetch(url('/api/worker/jobs/next'), {
+        method: 'GET',
+        headers: headers(),
+    });
+    if (res.status === 204) return null;
+    if (!res.ok) {
+        throw new Error(`fetchNextJob failed: ${res.status} ${await res.text()}`);
+    }
+    return (await res.json()) as ScrapeJob;
+}
+
+export async function heartbeat(jobId: number): Promise<void> {
+    await fetch(url(`/api/worker/jobs/${jobId}/heartbeat`), {
+        method: 'POST',
+        headers: headers(),
+    });
+}
+
+export async function postBatch(
+    jobId: number,
+    messages: ParsedLogMessage[],
+): Promise<{ received: number; inserted: number }> {
+    const res = await fetch(url(`/api/worker/jobs/${jobId}/batch`), {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ messages }),
+    });
+    if (!res.ok) {
+        throw new Error(`postBatch failed: ${res.status} ${await res.text()}`);
+    }
+    return (await res.json()) as { received: number; inserted: number };
+}
+
+export async function completeJob(
+    jobId: number,
+    stats: {
+        pages: number;
+        rows: number;
+        duration_ms: number;
+        aborted_due_to_time?: boolean;
+        early_stopped_due_to_duplicates?: boolean;
+        total_duplicates?: number;
+    },
+): Promise<void> {
+    const res = await fetch(url(`/api/worker/jobs/${jobId}/complete`), {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify(stats),
+    });
+    if (!res.ok) {
+        log.warn('completeJob non-OK', { status: res.status });
+    }
+}
+
+export async function failJob(
+    jobId: number,
+    payload: { error: string; retryable?: boolean },
+): Promise<void> {
+    const res = await fetch(url(`/api/worker/jobs/${jobId}/fail`), {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        log.warn('failJob non-OK', { status: res.status });
+    }
+}
+
+export async function reportSessionExpired(sessionId: number): Promise<void> {
+    const res = await fetch(url(`/api/worker/sessions/${sessionId}/expired`), {
+        method: 'POST',
+        headers: headers(),
+    });
+    if (!res.ok) {
+        log.warn('reportSessionExpired non-OK', { status: res.status });
+    }
+}

@@ -1,0 +1,54 @@
+# Top-level
+.git
+.github
+.idea
+.vscode
+.zed
+.DS_Store
+*.swp
+deploy/
+docker-compose.yml
+docker-compose.production.yml
+
+# Laravel — never copy host artifacts into the image; we rebuild them in
+# the docker stages.
+laravel/.env
+laravel/.env.*
+!laravel/.env.production.example
+laravel/vendor
+laravel/node_modules
+laravel/storage/app/private/*
+laravel/storage/app/public/*
+!laravel/storage/app/private/.gitignore
+!laravel/storage/app/public/.gitignore
+laravel/storage/framework/cache/*
+laravel/storage/framework/sessions/*
+laravel/storage/framework/views/*
+laravel/storage/logs/*
+laravel/storage/pail/*
+!laravel/storage/framework/cache/.gitignore
+!laravel/storage/framework/sessions/.gitignore
+!laravel/storage/framework/views/.gitignore
+!laravel/storage/logs/.gitignore
+!laravel/storage/pail/.gitignore
+laravel/bootstrap/cache/*.php
+laravel/public/build
+laravel/public/hot
+laravel/public/storage
+laravel/public/fonts-manifest.dev.json
+laravel/.phpunit.cache
+laravel/.phpunit.result.cache
+laravel/tests/
+
+# Scraper
+scraper/.env
+scraper/.env.*
+!scraper/.env.example
+scraper/node_modules
+scraper/dist
+scraper/debug
+scraper/scripts
+
+# Extension
+extension/build
+extension/.DS_Store

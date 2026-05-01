@@ -1,0 +1,218 @@
+# BexLogs production compose file.
+#
+# IMPORTANT: this is NOT the file to use for local development — see the
+# repo-root docker-compose.yml for that. This file:
+#   - exposes only :80 / :443 on the host (via Caddy)
+#   - never publishes the postgres/redis/reverb ports outside the docker net
+#   - builds one Laravel image and runs it as four roles (app/queue/scheduler/reverb)
+#   - persists data to *named* volumes so a `docker compose down` is safe
+#
+# Everything reads its config from `laravel/.env` (the file the bootstrap
+# script generates from `laravel/.env.production.example`). Use:
+#
+#   docker compose -f docker-compose.production.yml --env-file laravel/.env <cmd>
+
+name: bexlogs
+
+x-app-image: &app_image
+  image: bexlogs/app:latest
+  build:
+    context: .
+    dockerfile: docker/app/Dockerfile
+    args:
+      # Public build-time values for the Vite client bundle. Pulled out of
+      # laravel/.env via --env-file. These are NOT secrets — they're baked
+      # into the JS that ships to every browser.
+      VITE_REVERB_APP_KEY: ${REVERB_APP_KEY:-}
+      VITE_REVERB_HOST: ${APP_DOMAIN:-}
+      VITE_REVERB_PORT: ${REVERB_PORT:-443}
+      VITE_REVERB_SCHEME: ${REVERB_SCHEME:-https}
+      VITE_APP_NAME: ${APP_NAME:-BexLogs}
+
+x-app-env: &app_env
+  env_file:
+    - laravel/.env
+  environment:
+    # Defaults that the .env almost certainly already sets, but we lock them
+    # to internal docker hostnames here so a misconfigured .env can't point
+    # the app at someone else's database.
+    DB_HOST: postgres
+    DB_PORT: 5432
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+      reverb:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN must be set}
+      APP_ACME_EMAIL: ${APP_ACME_EMAIL:-admin@localhost}
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - bexlogs_caddy_data:/data
+      - bexlogs_caddy_config:/config
+    networks:
+      - bexlogs
+
+  app:
+    <<: [*app_image, *app_env]
+    restart: unless-stopped
+    environment:
+      APP_ROLE: app
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - bexlogs_storage:/var/www/html/storage
+    networks:
+      - bexlogs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/up"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  queue:
+    <<: [*app_image, *app_env]
+    restart: unless-stopped
+    environment:
+      APP_ROLE: queue
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    volumes:
+      - bexlogs_storage:/var/www/html/storage
+    networks:
+      - bexlogs
+
+  scheduler:
+    <<: [*app_image, *app_env]
+    restart: unless-stopped
+    environment:
+      APP_ROLE: scheduler
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    volumes:
+      - bexlogs_storage:/var/www/html/storage
+    networks:
+      - bexlogs
+
+  reverb:
+    <<: [*app_image, *app_env]
+    restart: unless-stopped
+    environment:
+      APP_ROLE: reverb
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Skip the artisan cache warm-up in the WebSocket process — its hot
+      # path doesn't touch routes/views/events anyway.
+      SKIP_ARTISAN_CACHE: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - bexlogs_storage:/var/www/html/storage
+    networks:
+      - bexlogs
+
+  scraper:
+    image: bexlogs/scraper:latest
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      LARAVEL_BASE_URL: http://app:80
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:?WORKER_API_TOKEN must be set}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-5000}
+      MAX_CONCURRENT_SCRAPES: ${MAX_CONCURRENT_SCRAPES:-2}
+      MAX_PAGES_PER_JOB: ${MAX_PAGES_PER_JOB:-2000}
+      BATCH_SIZE: ${BATCH_SIZE:-100}
+      HEADLESS: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      - bexlogs
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:?DB_DATABASE must be set}
+      POSTGRES_USER: ${DB_USERNAME:?DB_USERNAME must be set}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+    volumes:
+      - bexlogs_pg_data:/var/lib/postgresql/data
+    networks:
+      - bexlogs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes:
+      - bexlogs_redis_data:/data
+    networks:
+      - bexlogs
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  bexlogs:
+    driver: bridge
+
+volumes:
+  bexlogs_pg_data:
+  bexlogs_redis_data:
+  bexlogs_caddy_data:
+  bexlogs_caddy_config:
+  bexlogs_storage:

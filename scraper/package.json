@@ -1,0 +1,26 @@
+{
+    "name": "bexlogs-scraper",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Headless Playwright worker that scrapes BookingExperts logs and posts batches to the BexLogs Laravel API.",
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "start": "node dist/index.js",
+        "dev": "tsx src/index.ts",
+        "scrape:once": "tsx src/cli/scrapeOnce.ts",
+        "lint": "eslint src --ext .ts",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "playwright": "^1.49.1",
+        "undici": "^7.16.0",
+        "zod": "^3.24.1",
+        "dotenv": "^16.4.7"
+    },
+    "devDependencies": {
+        "@types/node": "^22.13.5",
+        "tsx": "^4.20.6",
+        "typescript": "^5.7.3"
+    }
+}

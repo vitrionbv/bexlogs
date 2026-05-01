@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: bexlogs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bexlogs
+      POSTGRES_USER: bexlogs
+      POSTGRES_PASSWORD: bexlogs
+    volumes:
+      - bexlogs-pg:/var/lib/postgresql/data
+    ports:
+      - "54323:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bexlogs -d bexlogs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: bexlogs-redis
+    restart: unless-stopped
+    ports:
+      - "63792:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  scraper:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    container_name: bexlogs-scraper
+    restart: unless-stopped
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      LARAVEL_BASE_URL: ${LARAVEL_BASE_URL:-http://host.docker.internal:8000}
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:-change-me-in-production-please}
+      POLL_INTERVAL_MS: 5000
+      MAX_CONCURRENT_SCRAPES: 2
+      HEADLESS: "true"
+      LOG_LEVEL: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  bexlogs-pg:

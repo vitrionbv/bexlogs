@@ -1,0 +1,71 @@
+# BexLogs reverse proxy.
+#
+# Caddy terminates TLS for both the HTTP app and the Reverb WebSocket on the
+# same hostname. Reverb / Pusher protocol routes look like:
+#
+#   GET  /app/{appKey}              ← WebSocket upgrade (laravel-echo client)
+#   POST /apps/{appId}/events       ← Server-side broadcast (Laravel → Reverb)
+#   POST /apps/{appId}/users/...    ← Presence membership pings
+#
+# We send all of /app/* and /apps/* to the reverb container, and everything
+# else to the Nginx + PHP-FPM app container.
+
+{
+	# Email is used for ACME registration (Let's Encrypt). Defaults to internal
+	# self-signed if APP_ACME_EMAIL is unset, which is fine for a private LAN
+	# preview but you DO want to set it in real production.
+	email {$APP_ACME_EMAIL:admin@localhost}
+
+	# Quiet the admin API (we don't expose it; this just makes it fail fast
+	# if someone tries to localhost:2019).
+	admin off
+
+	# Sensible global defaults.
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# Reverb / Pusher protocol — both the WS handshake (/app/{key}) and the
+	# server-side HTTP API (/apps/{id}/...). Caddy preserves the Upgrade
+	# header automatically for the WS path.
+	@reverb path /app/* /apps/*
+	handle @reverb {
+		reverse_proxy reverb:8080 {
+			# Reverb's tasknet keepalives can hold connections open for a
+			# long time; bump the read/write timeouts.
+			transport http {
+				read_timeout 24h
+				write_timeout 24h
+			}
+		}
+	}
+
+	# Everything else → Nginx + PHP-FPM.
+	handle {
+		reverse_proxy app:80 {
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Always-on security headers.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options    "nosniff"
+		X-Frame-Options           "SAMEORIGIN"
+		Referrer-Policy           "strict-origin-when-cross-origin"
+		# Caddy adds its own Server header by default — strip it.
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+		level  INFO
+	}
+}

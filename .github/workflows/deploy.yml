@@ -1,0 +1,108 @@
+name: Deploy to production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to deploy (defaults to main)'
+        required: false
+        default: 'main'
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Pull, build, redeploy
+    runs-on: [self-hosted, linux, bexlogs]
+    timeout-minutes: 25
+
+    env:
+      APP_DIR: /opt/bexlogs
+      COMPOSE: docker compose -f /opt/bexlogs/docker-compose.production.yml --env-file /opt/bexlogs/laravel/.env
+
+    steps:
+      # We deliberately don't use actions/checkout — the runner already has
+      # the repo at /opt/bexlogs and that's the working tree we deploy from.
+      # Doing a checkout here would create a *second* clone in
+      # ${{ github.workspace }} that would never see laravel/.env.
+      - name: Resolve target ref
+        id: ref
+        run: |
+          TARGET="${{ github.event.inputs.ref || github.ref_name }}"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Target ref: $TARGET"
+
+      - name: Pull source
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          git fetch --all --prune
+          git checkout "${{ steps.ref.outputs.target }}"
+          git pull --ff-only origin "${{ steps.ref.outputs.target }}"
+          echo "HEAD now at $(git rev-parse --short HEAD)"
+
+      - name: Build images
+        working-directory: ${{ env.APP_DIR }}
+        run: $COMPOSE build app scraper
+
+      - name: Bring stack up
+        working-directory: ${{ env.APP_DIR }}
+        run: $COMPOSE up -d --remove-orphans
+
+      - name: Wait for app health
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if $COMPOSE exec -T app curl -fsS http://127.0.0.1/up >/dev/null 2>&1; then
+              echo "app healthy after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::app did not become healthy within 120s"
+          $COMPOSE logs --tail=200 app
+          exit 1
+
+      - name: Run migrations
+        working-directory: ${{ env.APP_DIR }}
+        run: $COMPOSE exec -T app php artisan migrate --force
+
+      - name: Warm caches
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          $COMPOSE exec -T app php artisan config:cache
+          $COMPOSE exec -T app php artisan route:cache
+          $COMPOSE exec -T app php artisan view:cache
+          $COMPOSE exec -T app php artisan event:cache
+
+      - name: Restart Reverb
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          $COMPOSE exec -T app php artisan reverb:restart || true
+          $COMPOSE restart reverb
+
+      - name: Restart workers
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          $COMPOSE exec -T app php artisan queue:restart || true
+          $COMPOSE restart queue scheduler
+
+      - name: External health check
+        if: vars.DEPLOY_DOMAIN != ''
+        run: |
+          curl -fsSL --retry 10 --retry-delay 3 --max-time 10 \
+            "https://${{ vars.DEPLOY_DOMAIN }}/up"
+
+      - name: Notify on failure
+        if: failure() && env.NOTIFY_WEBHOOK != ''
+        env:
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\":\"BexLogs deploy failed: ${{ github.sha }}\"}" \
+            "$NOTIFY_WEBHOOK" || true

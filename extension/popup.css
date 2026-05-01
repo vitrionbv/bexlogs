@@ -1,0 +1,164 @@
+:root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #0a0a0a;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --accent: #1f2937;
+    --accent-fg: #ffffff;
+    --hint: #9ca3af;
+    --error: #b91c1c;
+    --success: #047857;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0a0a0a;
+        --fg: #fafafa;
+        --muted: #9ca3af;
+        --border: #262626;
+        --accent: #fafafa;
+        --accent-fg: #0a0a0a;
+        --hint: #6b7280;
+        --error: #f87171;
+        --success: #34d399;
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font:
+        14px/1.4 -apple-system,
+        BlinkMacSystemFont,
+        'Segoe UI',
+        Roboto,
+        sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    width: 360px;
+    padding: 14px;
+}
+
+.hdr {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+h1 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+p.muted {
+    margin: 2px 0 0;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+section {
+    margin-bottom: 12px;
+}
+
+label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 4px;
+}
+
+input[type='url'],
+input[type='text'] {
+    width: 100%;
+    padding: 7px 9px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fg);
+    font-family: inherit;
+}
+
+input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+    border-color: transparent;
+}
+
+.hint {
+    margin: 4px 0 0;
+    font-size: 11px;
+    color: var(--hint);
+}
+
+.env-row {
+    display: flex;
+    flex-direction: column;
+}
+
+.radio-group {
+    display: flex;
+    gap: 14px;
+    font-size: 13px;
+}
+
+.radio-group label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+    font-weight: 400;
+}
+
+button.primary {
+    width: 100%;
+    padding: 9px 12px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: 0;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+button.primary:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+
+.status {
+    margin: 12px 0 0;
+    min-height: 18px;
+    font-size: 12px;
+}
+
+.status.error {
+    color: var(--error);
+}
+
+.status.success {
+    color: var(--success);
+}
+
+p.muted.ok {
+    color: var(--success);
+}
+
+footer {
+    margin-top: 14px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    font-size: 11px;
+}

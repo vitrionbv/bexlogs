@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+    <!--
+        BexLogs extension icon.
+        Brand glyph re-uses the path data from laravel/resources/js/components/AppLogoIcon.vue
+        (a stylised "B" + three log-line dots), placed on a slate-to-teal rounded tile.
+    -->
+    <defs>
+        <linearGradient id="bex-bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#0f172a" />
+            <stop offset="1" stop-color="#0d9488" />
+        </linearGradient>
+    </defs>
+
+    <rect width="128" height="128" rx="24" fill="url(#bex-bg)" />
+
+    <!-- Subtle top-left inner highlight for depth at large sizes -->
+    <path d="M64 0.5 H24 A23.5 23.5 0 0 0 0.5 24 V64"
+          fill="none"
+          stroke="#ffffff"
+          stroke-opacity="0.08"
+          stroke-width="1"
+          stroke-linecap="round" />
+
+    <!--
+        Brand glyph centered in tile.
+        translate(21.5, 10.625) + scale(3.5) takes the original 32-unit
+        coordinate space and renders the "B" at ~62% of the 128px canvas height.
+    -->
+    <g transform="translate(21.5 10.625) scale(3.5)">
+        <path fill="#ffffff"
+              d="M6 4h11.5a6.5 6.5 0 0 1 4.78 10.91 6.5 6.5 0 0 1-3.78 11.59H6V4Zm5 4v6h6.5a3 3 0 0 0 0-6H11Zm0 10v6h7.5a3 3 0 0 0 0-6H11Z" />
+        <path fill="#ffffff"
+              fill-opacity="0.8"
+              d="M2 8.25a1.25 1.25 0 1 1 2.5 0 1.25 1.25 0 0 1-2.5 0Zm0 7.5a1.25 1.25 0 1 1 2.5 0 1.25 1.25 0 0 1-2.5 0Zm0 7.5a1.25 1.25 0 1 1 2.5 0 1.25 1.25 0 0 1-2.5 0Z" />
+    </g>
+</svg>

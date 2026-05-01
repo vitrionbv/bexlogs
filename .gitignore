@@ -1,0 +1,31 @@
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+.zed/
+*.swp
+
+# Environment
+.env
+.env.*.local
+!.env.example
+!.env.production.example
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# Scraper
+scraper/debug/
+scraper/dist/
+scraper/build/
+
+# Extension build output
+extension/build/
+
+# Deploy artefacts / local runtime
+*.log
+*.pid
+tmp/
