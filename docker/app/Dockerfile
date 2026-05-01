@@ -9,59 +9,20 @@
 #   APP_ROLE=reverb     php artisan reverb:start
 #
 # Built once, run as four services in docker-compose.production.yml.
+#
+# Stage graph:
+#   vendor    ← composer install (no scripts, no autoloader)
+#   frontend  ← needs vendor + PHP so @laravel/vite-plugin-wayfinder can
+#               run `php artisan wayfinder:generate` during `npm run build`
+#   extension ← zips the browser extension
+#   phpdeps   ← composer dump-autoload once public/build is present
+#   runtime   ← nginx + php-fpm, copies phpdeps + extension zip
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─── Stage 1: Vite asset build ───────────────────────────────────────────────
-FROM node:22-alpine AS frontend
-
-WORKDIR /app
-
-# Public-only build-time values. These end up baked into the client JS bundle
-# (they're VITE_-prefixed so Vite exposes them) — they are NOT secrets, just
-# the WebSocket endpoint coordinates and the app name that the in-browser
-# Echo client needs to know to connect.
-ARG VITE_REVERB_APP_KEY=
-ARG VITE_REVERB_HOST=
-ARG VITE_REVERB_PORT=443
-ARG VITE_REVERB_SCHEME=https
-ARG VITE_APP_NAME=BexLogs
-
-COPY laravel/package.json laravel/package-lock.json ./
-COPY laravel/.npmrc ./
-RUN npm ci --no-audit --no-fund
-
-# Need the rest of the source so vite-plugin-wayfinder + tailwindcss can scan
-# templates/routes for class names and generate route helpers.
-COPY laravel/ ./
-
-# Vite loads VITE_* from .env files at build time. The production .env on
-# the host is never copied into the image (.dockerignore excludes it), so
-# we synthesise a minimal .env here from the build args.
-RUN printf '%s\n' \
-        "VITE_REVERB_APP_KEY=${VITE_REVERB_APP_KEY}" \
-        "VITE_REVERB_HOST=${VITE_REVERB_HOST}" \
-        "VITE_REVERB_PORT=${VITE_REVERB_PORT}" \
-        "VITE_REVERB_SCHEME=${VITE_REVERB_SCHEME}" \
-        "VITE_APP_NAME=${VITE_APP_NAME}" \
-    > .env \
-    && npm run build
-
-
-# ─── Stage 1b: Browser-extension zip ─────────────────────────────────────────
-# Built here so the host running deploy doesn't need `zip` installed.
-FROM alpine:3.20 AS extension
-
-RUN apk add --no-cache bash zip
-WORKDIR /src
-COPY extension/ ./
-RUN bash build.sh \
-    && mkdir -p /out \
-    && cp build/bexlogs-extension.zip /out/bexlogs-extension.zip
-
-
-# ─── Stage 2: Composer install ───────────────────────────────────────────────
-FROM php:8.5-cli-alpine AS phpdeps
+# ─── Stage 1: Composer vendor install ────────────────────────────────────────
+# Isolated so frontend can COPY vendor/ without waiting for anything else.
+FROM php:8.5-cli-alpine AS vendor
 
 ENV COMPOSER_ALLOW_SUPERUSER=1 \
     COMPOSER_NO_INTERACTION=1 \
@@ -88,7 +49,87 @@ RUN composer install \
         --no-interaction \
         --prefer-dist
 
+
+# ─── Stage 2: Vite asset build (php + node + vendor + source) ────────────────
+# Wayfinder runs `php artisan wayfinder:generate` during `npm run build`, so
+# this stage needs a PHP CLI with Laravel's core extensions plus the composer
+# vendor tree. Using php:8.5-cli-alpine as the base so the PHP version
+# matches runtime; Node is layered on top.
+FROM php:8.5-cli-alpine AS frontend
+
+ARG VITE_REVERB_APP_KEY=
+ARG VITE_REVERB_HOST=
+ARG VITE_REVERB_PORT=443
+ARG VITE_REVERB_SCHEME=https
+ARG VITE_APP_NAME=BexLogs
+
+RUN apk add --no-cache --virtual .build-deps \
+        autoconf g++ make pkgconf \
+        icu-dev libzip-dev \
+    && apk add --no-cache \
+        nodejs npm \
+        git unzip \
+        icu-libs libzip \
+    && docker-php-ext-install -j"$(nproc)" intl zip bcmath \
+    && apk del .build-deps \
+    && rm -rf /var/cache/apk/*
+
+WORKDIR /app
+
+COPY laravel/package.json laravel/package-lock.json ./
+COPY laravel/.npmrc ./
+RUN npm ci --no-audit --no-fund
+
 COPY laravel/ ./
+COPY --from=vendor /app/vendor ./vendor
+
+# Vite loads VITE_* from .env files at build time. The production .env on
+# the host is never copied into the image (.dockerignore excludes it), so
+# we synthesise a minimal .env here from the build args.
+RUN printf '%s\n' \
+        "VITE_REVERB_APP_KEY=${VITE_REVERB_APP_KEY}" \
+        "VITE_REVERB_HOST=${VITE_REVERB_HOST}" \
+        "VITE_REVERB_PORT=${VITE_REVERB_PORT}" \
+        "VITE_REVERB_SCHEME=${VITE_REVERB_SCHEME}" \
+        "VITE_APP_NAME=${VITE_APP_NAME}" \
+    > .env \
+    && npm run build
+
+
+# ─── Stage 2b: Browser-extension zip ─────────────────────────────────────────
+# Built here so the host running deploy doesn't need `zip` installed.
+FROM alpine:3.20 AS extension
+
+RUN apk add --no-cache bash zip
+WORKDIR /src
+COPY extension/ ./
+RUN bash build.sh \
+    && mkdir -p /out \
+    && cp build/bexlogs-extension.zip /out/bexlogs-extension.zip
+
+
+# ─── Stage 3: Composer dump-autoload ─────────────────────────────────────────
+FROM php:8.5-cli-alpine AS phpdeps
+
+ENV COMPOSER_ALLOW_SUPERUSER=1 \
+    COMPOSER_NO_INTERACTION=1 \
+    COMPOSER_HOME=/tmp/composer
+
+RUN apk add --no-cache --virtual .build-deps \
+        autoconf g++ make pkgconf \
+        icu-dev libzip-dev postgresql-dev \
+    && apk add --no-cache \
+        git unzip libpq icu-libs libzip \
+    && docker-php-ext-install -j"$(nproc)" \
+        pdo_pgsql intl zip bcmath opcache pcntl sockets \
+    && apk del .build-deps
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /app
+
+COPY laravel/ ./
+COPY --from=vendor /app/vendor ./vendor
 COPY --from=frontend /app/public/build ./public/build
 
 # dump-autoload runs the post-autoload-dump scripts (package:discover) by
@@ -97,7 +138,7 @@ COPY --from=frontend /app/public/build ./public/build
 RUN composer dump-autoload --optimize --classmap-authoritative --no-dev
 
 
-# ─── Stage 3: Runtime ────────────────────────────────────────────────────────
+# ─── Stage 4: Runtime ────────────────────────────────────────────────────────
 FROM php:8.5-fpm-alpine AS runtime
 
 ENV APP_ROLE=app \
@@ -127,7 +168,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /var/www/html
 
-COPY --from=phpdeps  --chown=www-data:www-data /app /var/www/html
+COPY --from=phpdeps   --chown=www-data:www-data /app /var/www/html
 COPY --from=extension --chown=www-data:www-data /out/bexlogs-extension.zip /opt/bexlogs/bexlogs-extension.zip
 
 # Pre-create the runtime dirs Laravel writes to, then make the whole tree
