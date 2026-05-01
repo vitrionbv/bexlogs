@@ -73,13 +73,32 @@ RUN npm ci --no-audit --no-fund
 COPY laravel/ ./
 COPY --from=vendor /app/vendor ./vendor
 
+# Build-time .env. We need APP_KEY for Laravel to boot (wayfinder:generate
+# boots the container to discover routes) and neutral drivers so nothing
+# tries to open a DB/Redis/mail connection during static route discovery.
+# APP_KEY value is never used for encryption at build time — it just needs
+# to exist and parse as base64.
 RUN printf '%s\n' \
+        "APP_NAME=${VITE_APP_NAME}" \
+        "APP_ENV=production" \
+        "APP_KEY=base64:$(head -c 32 /dev/urandom | base64)" \
+        "APP_DEBUG=false" \
+        "APP_URL=https://${VITE_REVERB_HOST}" \
+        "LOG_CHANNEL=stderr" \
+        "DB_CONNECTION=sqlite" \
+        "DB_DATABASE=:memory:" \
+        "CACHE_STORE=array" \
+        "SESSION_DRIVER=array" \
+        "QUEUE_CONNECTION=sync" \
+        "BROADCAST_CONNECTION=log" \
+        "MAIL_MAILER=array" \
         "VITE_REVERB_APP_KEY=${VITE_REVERB_APP_KEY}" \
         "VITE_REVERB_HOST=${VITE_REVERB_HOST}" \
         "VITE_REVERB_PORT=${VITE_REVERB_PORT}" \
         "VITE_REVERB_SCHEME=${VITE_REVERB_SCHEME}" \
         "VITE_APP_NAME=${VITE_APP_NAME}" \
     > .env \
+    && php artisan wayfinder:generate --with-form \
     && npm run build
 
 
