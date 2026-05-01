@@ -169,13 +169,23 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             let rows: RawRow[] = [];
             let parsedViaEval = false;
 
-            if (parsed.rowsHtml) {
+            if (typeof parsed.rowsHtml === 'string' && parsed.rowsHtml.length > 0) {
                 rows = await extractRowsFromHtmlString(page, parsed.rowsHtml);
                 nextToken = parsed.nextToken;
+            } else if (parsed.rowsHtml === '') {
+                // Recognized response shape but server returned zero rows
+                // (typical BookingExperts quiet window — overnight, weekend,
+                // any time-slice without events). Skip the in-page eval
+                // fallback (it would just re-run a no-op `.append("")`) and
+                // advance through the next_token the server still handed us.
+                // The pageReceived === 0 branch below logs the quiet-window
+                // page and the runaway-safety cap is still enforced.
+                nextToken = parsed.nextToken;
             } else {
-                // String parsing produced no HTML payload. If the body looks
-                // like Rails-UJS JS, fall back to executing it inside the live
-                // page so any DOM-mutating side effects happen naturally.
+                // parsed.rowsHtml === null: couldn't parse the response shape
+                // at all. If the body looks like Rails-UJS JS, fall back to
+                // executing it inside the live page so any DOM-mutating side
+                // effects happen naturally.
                 const looksLikeJs =
                     /^\s*[;$]/.test(body)
                     || body.includes('$(')
@@ -217,11 +227,26 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 }
 
                 if (!parsedViaEval) {
-                    log.warn('load_more response had no parseable HTML payload — stopping', {
-                        jobId: job.id,
-                        bodyPreview: previewBody(body, 240),
-                    });
-                    break;
+                    // Last-resort: parseLoadMoreResponse already scans the
+                    // full body for next_token=… (see tokenSources fallback)
+                    // and applied the "didn't advance" guard. If a forward-
+                    // moving token still exists, keep walking — the body was
+                    // unparseable but pagination state is intact. Stop only
+                    // when there's truly nothing left to chase.
+                    if (parsed.nextToken !== null) {
+                        log.warn('load_more body unparseable but next_token advances — continuing', {
+                            jobId: job.id,
+                            page: pageCount + 1,
+                            bodyPreview: previewBody(body, 240),
+                        });
+                        nextToken = parsed.nextToken;
+                    } else {
+                        log.warn('load_more response had no parseable HTML payload — stopping', {
+                            jobId: job.id,
+                            bodyPreview: previewBody(body, 240),
+                        });
+                        break;
+                    }
                 }
             }
 

@@ -266,6 +266,16 @@ export function extractRowsFromMain(): InitialPageResult {
  *      HTML (e.g. contains `<tr`, `<article`, `data-controller="log-event"`,
  *      `Webhook`, `Api Call`, or `Details`).
  *
+ * `rowsHtml` semantics:
+ *   - non-empty `string` — row payload extracted; feed to extractRowsFromHtmlString.
+ *   - `''` (empty string) — recognized response shape (Turbo Stream OR jQuery
+ *     $().append/.html) but no row payload found. This is the BookingExperts
+ *     "quiet window" shape: server returned zero events for this slice but
+ *     still handed us a forward-moving next_token in the load-more button.
+ *     The caller should advance via `nextToken` instead of bailing.
+ *   - `null` — couldn't recognize the response shape at all. The caller may
+ *     fall back to in-page JS eval / regex strategies.
+ *
  * `previousToken` is the token that was sent in the request that produced
  * this response. If the parsed `next_token` equals it, we return `null` to
  * defensively break the pagination loop ("token never advances").
@@ -281,10 +291,15 @@ export function parseLoadMoreResponse(
     const ROW_SHAPE_RE = /<tr\b|<article\b|data-controller=["'][^"']*log-event|Webhook|Api ?Call/i;
 
     let pagerInnerHtml: string | null = null;
+    // Whether we recognized the response as a known shape (Turbo Stream or
+    // legacy Rails-UJS jQuery). Used at the end to distinguish "explicit
+    // zero-row page" (`rowsHtml = ''`) from "totally unparseable" (`null`).
+    let recognizedShape = false;
 
     // Strategy 1: Turbo Stream blocks.
     const hasTurboStream = /<turbo-stream\b/i.test(jsBody);
     if (hasTurboStream) {
+        recognizedShape = true;
         const rowsParts: string[] = [];
         const turboBlockRe = /<turbo-stream\b([^>]*)>([\s\S]*?)<\/turbo-stream>/gi;
         let match: RegExpExecArray | null;
@@ -320,11 +335,18 @@ export function parseLoadMoreResponse(
     if (!result.rowsHtml && !hasTurboStream) {
         const appendChunks: string[] = [];
         const htmlChunks: string[] = [];
+        // NOTE: we keep empty captures (e.g. `.append("")`) so the presence of
+        // the call alone marks the body as a recognized shape. The row /
+        // pager filters below will reject empty strings on their merits.
         for (const m of jsBody.matchAll(/\.append\(\s*"((?:\\.|[^"\\])*)"\s*\)/g)) {
-            if (m[1]) appendChunks.push(unescapeJs(m[1]));
+            appendChunks.push(unescapeJs(m[1] ?? ''));
         }
         for (const m of jsBody.matchAll(/\.html\(\s*"((?:\\.|[^"\\])*)"\s*\)/g)) {
-            if (m[1]) htmlChunks.push(unescapeJs(m[1]));
+            htmlChunks.push(unescapeJs(m[1] ?? ''));
+        }
+
+        if (appendChunks.length > 0 || htmlChunks.length > 0) {
+            recognizedShape = true;
         }
 
         const rowCandidates = [...appendChunks, ...htmlChunks].filter(
@@ -395,6 +417,15 @@ export function parseLoadMoreResponse(
         } else {
             result.nextToken = decoded;
         }
+    }
+
+    // Recognized response shape (Turbo Stream or jQuery $().append/.html) but
+    // no row payload extracted: surface as `rowsHtml = ''` so the caller can
+    // treat this as a quiet-window page (no rows, advance via next_token)
+    // rather than as an unparseable response. Leave `null` if we never saw a
+    // recognized shape — the caller has its own in-page eval fallback.
+    if (result.rowsHtml === null && recognizedShape) {
+        result.rowsHtml = '';
     }
 
     return result;

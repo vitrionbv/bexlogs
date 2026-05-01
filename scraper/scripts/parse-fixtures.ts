@@ -145,6 +145,86 @@ const realBody =
     );
 }
 
+// ---- Fixture E: quiet-window page (empty append + next_token in button) --
+// Real-world shape from a BookingExperts subscription with no events in the
+// requested time slice. The `$('#log-events').append("")` is an explicit
+// "no rows for this page" while the load-more form still carries a forward-
+// moving next_token. parseLoadMoreResponse must surface this as
+// `rowsHtml = ''` (NOT null) so the main loop treats it as a quiet-window
+// page and keeps paginating instead of bailing as "unparseable".
+console.log('\nFixture E: quiet-window page (empty append + next_token in button)');
+const quietWindowBody =
+    `if (window.alertBox) {\n}\n\n` +
+    `$('#log-events').append("");\n` +
+    `$('#load-more-button').html("<form data-remote=\\"true\\" ` +
+    `action=\\"/o/0/a/0/s/0/load_more_logs.js?next_token=QUIET%2Fnext\\" ` +
+    `method=\\"get\\"><button>Laad meer...<\\/button><\\/form>");`;
+{
+    const result = parseLoadMoreResponse(quietWindowBody, 'OLDTOKEN');
+    check(
+        'rowsHtml === "" (recognized shape, zero rows)',
+        result.rowsHtml === '',
+        { rowsHtml: result.rowsHtml },
+    );
+    check(
+        'nextToken decoded from load-more-button HTML',
+        result.nextToken === 'QUIET/next',
+        { nextToken: result.nextToken },
+    );
+    check(
+        'nextToken advanced past previousToken',
+        result.nextToken !== null && result.nextToken !== 'OLDTOKEN',
+        { nextToken: result.nextToken },
+    );
+}
+
+// ---- Fixture F: end-of-stream (empty append, no next_token) --------------
+// BookingExperts has nothing left to paginate: the response acknowledges the
+// request with an empty append and either omits the load-more button update
+// or sets it to empty. parseLoadMoreResponse should still recognize the
+// shape (rowsHtml === '') so the caller doesn't try the eval fallback, and
+// nextToken === null so the while-loop exits cleanly via its `nextToken &&`
+// guard rather than via the unparseable branch.
+console.log('\nFixture F: end-of-stream (empty append, no next_token)');
+const endOfStreamBody =
+    `if (window.alertBox) {\n}\n\n` +
+    `$('#log-events').append("");\n` +
+    `$('#load-more-button').html("");`;
+{
+    const result = parseLoadMoreResponse(endOfStreamBody, 'OLDTOKEN');
+    check(
+        'rowsHtml === "" (recognized shape, zero rows)',
+        result.rowsHtml === '',
+        { rowsHtml: result.rowsHtml },
+    );
+    check(
+        'nextToken === null (no pagination state left)',
+        result.nextToken === null,
+        { nextToken: result.nextToken },
+    );
+}
+
+// ---- Fixture G: totally unparseable body --------------------------------
+// No turbo-stream, no $().append/.html, no next_token anywhere. The parser
+// should leave `rowsHtml = null` (NOT '') so the main loop falls into its
+// in-page eval / "stopping" branch rather than treating this as a quiet
+// window.
+console.log('\nFixture G: unrecognized response shape');
+const garbageBody = `if (window.alertBox) {\n}\n\n// nothing useful here`;
+{
+    const result = parseLoadMoreResponse(garbageBody, null);
+    check(
+        'rowsHtml === null (unrecognized shape)',
+        result.rowsHtml === null,
+        { rowsHtml: result.rowsHtml },
+    );
+    check(
+        'nextToken === null',
+        result.nextToken === null,
+        { nextToken: result.nextToken },
+    );
+}
+
 if (failures > 0) {
     console.error(`\n${failures} assertion(s) failed.`);
     process.exit(1);
