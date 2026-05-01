@@ -17,25 +17,25 @@
 #   extension ← zips the browser extension
 #   phpdeps   ← composer dump-autoload once public/build is present
 #   runtime   ← nginx + php-fpm, copies phpdeps + extension zip
+#
+# All PHP extensions are installed with mlocati/docker-php-extension-installer
+# which handles apk build deps + runtime libs + cleanup in one go. Way more
+# robust than upstream docker-php-ext-install (which has a parallel-build
+# race that hits `install-modules` when -j > 1).
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─── Stage 1: Composer vendor install ────────────────────────────────────────
-# Isolated so frontend can COPY vendor/ without waiting for anything else.
 FROM php:8.5-cli-alpine AS vendor
+
+COPY --from=mlocati/php-extension-installer:2 /usr/bin/install-php-extensions /usr/local/bin/
 
 ENV COMPOSER_ALLOW_SUPERUSER=1 \
     COMPOSER_NO_INTERACTION=1 \
     COMPOSER_HOME=/tmp/composer
 
-RUN apk add --no-cache --virtual .build-deps \
-        autoconf g++ make pkgconf \
-        icu-dev libzip-dev postgresql-dev \
-    && apk add --no-cache \
-        git unzip libpq icu-libs libzip \
-    && docker-php-ext-install -j"$(nproc)" \
-        pdo_pgsql intl zip bcmath opcache pcntl sockets \
-    && apk del .build-deps
+RUN apk add --no-cache git unzip \
+    && install-php-extensions pdo_pgsql intl zip bcmath opcache pcntl sockets
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
@@ -51,10 +51,6 @@ RUN composer install \
 
 
 # ─── Stage 2: Vite asset build (php + node + vendor + source) ────────────────
-# Wayfinder runs `php artisan wayfinder:generate` during `npm run build`, so
-# this stage needs a PHP CLI with Laravel's core extensions plus the composer
-# vendor tree. Using php:8.5-cli-alpine as the base so the PHP version
-# matches runtime; Node is layered on top.
 FROM php:8.5-cli-alpine AS frontend
 
 ARG VITE_REVERB_APP_KEY=
@@ -63,16 +59,10 @@ ARG VITE_REVERB_PORT=443
 ARG VITE_REVERB_SCHEME=https
 ARG VITE_APP_NAME=BexLogs
 
-RUN apk add --no-cache --virtual .build-deps \
-        autoconf g++ make pkgconf \
-        icu-dev libzip-dev \
-    && apk add --no-cache \
-        nodejs npm \
-        git unzip \
-        icu-libs libzip \
-    && docker-php-ext-install -j"$(nproc)" intl zip bcmath \
-    && apk del .build-deps \
-    && rm -rf /var/cache/apk/*
+COPY --from=mlocati/php-extension-installer:2 /usr/bin/install-php-extensions /usr/local/bin/
+
+RUN apk add --no-cache nodejs npm git unzip \
+    && install-php-extensions intl zip bcmath
 
 WORKDIR /app
 
@@ -83,9 +73,6 @@ RUN npm ci --no-audit --no-fund
 COPY laravel/ ./
 COPY --from=vendor /app/vendor ./vendor
 
-# Vite loads VITE_* from .env files at build time. The production .env on
-# the host is never copied into the image (.dockerignore excludes it), so
-# we synthesise a minimal .env here from the build args.
 RUN printf '%s\n' \
         "VITE_REVERB_APP_KEY=${VITE_REVERB_APP_KEY}" \
         "VITE_REVERB_HOST=${VITE_REVERB_HOST}" \
@@ -97,7 +84,6 @@ RUN printf '%s\n' \
 
 
 # ─── Stage 2b: Browser-extension zip ─────────────────────────────────────────
-# Built here so the host running deploy doesn't need `zip` installed.
 FROM alpine:3.20 AS extension
 
 RUN apk add --no-cache bash zip
@@ -111,18 +97,14 @@ RUN bash build.sh \
 # ─── Stage 3: Composer dump-autoload ─────────────────────────────────────────
 FROM php:8.5-cli-alpine AS phpdeps
 
+COPY --from=mlocati/php-extension-installer:2 /usr/bin/install-php-extensions /usr/local/bin/
+
 ENV COMPOSER_ALLOW_SUPERUSER=1 \
     COMPOSER_NO_INTERACTION=1 \
     COMPOSER_HOME=/tmp/composer
 
-RUN apk add --no-cache --virtual .build-deps \
-        autoconf g++ make pkgconf \
-        icu-dev libzip-dev postgresql-dev \
-    && apk add --no-cache \
-        git unzip libpq icu-libs libzip \
-    && docker-php-ext-install -j"$(nproc)" \
-        pdo_pgsql intl zip bcmath opcache pcntl sockets \
-    && apk del .build-deps
+RUN apk add --no-cache git unzip \
+    && install-php-extensions pdo_pgsql intl zip bcmath opcache pcntl sockets
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
@@ -132,14 +114,13 @@ COPY laravel/ ./
 COPY --from=vendor /app/vendor ./vendor
 COPY --from=frontend /app/public/build ./public/build
 
-# dump-autoload runs the post-autoload-dump scripts (package:discover) by
-# default, so this single command finalises both the optimised classmap
-# and the Laravel package manifest.
 RUN composer dump-autoload --optimize --classmap-authoritative --no-dev
 
 
 # ─── Stage 4: Runtime ────────────────────────────────────────────────────────
 FROM php:8.5-fpm-alpine AS runtime
+
+COPY --from=mlocati/php-extension-installer:2 /usr/bin/install-php-extensions /usr/local/bin/
 
 ENV APP_ROLE=app \
     PHP_OPCACHE_VALIDATE_TIMESTAMPS=0 \
@@ -147,17 +128,11 @@ ENV APP_ROLE=app \
     PHP_UPLOAD_MAX_FILESIZE=64M \
     PHP_POST_MAX_SIZE=64M
 
-RUN apk add --no-cache --virtual .build-deps \
-        autoconf g++ make pkgconf \
-        icu-dev libzip-dev postgresql-dev \
-    && apk add --no-cache \
+RUN apk add --no-cache \
         bash curl tini ca-certificates tzdata \
         nginx supervisor \
-        libpq icu-libs libzip \
-    && docker-php-ext-install -j"$(nproc)" \
-        pdo_pgsql intl zip bcmath opcache pcntl sockets \
-    && apk del .build-deps \
-    && rm -rf /var/cache/apk/*
+    && install-php-extensions pdo_pgsql intl zip bcmath opcache pcntl sockets \
+    && rm -rf /usr/local/bin/install-php-extensions /var/cache/apk/*
 
 COPY docker/app/php.ini        /usr/local/etc/php/conf.d/zz-bexlogs.ini
 COPY docker/app/php-fpm.conf   /usr/local/etc/php-fpm.d/zz-bexlogs.conf
@@ -171,10 +146,6 @@ WORKDIR /var/www/html
 COPY --from=phpdeps   --chown=www-data:www-data /app /var/www/html
 COPY --from=extension --chown=www-data:www-data /out/bexlogs-extension.zip /opt/bexlogs/bexlogs-extension.zip
 
-# Pre-create the runtime dirs Laravel writes to, then make the whole tree
-# owned by www-data. storage/ is mounted as a volume in production, but the
-# image still needs the skeleton so the volume picks the perms up on first
-# create.
 RUN mkdir -p \
         storage/framework/cache/data \
         storage/framework/sessions \
