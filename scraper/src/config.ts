@@ -5,7 +5,7 @@ const envSchema = z.object({
     LARAVEL_BASE_URL: z.string().url(),
     WORKER_API_TOKEN: z.string().min(8),
     POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
-    MAX_CONCURRENT_SCRAPES: z.coerce.number().int().positive().default(2),
+    MAX_CONCURRENT_SCRAPES: z.coerce.number().int().positive().default(8),
     MAX_PAGES_PER_JOB: z.coerce.number().int().positive().default(2000),
     BATCH_SIZE: z.coerce.number().int().positive().default(100),
     // Early-stop knobs: stop paginating once we've seen at least

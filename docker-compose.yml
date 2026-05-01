@@ -45,7 +45,7 @@ services:
       LARAVEL_BASE_URL: ${LARAVEL_BASE_URL:-http://host.docker.internal:8000}
       WORKER_API_TOKEN: ${WORKER_API_TOKEN:-change-me-in-production-please}
       POLL_INTERVAL_MS: 5000
-      MAX_CONCURRENT_SCRAPES: 2
+      MAX_CONCURRENT_SCRAPES: 8
       HEADLESS: "true"
       LOG_LEVEL: info
     extra_hosts:
