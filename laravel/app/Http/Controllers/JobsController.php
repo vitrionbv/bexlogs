@@ -164,19 +164,66 @@ class JobsController extends Controller
 
             $count = DB::table('scrape_jobs')->whereIn('id', $ids)->delete();
 
-            // Reset the sequence so the next insert is contiguous, but only
-            // when it can't collide with an in-flight queued/running row.
-            $remainingMax = (int) DB::table('scrape_jobs')->max('id');
-            if ($remainingMax === 0) {
-                DB::statement('ALTER SEQUENCE scrape_jobs_id_seq RESTART WITH 1');
-            } else {
-                DB::statement("SELECT setval('scrape_jobs_id_seq', {$remainingMax}, true)");
-            }
+            $this->alignScrapeJobsIdSequenceAfterDeletion();
 
             return $count;
         });
 
         return back()->with('status', "purged-{$deleted}-jobs");
+    }
+
+    public function purgeFailed(Request $request): RedirectResponse
+    {
+        $userId = $request->user()->id;
+
+        $deleted = DB::transaction(function () use ($userId) {
+            $ids = DB::table('scrape_jobs')
+                ->join('subscriptions', 'subscriptions.id', '=', 'scrape_jobs.subscription_id')
+                ->join('applications', 'applications.id', '=', 'subscriptions.application_id')
+                ->join('organizations', 'organizations.id', '=', 'applications.organization_id')
+                ->where('organizations.user_id', $userId)
+                ->where('scrape_jobs.status', ScrapeJob::STATUS_FAILED)
+                ->pluck('scrape_jobs.id');
+
+            if ($ids->isEmpty()) {
+                return 0;
+            }
+
+            $count = DB::table('scrape_jobs')->whereIn('id', $ids)->delete();
+
+            $this->alignScrapeJobsIdSequenceAfterDeletion();
+
+            return $count;
+        });
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => $deleted === 0
+                ? 'No failed jobs to remove.'
+                : ($deleted === 1 ? 'Removed 1 failed job.' : "Removed {$deleted} failed jobs."),
+        ]);
+
+        return back()
+            ->with('status', 'failed-jobs-purged')
+            ->with('failed_purged_count', $deleted);
+    }
+
+    /**
+     * Reset the PostgreSQL sequence so the next insert is contiguous after
+     * bulk deletes. Skipped on other drivers (e.g. sqlite in tests).
+     */
+    private function alignScrapeJobsIdSequenceAfterDeletion(): void
+    {
+        if (DB::getDriverName() !== 'pgsql') {
+            return;
+        }
+
+        $remainingMax = (int) DB::table('scrape_jobs')->max('id');
+        if ($remainingMax === 0) {
+            DB::statement('ALTER SEQUENCE scrape_jobs_id_seq RESTART WITH 1');
+        } else {
+            DB::statement("SELECT setval('scrape_jobs_id_seq', {$remainingMax}, true)");
+        }
     }
 
     private function authorizeJob(Request $request, ScrapeJob $job): void

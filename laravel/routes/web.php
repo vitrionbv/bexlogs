@@ -39,6 +39,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     // NOTE: must be registered before the `jobs/{job}` destroy route, otherwise
     // `DELETE /jobs/old` would be captured by route-model-binding and 404.
     Route::delete('jobs/old', [JobsController::class, 'purge'])->name('jobs.purge');
+    Route::delete('jobs/failed', [JobsController::class, 'purgeFailed'])->name('jobs.purge_failed');
     Route::delete('jobs/{job}', [JobsController::class, 'destroy'])->name('jobs.destroy');
 
     // Logs = per-subscription log feeds. One row per (org × app × subscription).

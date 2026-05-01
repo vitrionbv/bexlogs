@@ -178,6 +178,9 @@ return;
 const purgeOpen = ref(false);
 const purging = ref(false);
 
+const purgeFailedOpen = ref(false);
+const purgingFailed = ref(false);
+
 const purgeableCount = computed(
     () =>
         (props.statusCounts.completed ?? 0) +
@@ -185,10 +188,28 @@ const purgeableCount = computed(
         (props.statusCounts.cancelled ?? 0),
 );
 
+function purgeFailed() {
+    if (purgingFailed.value) {
+        return;
+    }
+
+    purgingFailed.value = true;
+    router.delete('/jobs/failed', {
+        preserveScroll: true,
+        onSuccess: () => {
+            purgeFailedOpen.value = false;
+        },
+        onError: () => toast.error('Failed to remove failed jobs'),
+        onFinish: () => {
+            purgingFailed.value = false;
+        },
+    });
+}
+
 function purge() {
     if (purging.value) {
-return;
-}
+        return;
+    }
 
     purging.value = true;
     router.delete('/jobs/old', {
@@ -405,7 +426,21 @@ const Field = defineComponent({
                         inserted vs received when they differ (duplicates overlap).
                     </p>
                 </div>
-                <div class="flex items-center gap-2">
+                <div class="flex flex-wrap items-center gap-2">
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        class="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        :disabled="(statusCounts.failed ?? 0) === 0"
+                        :title="
+                            (statusCounts.failed ?? 0) === 0
+                                ? 'No failed jobs to remove'
+                                : `Remove ${statusCounts.failed} failed job${(statusCounts.failed ?? 0) === 1 ? '' : 's'}`
+                        "
+                        @click="purgeFailedOpen = true"
+                    >
+                        <Trash2 class="mr-1 size-4" /> Purge failed jobs
+                    </Button>
                     <Button
                         variant="outline"
                         size="sm"
@@ -583,6 +618,25 @@ const Field = defineComponent({
                 </CardContent>
             </Card>
         </div>
+
+        <Dialog v-model:open="purgeFailedOpen">
+            <DialogContent class="sm:max-w-md">
+                <DialogHeader>
+                    <DialogTitle>Delete all failed jobs?</DialogTitle>
+                    <DialogDescription>
+                        This cannot be undone. Only jobs in the failed state are removed; queued, running, completed, and
+                        cancelled jobs are not affected.
+                    </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                    <Button variant="ghost" :disabled="purgingFailed" @click="purgeFailedOpen = false">Cancel</Button>
+                    <Button variant="destructive" :disabled="purgingFailed" @click="purgeFailed">
+                        <Loader2 v-if="purgingFailed" class="mr-1 size-4 animate-spin" />
+                        Delete failed jobs
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
 
         <Dialog v-model:open="purgeOpen">
             <DialogContent class="sm:max-w-md">
