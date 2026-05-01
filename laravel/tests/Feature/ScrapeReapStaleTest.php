@@ -98,6 +98,7 @@ class ScrapeReapStaleTest extends TestCase
             'Worker did not send a heartbeat for over 3 minutes; job reaped as stale.',
             $job->error,
         );
+        $this->assertSame('worker_reaped', $job->stats['stop_reason'] ?? null);
 
         Event::assertDispatched(ScrapeJobUpdated::class, 1);
         Event::assertDispatched(
@@ -106,6 +107,34 @@ class ScrapeReapStaleTest extends TestCase
                 && $e->status === ScrapeJob::STATUS_FAILED
                 && $e->subscriptionId === (string) $this->subscription->id,
         );
+    }
+
+    public function test_reaper_preserves_existing_stats_when_stamping_stop_reason(): void
+    {
+        Event::fake([ScrapeJobUpdated::class]);
+
+        $job = $this->makeJob([
+            'status' => ScrapeJob::STATUS_RUNNING,
+            'started_at' => now()->subMinutes(15),
+            'last_heartbeat_at' => now()->subMinutes(10),
+            'stats' => [
+                'rows_received' => 50,
+                'rows_inserted' => 48,
+                'batches' => 5,
+                'pages_processed' => 3,
+            ],
+        ]);
+
+        $this->artisan('scrape:reap-stale')->assertSuccessful();
+
+        $job->refresh();
+        $stats = $job->stats ?? [];
+
+        $this->assertSame('worker_reaped', $stats['stop_reason'] ?? null);
+        $this->assertSame(50, (int) ($stats['rows_received'] ?? 0));
+        $this->assertSame(48, (int) ($stats['rows_inserted'] ?? 0));
+        $this->assertSame(5, (int) ($stats['batches'] ?? 0));
+        $this->assertSame(3, (int) ($stats['pages_processed'] ?? 0));
     }
 
     public function test_running_job_with_recent_heartbeat_is_left_alone(): void

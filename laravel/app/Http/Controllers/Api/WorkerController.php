@@ -20,6 +20,34 @@ use Symfony\Component\HttpFoundation\Response as SymfonyResponse;
 class WorkerController extends Controller
 {
     /**
+     * Sentinel string the Playwright worker emits when it sees a 401/403 on
+     * /load_more_logs.js or lands on /sign_in. Mirrors `SESSION_EXPIRED_SENTINEL`
+     * in `scraper/src/scrape.ts` — keep in sync. We detect it inside `fail()`
+     * to stamp `stats.stop_reason = session_expired` without requiring the
+     * worker to send a separate field.
+     */
+    private const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
+
+    /**
+     * Allowed values for `stats.stop_reason`. Mirrors the `StopReason` union
+     * in `scraper/src/types.ts` plus the `worker_reaped` value emitted by
+     * `ScrapeReapStale`. The Jobs UI maps these to human-readable labels in
+     * `pages/Jobs/Index.vue`.
+     */
+    public const STOP_REASONS = [
+        'natural_end',
+        'duplicate_detection',
+        'pagination_limit',
+        'time_limit',
+        'unparseable',
+        'token_echo',
+        'runaway_safety',
+        'empty_window',
+        'session_expired',
+        'worker_reaped',
+    ];
+
+    /**
      * Pull the next queued job (FIFO) and mark it running.
      * Response 200 with job, or 204 if nothing to do.
      */
@@ -248,8 +276,14 @@ class WorkerController extends Controller
             'aborted_due_to_time' => 'nullable|boolean',
             'early_stopped_due_to_duplicates' => 'nullable|boolean',
             'total_duplicates' => 'nullable|integer',
+            'stop_reason' => ['nullable', 'string', 'in:'.implode(',', self::STOP_REASONS)],
         ]);
 
+        // array_filter strips keys whose value is null so we don't clobber
+        // existing per-batch counters (`rows_received`, `rows_inserted`,
+        // `batches`, `last_batch_at`, `pages_processed`) with nulls when
+        // the worker omits a field. Any explicit value — including
+        // `stop_reason` — overlays cleanly via array_merge.
         $incoming = array_filter($stats, fn ($v) => $v !== null);
         $current = $job->fresh();
         $mergedStats = array_merge($current->stats ?? [], $incoming);
@@ -276,11 +310,24 @@ class WorkerController extends Controller
             'retryable' => 'nullable|boolean',
         ]);
 
-        $job->update([
+        // Only the session-expired path gets a labelled stop_reason on
+        // failure — every other error message is generic enough that
+        // forcing a category would mislead operators. Generic failures
+        // leave stop_reason unset; the UI hides the badge in that case.
+        $update = [
             'status' => ScrapeJob::STATUS_FAILED,
             'completed_at' => now(),
             'error' => $payload['error'],
-        ]);
+        ];
+
+        if ($payload['error'] === self::SESSION_EXPIRED_SENTINEL) {
+            $update['stats'] = array_merge(
+                $job->stats ?? [],
+                ['stop_reason' => 'session_expired'],
+            );
+        }
+
+        $job->update($update);
 
         broadcast(ScrapeJobUpdated::fromJob($job->fresh()));
 

@@ -1,7 +1,7 @@
 import { fetch } from 'undici';
 import { config } from './config.js';
 import { log } from './log.js';
-import type { ParsedLogMessage, ScrapeJob } from './types.js';
+import type { ParsedLogMessage, ScrapeJob, StopReason } from './types.js';
 
 const headers = (): Record<string, string> => ({
     Authorization: `Bearer ${config.WORKER_API_TOKEN}`,
@@ -63,6 +63,7 @@ export async function completeJob(
         aborted_due_to_time?: boolean;
         early_stopped_due_to_duplicates?: boolean;
         total_duplicates?: number;
+        stop_reason?: StopReason;
     },
 ): Promise<void> {
     const res = await fetch(url(`/api/worker/jobs/${jobId}/complete`), {

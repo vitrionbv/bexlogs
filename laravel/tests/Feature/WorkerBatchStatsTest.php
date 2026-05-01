@@ -132,6 +132,34 @@ class WorkerBatchStatsTest extends TestCase
         $this->assertSame(1, (int) ($this->job->stats['batches'] ?? 0));
     }
 
+    public function test_complete_persists_stop_reason_alongside_prior_batch_counters(): void
+    {
+        $this->postBatch([$this->message('2026-05-01T12:00:00Z', 1)])->assertOk();
+
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 7,
+                'rows' => 42,
+                'duration_ms' => 2500,
+                'aborted_due_to_time' => false,
+                'early_stopped_due_to_duplicates' => true,
+                'total_duplicates' => 12,
+                'stop_reason' => 'duplicate_detection',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $stats = $this->job->stats ?? [];
+
+        $this->assertSame('duplicate_detection', $stats['stop_reason'] ?? null);
+        $this->assertTrue((bool) ($stats['early_stopped_due_to_duplicates'] ?? false));
+        $this->assertSame(12, (int) ($stats['total_duplicates'] ?? 0));
+        // The per-batch counters from the prior /batch POST must survive
+        // the /complete merge — see WorkerController::complete().
+        $this->assertSame(1, (int) ($stats['rows_inserted'] ?? 0));
+        $this->assertSame(1, (int) ($stats['batches'] ?? 0));
+    }
+
     /** @param array<int, array<string, mixed>> $messages */
     private function postBatch(array $messages, ?int $pagesProcessed = null): TestResponse
     {

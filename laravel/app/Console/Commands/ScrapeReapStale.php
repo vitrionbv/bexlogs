@@ -71,6 +71,14 @@ class ScrapeReapStale extends Command
             $job->status = ScrapeJob::STATUS_FAILED;
             $job->completed_at = now();
             $job->error = $errorMessage;
+            // Stamp `stop_reason` into the existing stats blob so the Jobs
+            // UI can show the "Worker reaped" badge alongside whatever
+            // partial per-batch counters the worker managed to ship before
+            // it died. Preserves prior keys (rows_received, batches, etc.).
+            $job->stats = array_merge(
+                $job->stats ?? [],
+                ['stop_reason' => 'worker_reaped'],
+            );
             $job->save();
 
             // Match the rest of the app: dispatch via broadcast() so the

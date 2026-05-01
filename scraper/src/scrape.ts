@@ -7,7 +7,7 @@ import { extractRowsFromMain, parseLoadMoreResponse, type RawRow } from './extra
 import { rowToMessage } from './rowParser.js';
 import { log } from './log.js';
 import { postBatch, completeJob, failJob, heartbeat, reportSessionExpired } from './api.js';
-import type { ParsedLogMessage, ScrapeJob } from './types.js';
+import type { ParsedLogMessage, ScrapeJob, StopReason } from './types.js';
 
 const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
 
@@ -24,6 +24,7 @@ export interface ScrapeResult {
     aborted_due_to_time: boolean;
     early_stopped_due_to_duplicates: boolean;
     total_duplicates: number;
+    stop_reason: StopReason;
 }
 
 /**
@@ -49,6 +50,14 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     let pageCount = 0;
     let rowCount = 0;
     let abortedDueToTime = false;
+    // Track which break/return path the main loop exits through. Default
+    // to `natural_end` so a clean fall-through (nextToken === null with no
+    // earlier reason set) reports the boring "we ran out of pages" case.
+    // `stopReasonSet` distinguishes an explicit assignment from the default
+    // — needed to tell `natural_end` (token went null) from `pagination_limit`
+    // (loop condition exit while a token is still in hand).
+    let stopReason: StopReason = 'natural_end';
+    let stopReasonSet = false;
     // Early-stop tracking: count how many consecutive load_more pages came
     // back as 100% duplicates (received > 0 && inserted === 0), and the
     // running total of (received - inserted) across the whole job. The
@@ -102,6 +111,16 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         totalDuplicatesObserved += initialStats.duplicates;
         pageCount++;
 
+        // Job 72 pattern: server gave us a fully-rendered page with zero
+        // rows AND no next_token to chase. There's nothing to paginate
+        // through and nothing to show — distinct enough from "natural_end"
+        // (which implies we walked at least some real data) that it gets
+        // its own label so operators can spot quiet windows at a glance.
+        if (initial.rows.length === 0 && !initial.nextToken) {
+            stopReason = 'empty_window';
+            stopReasonSet = true;
+        }
+
         // Subsequent pages: pure XHR via APIRequestContext (no clicks).
         let nextToken = initial.nextToken;
         const apiCtx: APIRequestContext = context.request;
@@ -124,6 +143,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     rows: rowCount,
                 });
                 abortedDueToTime = true;
+                stopReason = 'time_limit';
+                stopReasonSet = true;
                 nextToken = null;
                 break;
             }
@@ -143,6 +164,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
 
             if (xhr.status() === 422) {
                 log.info('load_more returned 422 — pagination exhausted', { jobId: job.id });
+                stopReason = 'natural_end';
+                stopReasonSet = true;
                 nextToken = null;
                 break;
             }
@@ -245,6 +268,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                             jobId: job.id,
                             bodyPreview: previewBody(body, 240),
                         });
+                        stopReason = 'unparseable';
+                        stopReasonSet = true;
                         break;
                     }
                 }
@@ -287,6 +312,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 });
                 nextToken = null;
                 earlyStoppedDueToDuplicates = true;
+                stopReason = 'duplicate_detection';
+                stopReasonSet = true;
                 break;
             }
 
@@ -310,6 +337,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                         consecutive: consecutiveZeroRowPages,
                         lastTokenPrefix: nextToken ? nextToken.slice(0, 12) : null,
                     });
+                    stopReason = 'runaway_safety';
+                    stopReasonSet = true;
                     break;
                 }
             } else {
@@ -323,11 +352,24 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     jobId: job.id,
                     page: pageCount,
                 });
+                stopReason = 'token_echo';
+                stopReasonSet = true;
                 break;
             }
 
             await heartbeat(job.id).catch(() => undefined);
             await sleep(jitter(200, 800));
+        }
+
+        // Loop exit. If nothing inside the loop captured a specific reason,
+        // distinguish "ran out of pages" (token went null) from "hit the
+        // page-cap" (max_pages clamp). Either is a clean exit, but the
+        // operator-visible labels carry different signals: `pagination_limit`
+        // hints that raising the cap might recover more rows; `natural_end`
+        // means we're caught up.
+        if (!stopReasonSet) {
+            const maxPages = job.params.max_pages ?? config.MAX_PAGES_PER_JOB;
+            stopReason = pageCount >= maxPages ? 'pagination_limit' : 'natural_end';
         }
 
         const stats: ScrapeResult = {
@@ -337,6 +379,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             aborted_due_to_time: abortedDueToTime,
             early_stopped_due_to_duplicates: earlyStoppedDueToDuplicates,
             total_duplicates: totalDuplicatesObserved,
+            stop_reason: stopReason,
         };
         await completeJob(job.id, stats);
         log.info('scrape complete', { jobId: job.id, ...stats });
@@ -344,8 +387,18 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const isExpired = message === SESSION_EXPIRED_SENTINEL || /sign_in/.test(message);
+        // Laravel's WorkerController::fail() detects this same sentinel on
+        // the server side and writes `stop_reason: session_expired` into
+        // stats; setting it here too keeps scraper logs honest about why
+        // the loop unwound (especially useful for replaying via
+        // `npm run scrape:once`).
         if (isExpired) {
-            log.warn('session expired — reporting back to Laravel', { jobId: job.id, sessionId: job.session.id });
+            stopReason = 'session_expired';
+            log.warn('session expired — reporting back to Laravel', {
+                jobId: job.id,
+                sessionId: job.session.id,
+                stopReason,
+            });
             await reportSessionExpired(job.session.id).catch(() => undefined);
         } else {
             log.error('scrape failed', { jobId: job.id, error: message });

@@ -47,6 +47,18 @@ import {
 } from '@/components/ui/table';
 import { useUserChannel } from '@/composables/useRealtime';
 
+type StopReason =
+    | 'natural_end'
+    | 'duplicate_detection'
+    | 'pagination_limit'
+    | 'time_limit'
+    | 'unparseable'
+    | 'token_echo'
+    | 'runaway_safety'
+    | 'empty_window'
+    | 'session_expired'
+    | 'worker_reaped';
+
 type ScrapeJobStats = {
     rows?: number;
     rows_received?: number;
@@ -56,6 +68,10 @@ type ScrapeJobStats = {
     pages_processed?: number;
     pages?: number;
     duration_ms?: number;
+    aborted_due_to_time?: boolean;
+    early_stopped_due_to_duplicates?: boolean;
+    total_duplicates?: number;
+    stop_reason?: StopReason;
     [key: string]: unknown;
 };
 
@@ -154,6 +170,86 @@ const STATUS_META = {
     failed: { variant: 'destructive' as const, icon: AlertTriangle, label: 'Failed' },
     cancelled: { variant: 'outline' as const, icon: XCircle, label: 'Cancelled' },
 };
+
+type StopReasonMeta = {
+    label: string;
+    variant: 'secondary' | 'warning' | 'destructive';
+    description: string;
+};
+
+// Each entry maps the scraper-emitted enum value (`StopReason` in
+// scraper/src/types.ts + `worker_reaped` from `ScrapeReapStale`) to the
+// human-readable badge surface and a tooltip blurb. Variant choice:
+//   - secondary  → expected, harmless terminations (natural end / quiet window)
+//   - warning    → policy-driven cuts the operator may want to revisit
+//                  (duplicate dedup, page cap, budget cap)
+//   - destructive → worker hit a real fault path
+const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
+    natural_end: {
+        label: 'Natural end',
+        variant: 'secondary',
+        description: 'Pagination exhausted (no next_token / 422 from BookingExperts).',
+    },
+    empty_window: {
+        label: 'No activity',
+        variant: 'secondary',
+        description: 'Initial page had zero rows and no next_token to chase.',
+    },
+    duplicate_detection: {
+        label: 'Duplicate detection',
+        variant: 'warning',
+        description: 'Stopped early — pagination re-walked already-scraped territory.',
+    },
+    pagination_limit: {
+        label: 'Pagination limit',
+        variant: 'warning',
+        description: 'Reached max_pages cap before exhausting pagination.',
+    },
+    time_limit: {
+        label: 'Time limit',
+        variant: 'warning',
+        description: 'Wall-clock budget exceeded — job was aborted cleanly.',
+    },
+    unparseable: {
+        label: 'Unparseable response',
+        variant: 'destructive',
+        description: 'load_more body could not be parsed and no fallback succeeded.',
+    },
+    token_echo: {
+        label: 'Token echo',
+        variant: 'destructive',
+        description: 'BookingExperts handed back the same next_token — pagination is stuck.',
+    },
+    runaway_safety: {
+        label: 'Runaway safety',
+        variant: 'destructive',
+        description: 'Hit the cap on consecutive zero-row pages.',
+    },
+    session_expired: {
+        label: 'Session expired',
+        variant: 'destructive',
+        description: 'BookingExperts returned 401/403 — re-authenticate via the extension.',
+    },
+    worker_reaped: {
+        label: 'Worker reaped',
+        variant: 'destructive',
+        description: 'Worker stopped heart-beating — the reaper failed the job.',
+    },
+};
+
+function jobStopReason(job: Job): StopReason | null {
+    if (job.status !== 'completed' && job.status !== 'failed') {
+        return null;
+    }
+
+    const reason = job.stats?.stop_reason;
+
+    if (typeof reason === 'string' && reason in STOP_REASON_META) {
+        return reason as StopReason;
+    }
+
+    return null;
+}
 
 function refresh() {
     router.reload({ only: ['jobs', 'statusCounts', 'jobSummary'] });
@@ -529,13 +625,23 @@ const Field = defineComponent({
                                     {{ job.subscription_name }}
                                 </TableCell>
                                 <TableCell>
-                                    <Badge :variant="STATUS_META[job.status].variant" class="gap-1 capitalize">
-                                        <component
-                                            :is="STATUS_META[job.status].icon"
-                                            :class="['size-3', job.status === 'running' && 'animate-spin']"
-                                        />
-                                        {{ STATUS_META[job.status].label }}
-                                    </Badge>
+                                    <div class="flex flex-wrap items-center gap-1">
+                                        <Badge :variant="STATUS_META[job.status].variant" class="gap-1 capitalize">
+                                            <component
+                                                :is="STATUS_META[job.status].icon"
+                                                :class="['size-3', job.status === 'running' && 'animate-spin']"
+                                            />
+                                            {{ STATUS_META[job.status].label }}
+                                        </Badge>
+                                        <Badge
+                                            v-if="jobStopReason(job)"
+                                            :variant="STOP_REASON_META[jobStopReason(job)!].variant"
+                                            class="font-normal"
+                                            :title="STOP_REASON_META[jobStopReason(job)!].description"
+                                        >
+                                            {{ STOP_REASON_META[jobStopReason(job)!].label }}
+                                        </Badge>
+                                    </div>
                                 </TableCell>
                                 <TableCell class="text-muted-foreground text-xs">
                                     <template v-if="job.session_email">
@@ -676,6 +782,16 @@ const Field = defineComponent({
                         <Field label="Completed">{{ fmt(focused.completed_at) }}</Field>
                         <Field label="Heartbeat">{{ fmt(focused.last_heartbeat_at) }}</Field>
                     </div>
+                    <Field v-if="jobStopReason(focused)" label="Completion reason">
+                        <div class="flex items-center gap-2">
+                            <Badge :variant="STOP_REASON_META[jobStopReason(focused)!].variant">
+                                {{ STOP_REASON_META[jobStopReason(focused)!].label }}
+                            </Badge>
+                            <span class="text-muted-foreground text-xs">
+                                {{ STOP_REASON_META[jobStopReason(focused)!].description }}
+                            </span>
+                        </div>
+                    </Field>
                     <Field v-if="focused.error" label="Error">
                         <pre class="bg-destructive/10 text-destructive max-h-72 overflow-auto rounded p-2 text-xs whitespace-pre-wrap break-all font-mono">{{ focused.error }}</pre>
                     </Field>
