@@ -123,4 +123,20 @@ return [
         'store' => env('APP_MAINTENANCE_STORE', 'database'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | IP Allowlist
+    |--------------------------------------------------------------------------
+    |
+    | Comma-separated list of CIDRs / literal IPs that are permitted to reach
+    | the app. An empty list (the default) means "open" — fresh installs
+    | never lock themselves out. Loopback (127.0.0.1, ::1) is always allowed
+    | implicitly so the in-container `/up` healthcheck cannot be blocked.
+    |
+    | Consumed by `App\Http\Middleware\EnsureClientIpIsAllowed`.
+    |
+    */
+
+    'ip_allowlist' => array_filter(array_map('trim', explode(',', (string) env('APP_IP_ALLOWLIST', '')))),
+
 ];

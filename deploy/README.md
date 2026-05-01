@@ -227,6 +227,86 @@ pulling from `/var/backups/bexlogs/`. Out of scope here.
 
 ---
 
+## IP allowlist
+
+The Laravel app supports an optional, application-level IP allowlist via
+`App\Http\Middleware\EnsureClientIpIsAllowed`. It is wired into both the
+`web` and `api` middleware groups, so it covers `/login`, the dashboard,
+`/admin/*`, the BookingExperts authenticate flow, the `/broadcasting/auth`
+endpoint, etc. The `/up` healthcheck and `/api/worker/*` (scraper, gated
+by `WORKER_API_TOKEN`) are always exempt; loopback (127.0.0.1, ::1) is
+always allowed implicitly.
+
+Empty allowlist == open. A fresh deploy without `APP_IP_ALLOWLIST` set
+behaves exactly like before — nothing gets locked out.
+
+To turn it on:
+
+```bash
+ssh root@<server>
+cd /opt/bexlogs
+
+# Set / update the env var. Idempotent — replaces the value if the key
+# already exists, appends otherwise.
+KEY=APP_IP_ALLOWLIST
+VAL='203.0.113.10,198.51.100.0/24'   # ← your IP(s) / CIDR(s)
+ENV_FILE=/opt/bexlogs/laravel/.env
+
+if grep -qE "^${KEY}=" "$ENV_FILE"; then
+  sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$ENV_FILE"
+else
+  printf '\n%s=%s\n' "$KEY" "$VAL" >> "$ENV_FILE"
+fi
+
+# Re-cache config so the new value takes effect (the deploy workflow
+# already runs config:cache, but only as part of a deploy — for a bare
+# .env edit you do it by hand).
+COMPOSE='docker compose -f docker-compose.production.yml --env-file laravel/.env'
+for svc in app queue scheduler reverb; do
+  $COMPOSE exec -T "$svc" php artisan config:cache
+done
+```
+
+Rejected requests get a 403 and a one-line `notice` log entry with IP,
+method, URL, and User-Agent. Garbage entries (e.g. a hostname instead of
+an IP) are silently skipped — the middleware logs a single warning per
+worker process so you notice in the logs but don't drown in repeats.
+
+### Defense in depth — independent of the middleware
+
+The application-level allowlist works at the PHP layer, which means an
+attacker still touches Caddy and PHP-FPM before getting blocked. For
+stronger isolation use **either or both** of these:
+
+**1. Cloudflare WAF rule.** Stops attackers at Cloudflare's edge so
+nothing hits the origin at all. From the Cloudflare dashboard →
+Security → WAF → Custom rules, add a rule with action `Block` and the
+expression (replace the IP with your own, comma-separate for multiple):
+
+```
+(http.host eq "bexlogs.vitrion.dev") and not (ip.src in {203.0.113.10})
+```
+
+**2. UFW + Cloudflare's edge IPs.** Force all `:80` / `:443` traffic to
+come through Cloudflare so even bypass attempts via the server's bare
+IPv4 fail before reaching Caddy. Cloudflare publishes its current edge
+ranges at <https://www.cloudflare.com/ips/>. Pseudocode (regenerate
+when the published list changes — typically a few times a year):
+
+```bash
+sudo ufw allow from <each-CF-range> to any port 443 proto tcp
+sudo ufw allow from <each-CF-range> to any port 80  proto tcp
+sudo ufw deny  80,443/tcp
+```
+
+This is strictly stricter than the application-level allowlist: even
+a leaked origin IP can no longer talk to the box on `:80`/`:443` unless
+the request comes through Cloudflare. The application-level allowlist
+then layers on top to gate which Cloudflare-fronted requests are allowed
+to log in. You can use either, both, or neither.
+
+---
+
 ## SSL / TLS
 
 Caddy auto-provisions a Let's Encrypt cert the first time it sees a

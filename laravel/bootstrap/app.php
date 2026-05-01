@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Middleware\AuthenticateWorker;
+use App\Http\Middleware\EnsureClientIpIsAllowed;
 use App\Http\Middleware\EnsureUserIsAdmin;
 use App\Http\Middleware\HandleAppearance;
 use App\Http\Middleware\HandleInertiaRequests;
@@ -26,6 +27,20 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->encryptCookies(except: ['appearance', 'sidebar_state']);
 
+        // Prepend the IP allowlist to the web + api groups so it runs
+        // before auth / throttle / route-model-binding. The `/up`
+        // healthcheck route lives outside both groups (registered via
+        // `health: '/up'` above) so it is naturally exempt; the
+        // middleware itself also short-circuits `/up` and `/api/worker/*`
+        // as a belt-and-braces guard.
+        $middleware->web(prepend: [
+            EnsureClientIpIsAllowed::class,
+        ]);
+
+        $middleware->api(prepend: [
+            EnsureClientIpIsAllowed::class,
+        ]);
+
         $middleware->web(append: [
             HandleAppearance::class,
             HandleInertiaRequests::class,
@@ -35,6 +50,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'worker' => AuthenticateWorker::class,
             'admin' => EnsureUserIsAdmin::class,
+            'ip.allowlist' => EnsureClientIpIsAllowed::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
