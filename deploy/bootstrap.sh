@@ -253,6 +253,43 @@ install -m 0640 -o "$APP_USER" -g "$APP_USER" "$TMP_ENV" "$ENV_FILE"
 rm -f "$TMP_ENV"
 ok ".env written to ${ENV_FILE}"
 
+# ─── Step 8b: Origin certificate preflight ────────────────────────────────
+ORIGIN_DIR="/etc/bexlogs/origin"
+ORIGIN_CRT="${ORIGIN_DIR}/origin.crt"
+ORIGIN_KEY="${ORIGIN_DIR}/origin.key"
+
+if [ ! -f "$ORIGIN_CRT" ] || [ ! -f "$ORIGIN_KEY" ]; then
+    warn "Cloudflare Origin Certificate not found."
+    cat <<EOF
+
+  Before bringing the stack up, place the Cloudflare Origin Certificate
+  and private key at:
+
+      ${ORIGIN_CRT}
+      ${ORIGIN_KEY}
+
+  Generate one at:  Cloudflare dash → SSL/TLS → Origin Server → Create
+  Certificate. RSA 2048, hostnames covering ${DOMAIN:-<your-domain>},
+  15-year validity, PEM format.
+
+  Paste the certificate block into ${ORIGIN_CRT} and the private key block
+  into ${ORIGIN_KEY}. Then:
+
+      install -d -m 0755 ${ORIGIN_DIR}
+      chmod 0644 ${ORIGIN_CRT}
+      chmod 0600 ${ORIGIN_KEY}
+
+  And re-run this bootstrap.
+
+EOF
+    fatal "Origin certificate missing — see above."
+fi
+
+install -d -m 0755 "$ORIGIN_DIR"
+chmod 0644 "$ORIGIN_CRT" || true
+chmod 0600 "$ORIGIN_KEY" || true
+ok "Origin certificate in place"
+
 # ─── Step 9: Build + bring up the stack ───────────────────────────────────
 COMPOSE=(docker compose -f "${APP_DIR}/docker-compose.production.yml" --env-file "$ENV_FILE")
 

@@ -59,6 +59,10 @@ services:
       APP_ACME_EMAIL: ${APP_ACME_EMAIL:-admin@localhost}
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Cloudflare Origin Certificate mounted read-only from the host.
+      # Placed by the operator at /etc/bexlogs/origin/{origin.crt,origin.key}
+      # before the first `docker compose up`.
+      - /etc/bexlogs/origin:/etc/caddy/certs:ro
       - bexlogs_caddy_data:/data
       - bexlogs_caddy_config:/config
     networks:

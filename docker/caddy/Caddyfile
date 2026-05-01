@@ -9,24 +9,33 @@
 #
 # We send all of /app/* and /apps/* to the reverb container, and everything
 # else to the Nginx + PHP-FPM app container.
+#
+# TLS: we use a Cloudflare Origin Certificate mounted from the host at
+# /etc/caddy/certs/origin.{crt,key}. This lets Cloudflare's "Full (strict)"
+# mode talk to us over HTTPS without Let's Encrypt renewal dance. Cloudflare
+# terminates public TLS with its own cert; this cert is only trusted by
+# Cloudflare's edge.
 
 {
-	# Email is used for ACME registration (Let's Encrypt). Defaults to internal
-	# self-signed if APP_ACME_EMAIL is unset, which is fine for a private LAN
-	# preview but you DO want to set it in real production.
+	# ACME is disabled because we ship an explicit origin cert below — this
+	# email is kept as a harmless default in case a future site-block adds
+	# automatic HTTPS.
 	email {$APP_ACME_EMAIL:admin@localhost}
 
 	# Quiet the admin API (we don't expose it; this just makes it fail fast
 	# if someone tries to localhost:2019).
 	admin off
 
-	# Sensible global defaults.
+	# Caddy sits behind Cloudflare — trust forwarded headers from CF's IPs and
+	# the Docker bridge network so client IPs/protos propagate correctly.
 	servers {
 		trusted_proxies static private_ranges
 	}
 }
 
 {$APP_DOMAIN} {
+	tls /etc/caddy/certs/origin.crt /etc/caddy/certs/origin.key
+
 	encode zstd gzip
 
 	# Reverb / Pusher protocol — both the WS handshake (/app/{key}) and the
