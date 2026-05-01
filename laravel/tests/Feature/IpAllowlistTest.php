@@ -77,6 +77,26 @@ class IpAllowlistTest extends TestCase
             ->assertOk();
     }
 
+    public function test_cf_connecting_ip_takes_precedence_over_request_ip(): void
+    {
+        // In production Caddy doesn't trust Cloudflare's edge as a proxy
+        // so X-Forwarded-For arrives at Laravel as a CF edge IP — not the
+        // real visitor. The middleware MUST consult CF-Connecting-IP, or
+        // the user (and only the user) gets locked out the second the
+        // allowlist is turned on.
+        config(['app.ip_allowlist' => ['93.119.3.188']]);
+
+        $this->withServerVariables(['REMOTE_ADDR' => '104.23.166.126'])
+            ->withHeaders(['CF-Connecting-IP' => '93.119.3.188'])
+            ->get('/')
+            ->assertOk();
+
+        $this->withServerVariables(['REMOTE_ADDR' => '104.23.166.126'])
+            ->withHeaders(['CF-Connecting-IP' => '1.2.3.4'])
+            ->get('/')
+            ->assertForbidden();
+    }
+
     public function test_worker_api_is_never_ip_restricted(): void
     {
         config(['app.ip_allowlist' => ['93.119.3.188']]);

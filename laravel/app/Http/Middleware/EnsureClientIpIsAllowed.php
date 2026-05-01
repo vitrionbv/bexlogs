@@ -16,6 +16,16 @@ use Symfony\Component\HttpFoundation\Response;
  * — fresh deploys never lock themselves out before the operator has set the
  * env var.
  *
+ * Client IP resolution: in production we sit behind Cloudflare → Caddy →
+ * app. The Caddyfile pins `trusted_proxies static private_ranges`, which
+ * means Caddy does NOT treat Cloudflare's edge as a trusted proxy and
+ * overwrites `X-Forwarded-For` with the CF edge IP. Laravel's
+ * `$request->ip()` therefore returns a CF edge IP, not the real client.
+ * To get the original visitor we consult `CF-Connecting-IP`, which CF
+ * sets unconditionally and Caddy passes through untouched. Outside of
+ * Cloudflare (tests, dev, direct-to-origin probes) we fall back to
+ * `$request->ip()`, which preserves the existing TrustProxies pipeline.
+ *
  * Loopback (127.0.0.1, ::1) is always allowed implicitly so the container's
  * own `/up` healthcheck can never be blocked. The middleware also short
  * circuits the `/up` route and the worker API (`/api/worker/*`) — the
@@ -56,7 +66,7 @@ class EnsureClientIpIsAllowed
             return $next($request);
         }
 
-        $clientIp = (string) $request->ip();
+        $clientIp = $this->resolveClientIp($request);
 
         // Loopback is always allowed (the in-container healthcheck talks
         // to the app over 127.0.0.1 even after TrustProxies kicks in), no
@@ -115,6 +125,34 @@ class EnsureClientIpIsAllowed
         }
 
         return $valid;
+    }
+
+    /**
+     * Resolve the visitor's IP, preferring `CF-Connecting-IP` (set by
+     * Cloudflare, passed through by Caddy) over `$request->ip()`.
+     *
+     * Why: the Caddyfile only trusts private_ranges, so it overwrites
+     * X-Forwarded-For with the CF edge IP — using `$request->ip()` alone
+     * would lock out every real visitor (and our home IP too) because
+     * Laravel would only ever see CF edges. CF-Connecting-IP is the
+     * canonical "real client" header and is the cheapest fix that
+     * doesn't require touching the Caddy config.
+     *
+     * Trust caveat: CF-Connecting-IP is only authentic when the request
+     * actually came through Cloudflare. A direct hit on the origin IP
+     * could spoof it — that's what the UFW + Cloudflare-edge-IPs
+     * hardening in `deploy/README.md` is for. The application-level
+     * allowlist is the second layer of defense, not the only one.
+     */
+    private function resolveClientIp(Request $request): string
+    {
+        $cf = trim((string) $request->header('CF-Connecting-IP', ''));
+
+        if ($cf !== '' && filter_var($cf, FILTER_VALIDATE_IP) !== false) {
+            return $cf;
+        }
+
+        return (string) $request->ip();
     }
 
     private function looksLikeIpOrCidr(string $entry): bool
