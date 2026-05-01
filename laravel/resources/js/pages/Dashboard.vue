@@ -5,14 +5,18 @@ import {
     AlertTriangle,
     CheckCircle2,
     Cookie,
+    Cpu,
     Database,
+    HardDrive,
     KeyRound,
     Loader2,
+    MemoryStick,
     PauseCircle,
     Plug,
     Plus,
+    Server,
 } from 'lucide-vue-next';
-import { computed, defineComponent, h } from 'vue';
+import { computed, defineComponent, h, ref } from 'vue';
 import type { Component } from 'vue';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -23,6 +27,7 @@ import {
     CardHeader,
     CardTitle,
 } from '@/components/ui/card';
+import { useChannel } from '@/composables/useRealtime';
 
 type DashSummary = {
     counts: { queued: number; running: number; completed_24h: number; failed: number };
@@ -61,11 +66,78 @@ type PageRow = {
     last_scraped_at: string | null;
 };
 
+type ServerStats = {
+    hostname: string | null;
+    cpu: { percent: number | null; cores: number };
+    memory: { total: number; used: number; available: number; percent: number } | null;
+    disk: { total: number; used: number; free: number; percent: number } | null;
+    load: { 1: number; 5: number; 15: number } | null;
+    uptime_seconds: number | null;
+    generated_at: string;
+};
+
 const props = defineProps<{
     summary: DashSummary;
     sessions: SessionRow[];
     pages: PageRow[];
+    serverStats: ServerStats | null;
 }>();
+
+const liveStats = ref<ServerStats | null>(props.serverStats);
+
+useChannel('server-stats', {
+    'server-stats-updated': (payload) => {
+        liveStats.value = payload as unknown as ServerStats;
+    },
+});
+
+function formatBytes(bytes: number | null | undefined): string {
+    if (bytes === null || bytes === undefined || bytes <= 0) {
+        return '—';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const value = bytes / Math.pow(1024, exp);
+
+    return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[exp]}`;
+}
+
+function formatUptime(seconds: number | null | undefined): string {
+    if (!seconds || seconds <= 0) {
+        return '—';
+    }
+
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+
+    if (days > 0) {
+        return `${days}d ${hours}h`;
+    }
+
+    if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    }
+
+    return `${minutes}m`;
+}
+
+function pctTone(pct: number | null | undefined): string {
+    if (pct === null || pct === undefined) {
+        return 'bg-muted-foreground/40';
+    }
+
+    if (pct >= 90) {
+        return 'bg-destructive';
+    }
+
+    if (pct >= 75) {
+        return 'bg-warning';
+    }
+
+    return 'bg-primary';
+}
 
 defineOptions({
     layout: { breadcrumbs: [{ title: 'Dashboard', href: '/dashboard' }] },
@@ -210,6 +282,105 @@ const StatCard = defineComponent({
                     :icon="Cookie"
                     href="/logs"
                 />
+            </section>
+
+            <section v-if="liveStats">
+                <Card>
+                    <CardHeader class="flex-row items-center justify-between gap-2">
+                        <div>
+                            <CardTitle class="flex items-center gap-2">
+                                <Server class="size-4" />
+                                Server vitals
+                            </CardTitle>
+                            <CardDescription>
+                                Live host CPU, memory and disk usage. Updates every five seconds over WebSocket.
+                            </CardDescription>
+                        </div>
+                        <div class="flex items-center gap-2 text-xs">
+                            <span
+                                class="bg-success inline-block size-2 animate-pulse rounded-full"
+                                aria-hidden="true"
+                            />
+                            <span class="text-muted-foreground">
+                                {{ liveStats.hostname ?? 'host' }} · uptime {{ formatUptime(liveStats.uptime_seconds) }}
+                            </span>
+                        </div>
+                    </CardHeader>
+                    <CardContent class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                        <div class="border-border bg-card flex flex-col gap-2 rounded-lg border p-4">
+                            <div class="flex items-center justify-between">
+                                <span class="text-muted-foreground flex items-center gap-2 text-xs uppercase tracking-wide">
+                                    <Cpu class="size-3.5" /> CPU
+                                </span>
+                                <span class="text-muted-foreground text-xs">{{ liveStats.cpu.cores }} cores</span>
+                            </div>
+                            <span class="text-3xl font-semibold tabular-nums">
+                                {{ liveStats.cpu.percent !== null ? liveStats.cpu.percent.toFixed(1) : '—' }}<span class="text-muted-foreground text-base">%</span>
+                            </span>
+                            <div class="bg-muted h-1.5 overflow-hidden rounded-full">
+                                <div
+                                    class="h-full transition-all duration-700"
+                                    :class="pctTone(liveStats.cpu.percent)"
+                                    :style="{ width: `${Math.min(100, Math.max(0, liveStats.cpu.percent ?? 0))}%` }"
+                                />
+                            </div>
+                            <div class="text-muted-foreground flex justify-between text-xs">
+                                <span>load 1m</span>
+                                <span class="tabular-nums">{{ liveStats.load?.['1']?.toFixed(2) ?? '—' }}</span>
+                            </div>
+                        </div>
+
+                        <div class="border-border bg-card flex flex-col gap-2 rounded-lg border p-4">
+                            <div class="flex items-center justify-between">
+                                <span class="text-muted-foreground flex items-center gap-2 text-xs uppercase tracking-wide">
+                                    <MemoryStick class="size-3.5" /> Memory
+                                </span>
+                                <span class="text-muted-foreground text-xs tabular-nums">
+                                    {{ formatBytes(liveStats.memory?.used) }} / {{ formatBytes(liveStats.memory?.total) }}
+                                </span>
+                            </div>
+                            <span class="text-3xl font-semibold tabular-nums">
+                                {{ liveStats.memory ? liveStats.memory.percent.toFixed(1) : '—' }}<span class="text-muted-foreground text-base">%</span>
+                            </span>
+                            <div class="bg-muted h-1.5 overflow-hidden rounded-full">
+                                <div
+                                    class="h-full transition-all duration-700"
+                                    :class="pctTone(liveStats.memory?.percent)"
+                                    :style="{ width: `${Math.min(100, Math.max(0, liveStats.memory?.percent ?? 0))}%` }"
+                                />
+                            </div>
+                            <div class="text-muted-foreground flex justify-between text-xs">
+                                <span>available</span>
+                                <span class="tabular-nums">{{ formatBytes(liveStats.memory?.available) }}</span>
+                            </div>
+                        </div>
+
+                        <div class="border-border bg-card flex flex-col gap-2 rounded-lg border p-4">
+                            <div class="flex items-center justify-between">
+                                <span class="text-muted-foreground flex items-center gap-2 text-xs uppercase tracking-wide">
+                                    <HardDrive class="size-3.5" /> Disk
+                                </span>
+                                <span class="text-muted-foreground text-xs tabular-nums">
+                                    {{ formatBytes(liveStats.disk?.used) }} / {{ formatBytes(liveStats.disk?.total) }}
+                                </span>
+                            </div>
+                            <span class="text-3xl font-semibold tabular-nums">
+                                {{ liveStats.disk ? liveStats.disk.percent.toFixed(1) : '—' }}<span class="text-muted-foreground text-base">%</span>
+                            </span>
+                            <div class="bg-muted h-1.5 overflow-hidden rounded-full">
+                                <div
+                                    class="h-full transition-all duration-700"
+                                    :class="pctTone(liveStats.disk?.percent)"
+                                    :style="{ width: `${Math.min(100, Math.max(0, liveStats.disk?.percent ?? 0))}%` }"
+                                />
+                            </div>
+                            <div class="text-muted-foreground flex justify-between text-xs">
+                                <span>free</span>
+                                <span class="tabular-nums">{{ formatBytes(liveStats.disk?.free) }}</span>
+                            </div>
+                        </div>
+                    </CardContent>
+                </Card>
             </section>
 
             <section class="grid gap-4 lg:grid-cols-3">

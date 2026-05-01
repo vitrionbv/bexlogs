@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\BexSession;
 use App\Models\Page as LogPage;
+use App\Services\ServerMetrics;
 use App\Support\JobSummary;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
@@ -11,7 +12,7 @@ use Inertia\Response;
 
 class DashboardController extends Controller
 {
-    public function index(Request $request): Response
+    public function index(Request $request, ServerMetrics $metrics): Response
     {
         $user = $request->user();
 
@@ -52,10 +53,16 @@ class DashboardController extends Controller
             ])
             ->all();
 
+        // Initial server vitals snapshot for the admin section. Sent only
+        // once on page load; live updates after that arrive over the
+        // private-server-stats Reverb channel.
+        $serverStats = $user->is_admin ? $metrics->snapshot() : null;
+
         return Inertia::render('Dashboard', [
             'summary' => JobSummary::dashboardForUser($user),
             'sessions' => $sessions,
             'pages' => $pages,
+            'serverStats' => $serverStats,
         ]);
     }
 }
