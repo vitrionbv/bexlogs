@@ -28,12 +28,12 @@ return [
     |--------------------------------------------------------------------------
     */
     'extension_zip_path' => storage_path('app/public/bexlogs-extension.zip'),
-    'extension_version' => env('EXTENSION_VERSION', '1.1.0'),
+    'extension_version' => env('EXTENSION_VERSION', '1.2.0'),
 
     /*
     | Minimum acceptable installed extension version. The frontend forces a
     | blocking "update required" modal if the running extension reports a
     | semver below this. Defaults to whatever Laravel ships with.
     */
-    'extension_min_version' => env('EXTENSION_MIN_VERSION', env('EXTENSION_VERSION', '1.1.0')),
+    'extension_min_version' => env('EXTENSION_MIN_VERSION', env('EXTENSION_VERSION', '1.2.0')),
 ];

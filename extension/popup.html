@@ -11,51 +11,122 @@
             <img src="icons/icon48.png" alt="" width="32" height="32" />
             <div>
                 <h1>BexLogs Authenticator</h1>
-                <p id="linked-banner" class="muted">Not linked to a BexLogs instance yet.</p>
+                <p id="subtitle" class="muted">Checking link status…</p>
             </div>
         </header>
 
-        <section>
-            <label for="server">Linked BexLogs server</label>
-            <input
-                id="server"
-                type="url"
-                placeholder="https://bexlogs.example.com"
-                autocomplete="off"
-                spellcheck="false"
-            />
-            <p class="hint">
-                Open BexLogs in a tab and click "Link extension" to set this automatically.
-            </p>
-        </section>
-
-        <section>
-            <label for="token">Pairing token (manual)</label>
-            <input
-                id="token"
-                type="text"
-                placeholder="Paste from BexLogs Sessions page"
-                autocomplete="off"
-                spellcheck="false"
-            />
-            <p class="hint">
-                Only needed if BexLogs couldn't hand off the code automatically.
-            </p>
-        </section>
-
-        <section class="env-row">
-            <label>Environment</label>
-            <div class="radio-group">
-                <label><input type="radio" name="env" value="production" checked /> Production</label>
-                <label><input type="radio" name="env" value="staging" /> Staging</label>
+        <!--
+          ============================================================
+          LINKED state — this browser's active tab is on a server we've
+          already paired with. No code entry needed; the user can just
+          re-authenticate or unlink.
+          ============================================================
+        -->
+        <section id="linked-card" class="card card-linked" hidden>
+            <div class="card-head">
+                <div class="card-icon card-icon-ok">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                </div>
+                <div class="card-head-text">
+                    <h2>Linked</h2>
+                    <p class="muted">
+                        <span id="linked-host" class="mono"></span>
+                    </p>
+                </div>
+                <span id="linked-env" class="badge"></span>
             </div>
+
+            <dl class="meta">
+                <dt>Account</dt>
+                <dd id="linked-email">—</dd>
+                <dt>Linked</dt>
+                <dd id="linked-at">—</dd>
+                <dt>Last validated</dt>
+                <dd id="linked-validated">—</dd>
+                <dt>Session #</dt>
+                <dd id="linked-session-id" class="mono">—</dd>
+            </dl>
+
+            <div class="actions">
+                <button id="reauth" type="button" class="primary">
+                    Re-authenticate
+                </button>
+                <button id="unlink" type="button" class="secondary">
+                    Unlink
+                </button>
+            </div>
+
+            <p id="linked-status" class="status" role="status"></p>
         </section>
 
-        <button id="go" type="button" class="primary">
-            Open BookingExperts &amp; capture cookies
-        </button>
+        <!--
+          ============================================================
+          SUMMARY state — current tab isn't linked, but this extension
+          instance knows about other linked BexLogs servers. User can
+          jump to one of them to manage, or link a new one below.
+          ============================================================
+        -->
+        <section id="other-instances" hidden>
+            <h3>Linked BexLogs instances</h3>
+            <ul id="other-instances-list" class="instances"></ul>
+            <p class="hint">
+                Open one of those tabs to manage its session, or paste a
+                pairing code from a new instance below.
+            </p>
+        </section>
 
-        <p id="status" class="status"></p>
+        <!--
+          ============================================================
+          PAIR state — fresh install OR user wants to link a new
+          BexLogs server. This is the legacy "enter code" flow.
+          ============================================================
+        -->
+        <section id="pair-form" hidden>
+            <section>
+                <label for="server">BexLogs server</label>
+                <input
+                    id="server"
+                    type="url"
+                    placeholder="https://bexlogs.example.com"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+                <p class="hint">
+                    Open BexLogs in a tab and click "Link extension" to set this
+                    automatically.
+                </p>
+            </section>
+
+            <section>
+                <label for="token">Pairing token</label>
+                <input
+                    id="token"
+                    type="text"
+                    placeholder="Paste from BexLogs Sessions page"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+                <p class="hint">
+                    Only needed if BexLogs couldn't hand off the code automatically.
+                </p>
+            </section>
+
+            <section class="env-row">
+                <label>Environment</label>
+                <div class="radio-group">
+                    <label><input type="radio" name="env" value="production" checked /> Production</label>
+                    <label><input type="radio" name="env" value="staging" /> Staging</label>
+                </div>
+            </section>
+
+            <button id="go" type="button" class="primary">
+                Open BookingExperts &amp; capture cookies
+            </button>
+
+            <p id="pair-status" class="status" role="status"></p>
+        </section>
 
         <footer class="muted">
             We open BookingExperts in a new tab; you log in normally; we read the

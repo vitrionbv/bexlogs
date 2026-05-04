@@ -1,9 +1,31 @@
 // BexLogs extension — background service worker.
 //
-// Listens for a "PAIR_AND_CAPTURE" message from the popup, opens the
-// BookingExperts sign-in tab, polls for a successful login (presence of a
-// session cookie + URL no longer at /sign_in), then POSTs all captured
-// cookies + the pairing token back to the configured BexLogs server.
+// Handles the two RPC messages from popup / content script:
+//
+//   PAIR_AND_CAPTURE  — open BookingExperts, wait for login, POST
+//                       cookies back to the linked BexLogs server,
+//                       persist the resulting link into
+//                       chrome.storage.local.linkedInstances so the
+//                       popup can render a "Linked" card next time.
+//
+//   UNLINK_INSTANCE   — remove an instance from linkedInstances AND
+//                       best-effort revoke the BexSession on the
+//                       linked server (CSRF handshake via the user's
+//                       existing Laravel session cookie).
+//
+// Link state lives in chrome.storage.local.linkedInstances, keyed by
+// origin. Shape:
+//
+//   {
+//     'https://bexlogs.vitrion.dev': {
+//       origin, baseUrl, environment, accountEmail, accountName,
+//       bexSessionId, linkedAt, lastValidatedAt,
+//     },
+//   }
+//
+// The legacy single-origin keys (`linkedOrigin`, `linkedName`,
+// `baseUrl`) in chrome.storage.sync are still maintained so the
+// existing content.js handshake continues to work.
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
@@ -14,15 +36,32 @@ const URLS = {
 };
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== 'PAIR_AND_CAPTURE') return false;
+    if (message?.type === 'PAIR_AND_CAPTURE') {
+        const { token, baseUrl, environment } = message;
 
-    const { token, baseUrl, environment } = message;
+        pairAndCapture({ token, baseUrl, environment })
+            .then((result) => sendResponse({ ok: true, ...result }))
+            .catch((err) =>
+                sendResponse({ ok: false, error: String(err?.message ?? err) }),
+            );
 
-    pairAndCapture({ token, baseUrl, environment })
-        .then((result) => sendResponse({ ok: true, ...result }))
-        .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
+        return true;
+    }
 
-    return true; // keep the channel open for the async response
+    if (message?.type === 'UNLINK_INSTANCE') {
+        unlinkInstance({
+            origin: message.origin,
+            bexSessionId: message.bexSessionId ?? null,
+        })
+            .then((result) => sendResponse({ ok: true, ...result }))
+            .catch((err) =>
+                sendResponse({ ok: false, error: String(err?.message ?? err) }),
+            );
+
+        return true;
+    }
+
+    return false;
 });
 
 // Chrome doesn't auto-inject content scripts into pre-existing tabs when the
@@ -50,7 +89,6 @@ async function injectIntoAllOpenTabs(reason) {
                 });
                 succeeded++;
             } catch (err) {
-                // Some pages (chrome://, web store, PDFs, etc.) refuse injection — that's fine.
                 console.debug('[bexlogs] could not inject into', tab.url, err?.message);
             }
         }
@@ -67,15 +105,11 @@ chrome.runtime.onInstalled.addListener((details) => {
 
 chrome.runtime.onStartup?.addListener(() => injectIntoAllOpenTabs('onStartup'));
 
-// SW boot — fires every time the service worker activates, including after
-// dev-mode "Reload" in chrome://extensions where onInstalled is silent.
 injectIntoAllOpenTabs('sw-boot');
 
 function shouldInject(url) {
-    // Mirror manifest exclude_matches: BookingExperts itself runs no content script.
     if (url.startsWith('https://app.bookingexperts.com/')) return false;
     if (url.startsWith('https://app.staging.bookingexperts.com/')) return false;
-    // Only http/https — no chrome://, file://, devtools://, etc.
     return /^https?:\/\//.test(url);
 }
 
@@ -89,7 +123,6 @@ async function pairAndCapture({ token, baseUrl, environment }) {
         throw new Error(`Unknown environment: ${environment}`);
     }
 
-    // Persist active pairing so we can recover if the popup closes.
     await chrome.storage.session.set({
         pairing: { token, baseUrl, environment, startedAt: Date.now() },
     });
@@ -117,6 +150,16 @@ async function pairAndCapture({ token, baseUrl, environment }) {
 
     const body = await response.json().catch(() => ({}));
 
+    await persistLinkedInstance({
+        origin: baseUrl,
+        baseUrl,
+        environment,
+        accountEmail: body?.account_email ?? null,
+        accountName: body?.account_name ?? null,
+        bexSessionId: body?.id ?? null,
+        isRelink: !!body?.relinked,
+    });
+
     try {
         await chrome.notifications.create({
             type: 'basic',
@@ -129,7 +172,11 @@ async function pairAndCapture({ token, baseUrl, environment }) {
         // notifications permission may be missing; ignore
     }
 
-    return { sessionId: body?.id ?? null, message: body?.message };
+    return {
+        sessionId: body?.id ?? null,
+        message: body?.message,
+        relinked: !!body?.relinked,
+    };
 }
 
 async function waitForLogin(tabId, environment) {
@@ -148,10 +195,8 @@ async function waitForLogin(tabId, environment) {
 
         if (!tab?.url) continue;
 
-        // Still on the sign-in page — keep waiting.
         if (tab.url.includes('/sign_in')) continue;
 
-        // Must be on the BookingExperts host (could be SSO redirects in between).
         if (!tab.url.startsWith(target)) continue;
 
         const cookies = await chrome.cookies.getAll({
@@ -184,4 +229,169 @@ function toExtensionCookie(c) {
 
 function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+}
+
+// --------------------------------------------------------------------
+// linkedInstances (chrome.storage.local) management
+// --------------------------------------------------------------------
+
+async function persistLinkedInstance({
+    origin,
+    baseUrl,
+    environment,
+    accountEmail,
+    accountName,
+    bexSessionId,
+    isRelink,
+}) {
+    const now = new Date().toISOString();
+
+    const { linkedInstances = {} } = await chrome.storage.local.get([
+        'linkedInstances',
+    ]);
+
+    const previous =
+        typeof linkedInstances === 'object' && linkedInstances !== null
+            ? linkedInstances[origin]
+            : null;
+
+    const entry = {
+        origin,
+        baseUrl,
+        environment: environment ?? previous?.environment ?? null,
+        accountEmail: accountEmail ?? previous?.accountEmail ?? null,
+        accountName: accountName ?? previous?.accountName ?? null,
+        bexSessionId: bexSessionId ?? previous?.bexSessionId ?? null,
+        // On relink keep the *original* `linkedAt` (we've been linked
+        // here the whole time; we just refreshed cookies); on a first
+        // pair set it to now.
+        linkedAt: isRelink && previous?.linkedAt ? previous.linkedAt : now,
+        lastValidatedAt: now,
+    };
+
+    const next = {
+        ...(typeof linkedInstances === 'object' && linkedInstances !== null
+            ? linkedInstances
+            : {}),
+        [origin]: entry,
+    };
+
+    await chrome.storage.local.set({ linkedInstances: next });
+    await chrome.storage.sync.set({
+        linkedOrigin: origin,
+        linkedName: safeHost(origin) ?? origin,
+        baseUrl: origin,
+    });
+}
+
+async function unlinkInstance({ origin, bexSessionId }) {
+    if (!origin) {
+        throw new Error('Missing origin');
+    }
+
+    let revoked = false;
+    let revokeError = null;
+
+    // Best-effort server-side revoke. The user's Laravel session cookie
+    // is already in this browser's jar, so `credentials: 'include'` will
+    // authenticate; we just need a fresh CSRF token, which we fetch from
+    // the /authenticate page's HTML meta tag.
+    if (bexSessionId) {
+        try {
+            revoked = await revokeSessionOnServer(origin, bexSessionId);
+        } catch (err) {
+            revokeError = String(err?.message ?? err);
+            console.warn('[bexlogs] revoke failed', revokeError);
+        }
+    }
+
+    // Drop the entry regardless of the server call outcome — local
+    // state should match the user's intent.
+    const { linkedInstances = {} } = await chrome.storage.local.get([
+        'linkedInstances',
+    ]);
+    const next =
+        typeof linkedInstances === 'object' && linkedInstances !== null
+            ? { ...linkedInstances }
+            : {};
+    delete next[origin];
+    await chrome.storage.local.set({ linkedInstances: next });
+
+    // Clear the legacy single-origin hints too, so content.js stops
+    // advertising "linked here" on that origin until re-paired.
+    const legacy = await chrome.storage.sync.get([
+        'linkedOrigin',
+        'baseUrl',
+    ]);
+    if (legacy.linkedOrigin === origin || legacy.baseUrl === origin) {
+        await chrome.storage.sync.remove([
+            'linkedOrigin',
+            'linkedName',
+            'baseUrl',
+        ]);
+    }
+
+    return { revoked, revokeError };
+}
+
+async function revokeSessionOnServer(origin, bexSessionId) {
+    // Step 1 — fetch the Authenticate page to pull a CSRF token out of
+    // its HTML. We intentionally don't require a specific status:
+    // Laravel serves the full app.blade.php on any auth'd route and the
+    // <meta name="csrf-token"> is always there.
+    const htmlResp = await fetch(`${origin}/authenticate`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'text/html' },
+    });
+
+    if (!htmlResp.ok) {
+        throw new Error(
+            `Could not fetch CSRF token (GET /authenticate → HTTP ${htmlResp.status}). ` +
+                'Are you still logged into BexLogs on this browser?',
+        );
+    }
+
+    const html = await htmlResp.text();
+    const token = extractCsrfToken(html);
+    if (!token) {
+        throw new Error(
+            'No CSRF token found on /authenticate. Log into BexLogs first, then try Unlink again.',
+        );
+    }
+
+    // Step 2 — DELETE the bex session. This route lives in the web
+    // middleware group, so we need both the CSRF token and the user's
+    // session cookie (via credentials: 'include').
+    const revokeResp = await fetch(`${origin}/bex-sessions/${bexSessionId}`, {
+        method: 'DELETE',
+        credentials: 'include',
+        headers: {
+            Accept: 'application/json',
+            'X-CSRF-TOKEN': token,
+            'X-Requested-With': 'XMLHttpRequest',
+        },
+    });
+
+    if (!revokeResp.ok && revokeResp.status !== 302) {
+        throw new Error(`Revoke returned HTTP ${revokeResp.status}`);
+    }
+
+    return true;
+}
+
+function extractCsrfToken(html) {
+    const m = /<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i.exec(
+        html,
+    );
+
+    return m ? m[1] : null;
+}
+
+function safeHost(origin) {
+    try {
+        return new URL(origin).host;
+    } catch {
+        return null;
+    }
 }

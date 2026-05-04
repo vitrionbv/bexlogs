@@ -8,7 +8,8 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * Per-user firehose: scrape job lifecycle events, sidebar refreshes,
- * page-touched signals for the Logs index. Single-tenant, so authorisation
+ * page-touched signals for the Logs index, BexSession relink events
+ * from the extension pairing endpoint. Single-tenant, so authorisation
  * is just "is this you?".
  */
 Broadcast::channel('user.{userId}', function (User $user, int $userId) {

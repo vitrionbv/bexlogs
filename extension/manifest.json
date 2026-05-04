@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "BexLogs Authenticator",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "Captures your BookingExperts session cookies after you log in, so the BexLogs app can scrape logs on your behalf.",
     "permissions": ["cookies", "storage", "tabs", "notifications", "scripting"],
     "host_permissions": [

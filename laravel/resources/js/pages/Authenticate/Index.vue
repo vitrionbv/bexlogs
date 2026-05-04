@@ -10,13 +10,14 @@ import {
     Plug,
     Play,
     RefreshCcw,
+    RotateCcw,
     ShieldCheck,
     Sparkles,
     Trash2,
     Wand2,
     XCircle,
 } from 'lucide-vue-next';
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { toast } from 'vue-sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -36,6 +37,7 @@ import {
     DialogTitle,
 } from '@/components/ui/dialog';
 import { useExtension } from '@/composables/useExtension';
+import { useUserChannel } from '@/composables/useRealtime';
 
 interface BexSessionRow {
     id: number;
@@ -88,12 +90,21 @@ interface PairingState {
     status: 'waiting' | 'ready' | 'expired' | 'unknown';
     sessionPreview: { account_email: string | null; environment: string } | null;
     sentToExtension: boolean;
+    /**
+     * 'relink' when the user is re-authenticating a specific expired
+     * session (targetSession filled). 'pair' is the fresh-link flow.
+     * The dialog copy + status toasts key off this so re-auths never
+     * look like they're going to create a new row.
+     */
+    mode: 'pair' | 'relink';
+    targetSession: { id: number; account_email: string | null } | null;
 }
 
 const dialogOpen = ref(false);
 const selectedEnvironment = ref<'production' | 'staging'>('production');
 const pairing = ref<PairingState | null>(null);
 const submitting = ref(false);
+const relinkingSessionId = ref<number | null>(null);
 const validating = ref<Record<number, boolean>>({});
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -111,7 +122,19 @@ function csrf(): string {
     );
 }
 
-async function startPairing() {
+async function startPairing(options: {
+    mode?: 'pair' | 'relink';
+    targetSession?: BexSessionRow | null;
+    environment?: 'production' | 'staging';
+} = {}) {
+    const mode = options.mode ?? 'pair';
+    const targetSession = options.targetSession ?? null;
+    const environment = options.environment ?? targetSession?.environment ?? selectedEnvironment.value;
+
+    if (mode === 'relink' && targetSession) {
+        relinkingSessionId.value = targetSession.id;
+    }
+
     submitting.value = true;
     pairing.value = null;
 
@@ -124,7 +147,7 @@ async function startPairing() {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-TOKEN': csrf(),
             },
-            body: JSON.stringify({ environment: selectedEnvironment.value }),
+            body: JSON.stringify({ environment }),
         });
 
         if (!res.ok) {
@@ -135,7 +158,7 @@ async function startPairing() {
 
         const data = await res.json();
         const sentToExtension =
-            extInfo.value.detected && extInfo.value.isLinkedHere && tryHandoff(data.token, selectedEnvironment.value);
+            extInfo.value.detected && extInfo.value.isLinkedHere && tryHandoff(data.token, environment);
 
         pairing.value = {
             token: data.token,
@@ -145,12 +168,20 @@ async function startPairing() {
             status: 'waiting',
             sessionPreview: null,
             sentToExtension,
+            mode,
+            targetSession: targetSession
+                ? { id: targetSession.id, account_email: targetSession.account_email }
+                : null,
         };
         dialogOpen.value = true;
         startPolling(data.token);
     } finally {
         submitting.value = false;
     }
+}
+
+function reauthenticateSession(session: BexSessionRow) {
+    void startPairing({ mode: 'relink', targetSession: session });
 }
 
 function tryHandoff(token: string, environment: 'production' | 'staging'): boolean {
@@ -199,14 +230,30 @@ return;
                 environment: data.session?.environment ?? pairing.value.environment,
             };
             clearPolling();
-            toast.success('BookingExperts authenticated');
+            // The backend reuses an existing row when the captured
+            // cookies map to a known account_email; detect that by
+            // comparing the resolved session id against our target
+            // (for explicit relinks) or against the current sessions
+            // list (for auto-relinks from the extension popup).
+            const reusedExistingRow =
+                pairing.value.targetSession?.id === data.session?.id;
+
+            if (pairing.value.mode === 'relink' || reusedExistingRow) {
+                toast.success('BookingExperts session re-authenticated');
+            } else {
+                toast.success('BookingExperts authenticated');
+            }
+
+            relinkingSessionId.value = null;
             router.reload({ only: ['sessions', 'jobSummary'] });
             setTimeout(() => (dialogOpen.value = false), 1500);
         } else if (data.status === 'expired') {
             clearPolling();
+            relinkingSessionId.value = null;
             toast.error('Pairing code expired. Generate a new one.');
         } else if (data.status === 'unknown') {
             clearPolling();
+            relinkingSessionId.value = null;
         }
     }, 1000);
 }
@@ -328,6 +375,60 @@ const extensionStatus = computed(() => {
         title: `Extension linked (v${extInfo.value.version ?? '?'})`,
         body: 'Pairing codes will be handed off automatically.',
     };
+});
+
+// Refresh the card list whenever the backend relinks an existing row
+// (BexSessionController::store → BexSessionRelinked). `user.{id}` is
+// the firehose the rest of the app already listens on, so no new
+// channel is needed.
+useUserChannel({
+    'bex-session-relinked': () => router.reload({ only: ['sessions', 'jobSummary'] }),
+});
+
+/**
+ * Auto-relink hook for the extension popup's "Re-authenticate" button.
+ *
+ * When the popup opens `/authenticate?relink=1&session=<id>` in a new
+ * tab, we:
+ *   1. Identify the target session by id (or, as a fallback, the most
+ *      recent expired session for the extension's default environment).
+ *   2. Immediately kick off startPairing({ mode: 'relink' }) so the
+ *      user only sees the dialog — no extra clicks.
+ *   3. Strip the query string afterwards so a reload doesn't re-fire.
+ */
+onMounted(() => {
+    if (typeof window === 'undefined') {
+        return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+
+    if (params.get('relink') !== '1') {
+        return;
+    }
+
+    const idParam = params.get('session');
+    const targetId = idParam ? Number(idParam) : NaN;
+    const byId = Number.isFinite(targetId)
+        ? (page.props as any).sessions?.find?.((s: BexSessionRow) => s.id === targetId)
+        : null;
+    const targetSession: BexSessionRow | null =
+        byId
+        ?? (page.props as any).sessions?.find?.((s: BexSessionRow) => !s.is_active)
+        ?? (page.props as any).sessions?.[0]
+        ?? null;
+
+    params.delete('relink');
+    params.delete('session');
+    const nextQs = params.toString();
+    const cleanPath = window.location.pathname + (nextQs ? '?' + nextQs : '');
+    window.history.replaceState({}, '', cleanPath);
+
+    void startPairing({
+        mode: targetSession ? 'relink' : 'pair',
+        targetSession,
+        environment: targetSession?.environment,
+    });
 });
 </script>
 
@@ -514,6 +615,37 @@ const extensionStatus = computed(() => {
                             </template>
                         </dl>
 
+                        <!--
+                            Expired sessions get a prominent
+                            "Re-authenticate" button: it reuses this
+                            exact row (BexSessionController matches on
+                            account_email) so scrape jobs keep their
+                            original bex_session_id.
+                        -->
+                        <div
+                            v-if="!session.is_active"
+                            class="border-warning/40 bg-warning/5 mt-3 flex items-center justify-between gap-3 rounded-md border p-3"
+                        >
+                            <div class="text-xs">
+                                <p class="font-medium">Re-authenticate this session</p>
+                                <p class="text-muted-foreground">
+                                    Refreshes cookies on row #{{ session.id }} — no new session row.
+                                </p>
+                            </div>
+                            <Button
+                                size="sm"
+                                :disabled="submitting && relinkingSessionId === session.id"
+                                @click="reauthenticateSession(session)"
+                            >
+                                <Loader2
+                                    v-if="submitting && relinkingSessionId === session.id"
+                                    class="mr-1 size-4 animate-spin"
+                                />
+                                <RotateCcw v-else class="mr-1 size-4" />
+                                Re-authenticate
+                            </Button>
+                        </div>
+
                         <footer class="mt-4 flex items-center justify-between gap-2">
                             <p class="text-muted-foreground inline-flex min-w-0 items-center gap-1 text-xs">
                                 <template v-if="session.is_active">
@@ -552,9 +684,22 @@ const extensionStatus = computed(() => {
             <Dialog v-model:open="dialogOpen">
                 <DialogContent class="sm:max-w-md">
                     <DialogHeader>
-                        <DialogTitle>Pair with the BexLogs extension</DialogTitle>
+                        <DialogTitle>
+                            <template v-if="pairing?.mode === 'relink'">
+                                Re-authenticate session
+                                <template v-if="pairing.targetSession?.account_email">
+                                    ({{ pairing.targetSession.account_email }})
+                                </template>
+                            </template>
+                            <template v-else>Pair with the BexLogs extension</template>
+                        </DialogTitle>
                         <DialogDescription>
-                            <template v-if="pairing?.sentToExtension">
+                            <template v-if="pairing?.mode === 'relink'">
+                                Refreshing cookies on session #{{ pairing.targetSession?.id }}. No
+                                new session will be created — we reuse the row as long as you sign
+                                in to the same BookingExperts account.
+                            </template>
+                            <template v-else-if="pairing?.sentToExtension">
                                 The extension has been handed the pairing code automatically.
                                 Watch its popup for the BookingExperts login tab.
                             </template>
@@ -576,11 +721,21 @@ const extensionStatus = computed(() => {
                         <div class="flex items-center gap-2 text-sm">
                             <template v-if="pairing.status === 'waiting'">
                                 <Loader2 class="size-4 animate-spin" />
-                                Waiting for the extension to deliver cookies…
+                                <template v-if="pairing.mode === 'relink'">
+                                    Waiting for the extension to deliver fresh cookies…
+                                </template>
+                                <template v-else>
+                                    Waiting for the extension to deliver cookies…
+                                </template>
                             </template>
                             <template v-else-if="pairing.status === 'ready'">
                                 <CheckCircle2 class="text-success size-4" />
-                                Authenticated{{ pairing.sessionPreview?.account_email ? ` as ${pairing.sessionPreview.account_email}` : '' }}.
+                                <template v-if="pairing.mode === 'relink'">
+                                    Re-authenticated{{ pairing.sessionPreview?.account_email ? ` as ${pairing.sessionPreview.account_email}` : '' }}.
+                                </template>
+                                <template v-else>
+                                    Authenticated{{ pairing.sessionPreview?.account_email ? ` as ${pairing.sessionPreview.account_email}` : '' }}.
+                                </template>
                             </template>
                             <template v-else-if="pairing.status === 'expired'">
                                 <XCircle class="text-warning size-4" />
