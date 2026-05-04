@@ -22,6 +22,10 @@ scraper/debug/
 scraper/dist/
 scraper/build/
 
+# Local copies of remote debug artifacts (pulled with `compose cp`).
+session_expired_artifacts/
+session_expired_artifacts_tmp/
+
 # Extension build output
 extension/build/
 

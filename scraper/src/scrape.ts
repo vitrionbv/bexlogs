@@ -8,6 +8,7 @@ import {
     type Browser,
     type BrowserContext,
     type Page,
+    type Response,
 } from 'playwright';
 import { config, BEX_BASE_URLS, type Environment } from './config.js';
 import { extractRowsFromMain, parseLoadMoreResponse, type RawRow } from './extractors.js';
@@ -30,6 +31,34 @@ const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
  * request timeout, well below the 3-min reaper threshold).
  */
 const LOAD_MORE_422_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
+
+/**
+ * Backoff schedule (ms between attempts) for the "BookingExperts redirected
+ * us to /sign_in" path. Empirically, when the scheduler fans out N parallel
+ * scrapes that share a single BexSession, BE bounces them all to /sign_in
+ * even though the cookies are still valid for sequential single-session
+ * traffic (validator hits `/` 60s before the wave and gets 200 + the user
+ * profile back). Hypotheses: (a) anti-bot heuristic on bursty same-cookie
+ * traffic from one IP, (b) Devise-side race when multiple requests arrive
+ * during a session refresh, (c) a per-session concurrency cap on BE's side.
+ *
+ * Whichever it is, the bounce is transient — a single retry after a few
+ * seconds usually recovers because the burst window has elapsed and the
+ * other parallel attempts have either finished or also bounced. After
+ * exhausting the schedule we accept the genuine `session_expired`
+ * classification: the user re-links via the extension, BexSession.cookies
+ * gets refreshed, the next scrape uses the new cookies. Total wall-clock
+ * cost on full exhaustion: 10s of sleep + the three navigations
+ * themselves. Comfortably under the 30s per-nav timeout and the 3-min
+ * reaper threshold.
+ *
+ * Operator note: if these retries flap frequently in production, lower
+ * `MAX_CONCURRENT_SCRAPES` (currently 8) so the per-IP / per-session
+ * burst is smaller. The follow-up structural fix is per-session
+ * serialization in Laravel's enqueue path; this retry is the surgical
+ * scraper-side mitigation.
+ */
+const SIGN_IN_RETRY_DELAYS_MS: readonly number[] = [3000, 7000];
 
 const DEBUG_DUMP_DIR = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -107,6 +136,13 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     const earlyStopMinDups =
         job.params.early_stop_min_duplicates ?? config.EARLY_STOP_MIN_DUPLICATES;
 
+    // Most recent BookingExperts request (initial page or load_more). Read by
+    // the catch block so a single ERROR line gives the operator enough
+    // context to triage without grepping through earlier log entries or
+    // SSHing into the container for a debug artifact. Updated at the
+    // detection points only — no per-request overhead on the success path.
+    let lastDiagnostic: LastDiagnostic | null = null;
+
     try {
         browser = await chromium.launch({ headless: config.HEADLESS });
         context = await browser.newContext({
@@ -126,27 +162,25 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         const initialUrl = buildLogsUrl(job);
         log.info('navigating to logs page', { jobId: job.id, url: initialUrl });
 
-        const response = await page.goto(initialUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+        const navResult = await navigateInitialWithSignInRetry(page, initialUrl, job.id);
+        const response = navResult.response;
+        lastDiagnostic = {
+            phase: 'initial',
+            requestUrl: initialUrl,
+            finalUrl: page.url(),
+            status: response.status(),
+            bodyPreview: navResult.bouncedToSignIn
+                ? previewBody(navResult.lastBody)
+                : null,
+        };
 
-        if (!response) throw new Error('no response from initial GET');
-        if (page.url().includes('/sign_in')) {
-            // Capture the rendered sign-in page (or whatever BE actually
-            // served) before throwing, so the operator can confirm this is
-            // a genuine expiry vs a transient anti-bot / concurrency
-            // rejection. page.content() is the full DOM after any JS-driven
-            // redirects, which is what determines our /sign_in match.
-            await dumpDebugArtifact(
-                job.id,
-                0,
-                await page.content().catch(() => '<page.content() failed>'),
-                'session_expired',
-                {
-                    subscription: job.subscription,
-                    pageCount: 0,
-                    previousToken: null,
-                    url: page.url(),
-                },
-            );
+        if (navResult.bouncedToSignIn) {
+            await dumpDebugArtifact(job.id, 0, navResult.lastBody, 'session_expired', {
+                subscription: job.subscription,
+                pageCount: 0,
+                previousToken: null,
+                url: page.url(),
+            });
             throw new Error(SESSION_EXPIRED_SENTINEL);
         }
         if (response.status() >= 400) throw new Error(`initial page HTTP ${response.status()}`);
@@ -215,10 +249,9 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             const url = buildLoadMoreUrl(job, nextToken);
             log.debug('load_more', { jobId: job.id, page: pageCount, url });
 
-            const xhrResult = await loadMoreWithRetry(apiCtx, url, referer, {
+            const xhrResult = await loadMoreWithSignInRetry(apiCtx, url, referer, {
                 jobId: job.id,
                 page: pageCount + 1,
-                retryDelaysMs: LOAD_MORE_422_RETRY_DELAYS_MS,
             });
 
             if (xhrResult === '422_exhausted') {
@@ -236,12 +269,18 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             }
 
             const xhr: APIResponse = xhrResult;
+            lastDiagnostic = {
+                phase: 'load_more',
+                requestUrl: url,
+                finalUrl: xhr.url(),
+                status: xhr.status(),
+                bodyPreview: null,
+            };
             if (xhr.status() === 401 || xhr.status() === 403) {
-                // Capture the body BE returned with the 4xx so we can tell
-                // whether it's an actual sign-in redirect or some other
-                // refusal (permission, soft rate-limit, anti-bot challenge)
-                // currently being miscategorized as session_expired.
+                // We've already exhausted the SIGN_IN_RETRY schedule inside
+                // loadMoreWithSignInRetry. The status here is final.
                 const body = await xhr.text().catch(() => '<xhr.text() failed>');
+                lastDiagnostic.bodyPreview = previewBody(body);
                 await dumpDebugArtifact(job.id, pageCount + 1, body, 'session_expired', {
                     subscription: job.subscription,
                     pageCount,
@@ -563,6 +602,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 jobId: job.id,
                 sessionId: job.session.id,
                 stopReason,
+                ...(lastDiagnostic ? lastDiagnosticForLog(lastDiagnostic) : {}),
             });
             await reportSessionExpired(job.session.id).catch(() => undefined);
         } else {
@@ -570,6 +610,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 jobId: job.id,
                 error: message,
                 stopReason: stopReason ?? null,
+                ...(lastDiagnostic ? lastDiagnosticForLog(lastDiagnostic) : {}),
             });
         }
         // Forward the typed reason so Laravel persists it onto
@@ -879,6 +920,186 @@ export async function loadMoreWithRetry(
     }
 
     return '422_exhausted';
+}
+
+/**
+ * Wrap `loadMoreWithRetry` (which already handles 422 with backoff) with
+ * an additional retry layer for 401/403 → /sign_in bouncing. We discovered
+ * empirically that BookingExperts redirects parallel same-cookie requests
+ * to /sign_in even when the cookies are valid for sequential traffic; a
+ * few-second pause between attempts is usually enough for the burst
+ * window to elapse and the response to come back 200.
+ *
+ * Status codes:
+ *   - APIResponse with status not in {401, 403}: caller proceeds as before.
+ *   - APIResponse with status 401/403: retries exhausted, caller treats as
+ *     genuine session_expired (dump artifact + throw SESSION_EXPIRED).
+ *   - '422_exhausted': forwarded straight through from loadMoreWithRetry.
+ *
+ * Each retry re-issues the entire loadMoreWithRetry call, so a 422 that
+ * happens during a 401/403 retry attempt still gets its own backoff. Worst
+ * case wall-clock: SIGN_IN_RETRY_DELAYS_MS sum + (per-retry) the 422 retry
+ * sum + the actual HTTP round trips. Bounded well under the 30s timeout
+ * + 3-min reaper threshold.
+ */
+export async function loadMoreWithSignInRetry(
+    apiCtx: APIRequestContext,
+    url: string,
+    referer: string,
+    opts: {
+        jobId: number;
+        page: number;
+        signInRetryDelaysMs?: readonly number[];
+        rate422RetryDelaysMs?: readonly number[];
+    },
+): Promise<APIResponse | '422_exhausted'> {
+    const { jobId, page } = opts;
+    const signInDelays = opts.signInRetryDelaysMs ?? SIGN_IN_RETRY_DELAYS_MS;
+    const rate422Delays = opts.rate422RetryDelaysMs ?? LOAD_MORE_422_RETRY_DELAYS_MS;
+    const maxAttempts = signInDelays.length + 1;
+    let lastResult: APIResponse | '422_exhausted' = await loadMoreWithRetry(apiCtx, url, referer, {
+        jobId,
+        page,
+        retryDelaysMs: rate422Delays,
+    });
+
+    for (let attempt = 1; attempt < maxAttempts; attempt++) {
+        if (lastResult === '422_exhausted') return lastResult;
+        const status = lastResult.status();
+        if (status !== 401 && status !== 403) return lastResult;
+
+        const delay = signInDelays[attempt - 1] ?? 0;
+        log.warn('load_more got 401/403 — retrying after backoff (likely transient sign-in bounce)', {
+            jobId,
+            page,
+            attempt,
+            attemptsRemaining: maxAttempts - attempt,
+            nextDelayMs: delay,
+            status,
+        });
+        await sleep(delay);
+
+        lastResult = await loadMoreWithRetry(apiCtx, url, referer, {
+            jobId,
+            page,
+            retryDelaysMs: rate422Delays,
+        });
+
+        if (lastResult !== '422_exhausted') {
+            const newStatus = lastResult.status();
+            if (newStatus !== 401 && newStatus !== 403) {
+                log.info('load_more recovered after 401/403 bounce', {
+                    jobId,
+                    page,
+                    retries: attempt,
+                    finalStatus: newStatus,
+                });
+                return lastResult;
+            }
+        }
+    }
+
+    if (lastResult !== '422_exhausted') {
+        log.error('load_more 401/403 exhausted retries — declaring session_expired', {
+            jobId,
+            page,
+            attempts: maxAttempts,
+            finalStatus: lastResult.status(),
+        });
+    }
+    return lastResult;
+}
+
+/**
+ * Re-navigate the initial logs page up to `SIGN_IN_RETRY_DELAYS_MS.length`
+ * times if BookingExperts bounces us to /sign_in. Returns the final
+ * response, whether we ended up bounced, and the rendered body of the
+ * last bounce (for the caller to dump as a debug artifact when the retry
+ * schedule was exhausted).
+ *
+ * The browser context retains the same cookies across retries — we don't
+ * need to reapply anything. Each `page.goto()` re-attempts the original
+ * URL; if the bounce was anti-bot/concurrency-driven the second or third
+ * attempt usually succeeds because the burst window has elapsed.
+ *
+ * Worst case wall-clock: SIGN_IN_RETRY_DELAYS_MS sum + the three
+ * page.goto() round trips. Comfortably bounded.
+ */
+async function navigateInitialWithSignInRetry(
+    page: Page,
+    url: string,
+    jobId: number,
+): Promise<{ response: Response; bouncedToSignIn: boolean; lastBody: string; retries: number }> {
+    let response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    if (!response) throw new Error('no response from initial GET');
+
+    if (!page.url().includes('/sign_in')) {
+        return { response, bouncedToSignIn: false, lastBody: '', retries: 0 };
+    }
+
+    let lastBody = await page.content().catch(() => '<page.content() failed>');
+    let retries = 0;
+
+    for (let i = 0; i < SIGN_IN_RETRY_DELAYS_MS.length; i++) {
+        const delay = SIGN_IN_RETRY_DELAYS_MS[i] ?? 0;
+        log.warn('initial nav landed on /sign_in — retrying after backoff (likely transient sign-in bounce)', {
+            jobId,
+            attempt: retries + 1,
+            attemptsRemaining: SIGN_IN_RETRY_DELAYS_MS.length - i,
+            nextDelayMs: delay,
+        });
+        await sleep(delay);
+
+        const retried = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+        if (!retried) throw new Error('no response from initial GET retry');
+        retries++;
+        response = retried;
+
+        if (!page.url().includes('/sign_in')) {
+            log.info('initial nav recovered after sign-in bounce', {
+                jobId,
+                retries,
+                finalUrl: page.url(),
+            });
+            return { response, bouncedToSignIn: false, lastBody: '', retries };
+        }
+        lastBody = await page.content().catch(() => '<page.content() failed>');
+    }
+
+    log.error('initial nav still on /sign_in after retries — declaring session_expired', {
+        jobId,
+        retries,
+        finalUrl: page.url(),
+    });
+    return { response, bouncedToSignIn: true, lastBody, retries };
+}
+
+interface LastDiagnostic {
+    phase: 'initial' | 'load_more';
+    requestUrl: string;
+    finalUrl: string;
+    status: number;
+    bodyPreview: string | null;
+}
+
+/**
+ * Compress a `lastDiagnostic` snapshot into a compact log fragment for the
+ * catch block. Splits the body preview into both a raw preview and a few
+ * boolean flags (is_signin, is_403, etc.) so an operator can pattern-match
+ * without re-reading the artifact.
+ */
+function lastDiagnosticForLog(d: LastDiagnostic): Record<string, unknown> {
+    const body = d.bodyPreview ?? '';
+    return {
+        last_phase: d.phase,
+        last_request_url: d.requestUrl,
+        last_final_url: d.finalUrl,
+        last_status: d.status,
+        last_body_preview: body || null,
+        body_contains_sign_in: body ? /\/sign_in|new_user|user_email|user_password/i.test(body) : false,
+        body_contains_403: body ? /\b403\b|forbidden/i.test(body) : false,
+        body_contains_429: body ? /\b429\b|rate.?limit|too many/i.test(body) : false,
+    };
 }
 
 function buildLoadMoreUrl(job: ScrapeJob, nextToken: string): string {

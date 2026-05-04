@@ -444,7 +444,7 @@ explaining why the worker stopped paginating. Two-tier semantics:
 | **Token echo** | failed (red) | BE handed back the same `next_token` we just sent. Pagination wedged. | Inspect scraper logs; may be a BE-side bug. |
 | **Unparseable response** | failed (red) | BE response shape changed and our parsers couldn't recover. | Update `extractors.ts` / `parseLoadMoreResponse`. |
 | **Runaway safety** | failed (red) | Hit the cap on consecutive zero-row pages. BE handed out an apparently-infinite quiet window. | Inspect logs; usually a BE-side anomaly. |
-| **Session expired** | failed (red) | BE returned 401/403 — cookies expired. | Re-authenticate via the browser extension. |
+| **Session expired** | failed (red) | BE bounced us to `/users/sign_in` (or returned 401/403 on `load_more`) and the sign-in retry schedule (`SIGN_IN_RETRY_DELAYS_MS = [3s, 7s]`) didn't recover. Cookies look genuinely expired. | Re-authenticate via the browser extension. If you see this badge under N-way concurrent fan-out *and* the session validates fine on a single sequential check, the bounce is likely transient — see "Fixing frequent `Session expired` failures" below before re-linking. |
 | **Worker reaped** | failed (red) | Worker stopped heart-beating; the reaper failed the job. | Check `docker compose logs scraper` for crashes. |
 
 `Caught up` is the healthy completion badge. Everything other than
@@ -498,6 +498,47 @@ We deliberately do NOT auto-reduce concurrency in code — silently
 adapting would hide systemic upstream pressure that the operator should
 notice and act on.
 
+### Fixing frequent `Session expired` failures under concurrent fan-out
+
+If the Jobs page shows clusters of `Session expired` failures that all
+land within ~1 second of one another (a single scheduler tick fanning
+out N parallel scrapes against the same `BexSession`), and the session
+validates fine on a single sequential check (`docker compose exec -T app
+php artisan bex:refresh-sessions` returns `still_valid=1`), the bounce
+is very likely transient — BookingExperts has been observed to redirect
+parallel same-cookie requests to `/users/sign_in` even when the cookies
+work for a single browser session. The scraper retries the bounce up
+to twice with `[3s, 7s]` backoffs (`SIGN_IN_RETRY_DELAYS_MS` in
+`scrape.ts`); if every parallel attempt also bounces during those
+retries, we eventually accept the `session_expired` classification and
+mark the row.
+
+The structural fix is per-session serialization in Laravel's enqueue
+path (only allow one `running` scrape job per `BexSession` at a time —
+queue the rest). Until that ships, the operator-side mitigation is the
+same as for `Pagination error (422)`: lower `MAX_CONCURRENT_SCRAPES`
+so fewer same-cookie requests land in the same burst window. See the
+422 instructions above for the env-edit + container-recreate steps.
+
+To confirm whether retries are firing in the next scrape window:
+
+```bash
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    logs -f scraper | grep -iE "sign-in bounce|recovered|session expired"
+```
+
+A successful recovery looks like one or two `WARN ... initial nav landed
+on /sign_in — retrying after backoff` lines followed by `INFO ...
+initial nav recovered after sign-in bounce` and a normal `load_more`
+sequence. A genuine expiry looks like every retry bouncing followed by
+`ERROR ... initial nav still on /sign_in after retries — declaring
+session_expired` and `WARN session expired — reporting back to Laravel`.
+
+The artifacts under `/app/debug/session_expired-*.html` are the actual
+sign-in page BE served (a sign-in form is what bucket-A genuine expiry
+looks like; bucket-B/C would have a 403 / 401 body without a form).
+Same retention guard as the other dumps (14d / 200MB).
+
 ### Debugging parser failures (`token_missing` / `unparseable` / `token_echo`)
 
 When a scrape job fails with `stop_reason` of `token_missing`,
@@ -514,8 +555,12 @@ Reasons that **don't** dump (deliberately):
 
 - `pagination_error` (422 exhausted) — known protocol error, body is just BookingExperts' 422 page.
 - `runaway_safety` — operational anomaly across many pages, no single body to inspect.
-- `session_expired` — body is a sign-in redirect, not parser evidence.
 - All clean completions.
+
+`session_expired` **does** dump — the body is the actual sign-in page (or
+403 body) BE served, used to disambiguate genuine expiry from transient
+sign-in bounces under concurrency. See "Fixing frequent `Session
+expired` failures under concurrent fan-out" above.
 
 To pull the dumps off the server for offline inspection (the dumps live
 inside the scraper container's writable layer — without a named volume
