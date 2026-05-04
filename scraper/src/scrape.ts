@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -36,6 +36,13 @@ const DEBUG_DUMP_DIR = path.resolve(
     '..',
     'debug',
 );
+
+// Retention guard for `scraper/debug/` (≈ /app/debug inside the container).
+// Bound by both age and total bytes so a chatty failure mode can't blow the
+// container's filesystem. Pruning runs once per dump (cheap — single readdir
+// + stat per entry) so an idle scraper never touches the directory.
+const DEBUG_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+const DEBUG_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
 
 export interface ScrapeResult {
     pages: number;
@@ -160,6 +167,18 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         // would be eternally valid AND every page was empty.
         let consecutiveZeroRowPages = 0;
 
+        // Most-recent /load_more_logs.js exchange, captured at the top of
+        // each loop iteration (after we receive the body). Tracked outside
+        // the loop so the post-loop `token_missing` fall-through can dump
+        // the body that produced the null next_token. The inline failure
+        // sites for `unparseable` and `token_echo` already have `body`,
+        // `url`, and `sentToken` in lexical scope so they don't read these
+        // — but they're cheap to maintain, so we keep them updated.
+        let lastBody: string | null = null;
+        let lastBodyPage = 0;
+        let lastUrl: string | null = null;
+        let lastSentToken: string | null = null;
+
         while (nextToken && pageCount < (job.params.max_pages ?? config.MAX_PAGES_PER_JOB)) {
             if (Date.now() - startedAt > budgetMs) {
                 log.warn('scrape budget exceeded — aborting cleanly', {
@@ -217,6 +236,15 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             }
 
             const sentToken = nextToken;
+            // Snapshot the exchange so the post-loop `token_missing`
+            // fall-through can dump the body that produced the null
+            // next_token. Captured BEFORE parseLoadMoreResponse mutates
+            // any of these so the dump reflects what the server actually
+            // sent us in this iteration.
+            lastBody = body;
+            lastBodyPage = pageCount + 1;
+            lastUrl = url;
+            lastSentToken = sentToken;
             const parsed = parseLoadMoreResponse(body, sentToken);
             let rows: RawRow[] = [];
             let parsedViaEval = false;
@@ -303,6 +331,12 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                             bodyPreview: previewBody(body, 240),
                         });
                         stopReason = 'unparseable';
+                        await dumpDebugArtifact(job.id, pageCount + 1, body, 'unparseable', {
+                            subscription: job.subscription,
+                            pageCount,
+                            previousToken: sentToken,
+                            url,
+                        });
                         throw new Error(
                             'load_more response had no parseable HTML payload and no next_token — '
                                 + 'BookingExperts response shape may have changed.',
@@ -396,6 +430,12 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     page: pageCount,
                 });
                 stopReason = 'token_echo';
+                await dumpDebugArtifact(job.id, pageCount, body, 'token_echo', {
+                    subscription: job.subscription,
+                    pageCount,
+                    previousToken: sentToken,
+                    url,
+                });
                 throw new Error(
                     `BookingExperts handed back the same next_token on page ${pageCount}; `
                         + 'pagination is stuck.',
@@ -427,6 +467,22 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 stopReason = 'pagination_limit';
             } else {
                 stopReason = 'token_missing';
+                // Dump the body that returned the null next_token. The
+                // null-token branch could be the loop's initial-page
+                // path (lastBody === null because we never made a
+                // load_more request — initial.nextToken was null with
+                // rows on the page), in which case there's no upstream
+                // body to capture and we just throw with the context-
+                // free message. Operator can still see the failure on
+                // the Jobs page; the error message is unambiguous.
+                if (lastBody !== null && lastUrl !== null) {
+                    await dumpDebugArtifact(job.id, lastBodyPage, lastBody, 'token_missing', {
+                        subscription: job.subscription,
+                        pageCount,
+                        previousToken: lastSentToken,
+                        url: lastUrl,
+                    });
+                }
                 throw new Error(
                     'BookingExperts stopped returning a next_token mid-scrape; '
                         + 'pagination state lost — treating as anomaly.',
@@ -847,6 +903,157 @@ async function dumpLoadMoreResponse(jobId: number, page: number, body: string): 
             page,
             error: err instanceof Error ? err.message : String(err),
         });
+    }
+}
+
+/**
+ * Reasons that warrant a forensic dump of the BookingExperts response body.
+ * Deliberately narrower than `StopReason`:
+ *   - `pagination_error` (422 exhausted) is a known protocol error with no
+ *     useful body — dumping a 422 page wastes disk and operator attention.
+ *   - `runaway_safety` is an operational anomaly across many pages, not a
+ *     parse issue with one body.
+ *   - `session_expired` bodies are sign-in redirects, not parser evidence.
+ *   - Clean completions never trigger.
+ */
+type DumpReason = 'token_missing' | 'unparseable' | 'token_echo';
+
+interface DumpContext {
+    subscription: ScrapeJob['subscription'];
+    pageCount: number;
+    previousToken: string | null;
+    url: string;
+}
+
+/**
+ * Persist the offending /load_more_logs.js response (and a small JSON
+ * sidecar) to `scraper/debug/` so an operator can SSH in and triage why
+ * BookingExperts confused the parser. Fires on every parse-class failure
+ * (`token_missing`, `unparseable`, `token_echo`) regardless of LOG_LEVEL or
+ * DEBUG_DUMP_LOADMORE — by the time we reach this code path the job is
+ * already failing, so the cost of the I/O is irrelevant compared to the
+ * value of having the body to inspect.
+ *
+ * Writes two files per failure (sharing a base name):
+ *   - `{reason}-{jobId}-p{page}-{timestamp}.html` — raw response body. The
+ *     `.html` extension is a lie (the body is usually Rails-UJS JS or a
+ *     Turbo Stream fragment) but it makes the file double-clickable in a
+ *     browser for visual inspection.
+ *   - `{reason}-{jobId}-p{page}-{timestamp}.json` — small metadata sidecar
+ *     so the operator can map the body back to the failed job without
+ *     re-reading scraper logs.
+ *
+ * Retention: bounded by `DEBUG_RETENTION_MS` (14d age) and
+ * `DEBUG_MAX_TOTAL_BYTES` (200MB total). Pruned in-line on each write so
+ * an idle scraper never touches the directory.
+ *
+ * Failure mode is a `warn` log + swallow — a debug-dump I/O error must
+ * not crash the scrape (the job is already failing for another reason;
+ * losing the artifact is not a regression worth surfacing).
+ */
+async function dumpDebugArtifact(
+    jobId: number,
+    page: number,
+    body: string,
+    reason: DumpReason,
+    context: DumpContext,
+): Promise<void> {
+    try {
+        await mkdir(DEBUG_DUMP_DIR, { recursive: true });
+        await pruneDebugDir();
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const baseName = `${reason}-${jobId}-p${page}-${timestamp}`;
+        const htmlFile = path.join(DEBUG_DUMP_DIR, `${baseName}.html`);
+        const jsonFile = path.join(DEBUG_DUMP_DIR, `${baseName}.json`);
+
+        const meta = {
+            jobId,
+            subscription: {
+                id: context.subscription.id,
+                environment: context.subscription.environment,
+                organization_id: context.subscription.organization_id,
+                application_id: context.subscription.application_id,
+            },
+            pageCount: context.pageCount,
+            previousToken: context.previousToken,
+            stopReason: reason,
+            timestamp: new Date().toISOString(),
+            url: context.url,
+            previewBody: previewBody(body),
+        };
+
+        await writeFile(htmlFile, body, 'utf8');
+        await writeFile(jsonFile, JSON.stringify(meta, null, 2), 'utf8');
+
+        log.info('dumped debug artifact', {
+            jobId,
+            page,
+            reason,
+            htmlFile,
+            jsonFile,
+            sizeBytes: Buffer.byteLength(body, 'utf8'),
+        });
+    } catch (err) {
+        log.warn('failed to dump debug artifact', {
+            jobId,
+            page,
+            reason,
+            error: err instanceof Error ? err.message : String(err),
+        });
+    }
+}
+
+/**
+ * Single-pass retention guard for `scraper/debug/`. Drops files older than
+ * `DEBUG_RETENTION_MS` first (cheap age cull), then if the surviving files
+ * still exceed `DEBUG_MAX_TOTAL_BYTES` removes oldest-first until under
+ * the cap. Treats every regular file in the directory uniformly — covers
+ * both the new `dumpDebugArtifact` outputs and the older
+ * `dumpLoadMoreResponse` outputs (debug-mode only) so the size cap means
+ * something regardless of which helper produced the file.
+ *
+ * Failure mode (e.g. dir doesn't exist yet, EACCES) is silently ignored
+ * — the subsequent `mkdir`/`writeFile` will surface any real I/O error
+ * via the caller's catch.
+ */
+async function pruneDebugDir(): Promise<void> {
+    let entries: string[];
+    try {
+        entries = await readdir(DEBUG_DUMP_DIR);
+    } catch {
+        return;
+    }
+
+    const now = Date.now();
+    const survivors: Array<{ name: string; mtimeMs: number; size: number }> = [];
+    let totalBytes = 0;
+
+    for (const name of entries) {
+        const full = path.join(DEBUG_DUMP_DIR, name);
+        let st;
+        try {
+            st = await stat(full);
+        } catch {
+            continue;
+        }
+        if (!st.isFile()) continue;
+
+        if (now - st.mtimeMs > DEBUG_RETENTION_MS) {
+            await unlink(full).catch(() => undefined);
+            continue;
+        }
+        survivors.push({ name, mtimeMs: st.mtimeMs, size: st.size });
+        totalBytes += st.size;
+    }
+
+    if (totalBytes <= DEBUG_MAX_TOTAL_BYTES) return;
+
+    survivors.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const f of survivors) {
+        if (totalBytes <= DEBUG_MAX_TOTAL_BYTES) break;
+        await unlink(path.join(DEBUG_DUMP_DIR, f.name)).catch(() => undefined);
+        totalBytes -= f.size;
     }
 }
 

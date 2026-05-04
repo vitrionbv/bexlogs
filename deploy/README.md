@@ -498,6 +498,78 @@ We deliberately do NOT auto-reduce concurrency in code — silently
 adapting would hide systemic upstream pressure that the operator should
 notice and act on.
 
+### Debugging parser failures (`token_missing` / `unparseable` / `token_echo`)
+
+When a scrape job fails with `stop_reason` of `token_missing`,
+`unparseable`, or `token_echo`, the scraper writes a forensic dump of
+the offending /load_more_logs.js response to `/app/debug/` inside the
+scraper container. Two files per failure share a base name:
+
+| file                                                    | what                                                                                                                |
+|---------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `{reason}-{jobId}-p{page}-{timestamp}.html`             | Raw response body from BookingExperts. The `.html` extension is a lie (it's usually Rails-UJS JS or a Turbo Stream fragment) but it makes the file double-clickable in a browser for visual inspection. |
+| `{reason}-{jobId}-p{page}-{timestamp}.json`             | Metadata sidecar: `jobId`, `subscription` (id/env/org/app), `pageCount`, `previousToken`, `stopReason`, `timestamp`, `url`, `previewBody`. Maps the dump back to a job without re-reading scraper logs. |
+
+Reasons that **don't** dump (deliberately):
+
+- `pagination_error` (422 exhausted) — known protocol error, body is just BookingExperts' 422 page.
+- `runaway_safety` — operational anomaly across many pages, no single body to inspect.
+- `session_expired` — body is a sign-in redirect, not parser evidence.
+- All clean completions.
+
+To pull the dumps off the server for offline inspection (the dumps live
+inside the scraper container's writable layer — without a named volume
+they're invisible to the host filesystem until you `docker cp` them
+out):
+
+```bash
+ssh root@<server>
+cd /opt/bexlogs
+
+# 1. List what's there
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    exec -T scraper ls -la /app/debug
+
+# 2. Copy the whole directory from the container to a host path
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    cp scraper:/app/debug ./scraper-debug-$(date +%F)
+
+# 3. Tarball + scp to your dev box
+tar -czf scraper-debug-$(date +%F).tar.gz scraper-debug-$(date +%F)
+# (then on your dev machine:)
+scp root@<server>:/opt/bexlogs/scraper-debug-*.tar.gz ./
+```
+
+#### Retention
+
+The directory has two bounds, applied on each new dump (single pass —
+idle scrapers don't touch the directory):
+
+- **Age:** files older than 14 days are unlinked.
+- **Size:** if the surviving total exceeds 200 MB, oldest files are
+  unlinked oldest-first until under the cap.
+
+#### Volume persistence — dumps are lost on rebuild
+
+`/app/debug` is **not** backed by a named volume, so `docker compose up
+-d --force-recreate scraper` (or any redeploy that rebuilds the image)
+wipes accumulated dumps. This is deliberate: the artifacts are short-
+lived debugging aids, not durable evidence — adding a named volume
+just to persist them would clutter the volume list with noise the
+operator rarely looks at, and the 14d / 200MB caps already keep the
+directory bounded.
+
+If you're about to redeploy and want to keep the dumps for an open
+investigation, copy them out *before* `docker compose up -d`:
+
+```bash
+ssh root@<server>
+docker compose -f /opt/bexlogs/docker-compose.production.yml \
+    --env-file /opt/bexlogs/laravel/.env \
+    cp scraper:/app/debug /tmp/bexlogs-debug-$(date +%F)
+# now redeploy as normal; /tmp survives
+```
+
 ### Get a shell inside a service
 
 ```bash
