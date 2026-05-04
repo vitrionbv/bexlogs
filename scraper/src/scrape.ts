@@ -34,29 +34,39 @@ const LOAD_MORE_422_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
 
 /**
  * Backoff schedule (ms between attempts) for the "BookingExperts redirected
- * us to /sign_in" path. Empirically, when the scheduler fans out N parallel
- * scrapes that share a single BexSession, BE bounces them all to /sign_in
- * even though the cookies are still valid for sequential single-session
- * traffic (validator hits `/` 60s before the wave and gets 200 + the user
- * profile back). Hypotheses: (a) anti-bot heuristic on bursty same-cookie
- * traffic from one IP, (b) Devise-side race when multiple requests arrive
- * during a session refresh, (c) a per-session concurrency cap on BE's side.
+ * us to /sign_in" path. The schedule covers two distinct scenarios:
  *
- * Whichever it is, the bounce is transient — a single retry after a few
- * seconds usually recovers because the burst window has elapsed and the
- * other parallel attempts have either finished or also bounced. After
- * exhausting the schedule we accept the genuine `session_expired`
- * classification: the user re-links via the extension, BexSession.cookies
- * gets refreshed, the next scrape uses the new cookies. Total wall-clock
- * cost on full exhaustion: 10s of sleep + the three navigations
- * themselves. Comfortably under the 30s per-nav timeout and the 3-min
- * reaper threshold.
+ *   1. **Stale-cookie expiry** (most common in production right now): the
+ *      cookies in BexSession.cookies are no longer accepted by BE for
+ *      deep `/organizations/.../logs` URLs even though the validator
+ *      (`BookingExpertsClient::validateSession`) reports the session as
+ *      "still valid". The validator is too lenient — it hits `GET /`,
+ *      sees a 301 to `/redirect?locale=nl` and accepts that as valid
+ *      because the immediate Location doesn't contain `/sign_in`. Follow
+ *      the chain and `/redirect?locale=nl` itself 302s to `/sign_in` for
+ *      a stale session. Retries here will not recover (every retry hits
+ *      the same `/sign_in`); we accept the session_expired classification
+ *      after the schedule exhausts, the user re-links via the extension,
+ *      and the next scrape uses fresh cookies. Validator-side fix is
+ *      tracked separately by the sibling worker handling the re-auth
+ *      flow.
  *
- * Operator note: if these retries flap frequently in production, lower
- * `MAX_CONCURRENT_SCRAPES` (currently 8) so the per-IP / per-session
- * burst is smaller. The follow-up structural fix is per-session
- * serialization in Laravel's enqueue path; this retry is the surgical
- * scraper-side mitigation.
+ *   2. **Transient anti-bot / concurrency bounce** (defensive — observed
+ *      historically but not currently the dominant failure mode): BE
+ *      occasionally bounces parallel same-cookie requests to /sign_in
+ *      even when the cookies are valid; a 3-7s pause is usually enough
+ *      for the burst window to elapse and the second attempt to
+ *      succeed. The retry layer earns its keep here.
+ *
+ * Total wall-clock cost on full exhaustion: 10s of sleep + the three
+ * navigations themselves. Comfortably under the 30s per-nav timeout and
+ * the 3-min reaper threshold.
+ *
+ * Operator note: if `Session expired` failures cluster while the
+ * Authenticate page still shows the BexSession as linked, see
+ * `deploy/README.md` ("Diagnosing Session expired failures") — the
+ * usual fix is re-linking via the extension popup, NOT a scraper
+ * change.
  */
 const SIGN_IN_RETRY_DELAYS_MS: readonly number[] = [3000, 7000];
 

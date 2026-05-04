@@ -498,46 +498,97 @@ We deliberately do NOT auto-reduce concurrency in code — silently
 adapting would hide systemic upstream pressure that the operator should
 notice and act on.
 
-### Fixing frequent `Session expired` failures under concurrent fan-out
+### Diagnosing `Session expired` failures (and the "linked-but-failing" trap)
 
-If the Jobs page shows clusters of `Session expired` failures that all
-land within ~1 second of one another (a single scheduler tick fanning
-out N parallel scrapes against the same `BexSession`), and the session
-validates fine on a single sequential check (`docker compose exec -T app
-php artisan bex:refresh-sessions` returns `still_valid=1`), the bounce
-is very likely transient — BookingExperts has been observed to redirect
-parallel same-cookie requests to `/users/sign_in` even when the cookies
-work for a single browser session. The scraper retries the bounce up
-to twice with `[3s, 7s]` backoffs (`SIGN_IN_RETRY_DELAYS_MS` in
-`scrape.ts`); if every parallel attempt also bounces during those
-retries, we eventually accept the `session_expired` classification and
-mark the row.
+When the Jobs page shows clusters of `Session expired` failures even
+though the Authenticate page reports the BexSession as **linked** /
+**still valid**, the most common cause is a stale `BexSession.cookies`
+that the validator can't detect. Background:
 
-The structural fix is per-session serialization in Laravel's enqueue
-path (only allow one `running` scrape job per `BexSession` at a time —
-queue the rest). Until that ships, the operator-side mitigation is the
-same as for `Pagination error (422)`: lower `MAX_CONCURRENT_SCRAPES`
-so fewer same-cookie requests land in the same burst window. See the
-422 instructions above for the env-edit + container-recreate steps.
+`BookingExpertsClient::validateSession` (used by `bex:refresh-sessions`
+and the "Validate now" UI button) hits `GET /` with the stored cookies
+and marks the session "valid" if the response is 200, OR is a 3xx
+whose `Location` header doesn't contain `/sign_in`. **It does NOT
+follow the redirect chain.** With a real (live) production session,
+`GET /` returns `301 Location: /redirect?locale=nl` — the validator
+sees no `/sign_in` in the immediate Location and marks valid. But if
+you follow the chain manually:
 
-To confirm whether retries are firing in the next scrape window:
+```bash
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    exec -T app php artisan tinker --execute='$session = App\Models\BexSession::find(1); $client = new App\Services\BookingExpertsClient("production"); $r = $client->authed($session)->get("/redirect?locale=nl"); echo "status=".$r->status()." location=".($r->header("Location") ?: "none").PHP_EOL;'
+```
+
+…a stale session 302s on to `/sign_in` from `/redirect?locale=nl`,
+even though the validator's first hop returned a redirect to
+`/redirect`. So the validator can be a false-positive: the user's
+browser still works (their browser has fresher cookies than the DB
+copy after weeks of rotation), the extension is still capturing, but
+the cookies in `BexSession.cookies` are no longer accepted by BE for
+deep URLs.
+
+The scraper's classification is correct in this case: BE genuinely
+redirects to `/users/sign_in` for the deep `/organizations/.../logs`
+URL. The retry layer (`SIGN_IN_RETRY_DELAYS_MS = [3s, 7s]` in
+`scrape.ts`) gives a transient bounce a chance to recover (e.g.
+brief BE-side anti-bot trigger), but a stale-cookie bounce will not
+recover within 10s — every retry hits the same `/sign_in`.
+
+Action when you see this pattern (Jobs failing as `Session expired`
+even though the UI says linked):
+
+1. **Re-link the BexSession from the extension popup** — capture
+   fresh cookies. Next scrape window picks them up.
+2. **Watch the next scheduler tick:** if the scrapes succeed, the
+   stale cookies were the problem.
+3. **If they still fail** with `Session expired`, the cookies the
+   extension captured are also being bounced — possible scenarios:
+   - BE has a per-IP / per-route lock on the prod IP (rotate the
+     server IP or whitelist via BE).
+   - The user lost developer-role permissions on the apps.
+   - BE moved /developer/applications behind a separate auth scope
+     that the extension's cookie capture doesn't cover.
+4. **The scraper has already dumped the body** to
+   `/app/debug/session_expired-*.html` — pull and inspect (it's the
+   same Devise sign-in form for all the cases above; the sidecar
+   `.json` has the request URL, finalUrl, etc.).
+
+**Validator false-positive is sibling-worker territory.** A separate
+worker is reworking the expired-session flow (see "Coordination" in
+the original task brief): the fix likely lives in
+`BookingExpertsClient::validateSession` (follow the redirect chain
+before declaring valid, OR hit a deeper URL that mirrors what the
+scraper actually requests).
+
+To confirm whether scraper retries are firing in the next scrape
+window:
 
 ```bash
 docker compose -f docker-compose.production.yml --env-file laravel/.env \
     logs -f scraper | grep -iE "sign-in bounce|recovered|session expired"
 ```
 
-A successful recovery looks like one or two `WARN ... initial nav landed
-on /sign_in — retrying after backoff` lines followed by `INFO ...
-initial nav recovered after sign-in bounce` and a normal `load_more`
-sequence. A genuine expiry looks like every retry bouncing followed by
-`ERROR ... initial nav still on /sign_in after retries — declaring
-session_expired` and `WARN session expired — reporting back to Laravel`.
+A successful recovery looks like one or two `WARN ... initial nav
+landed on /sign_in — retrying after backoff` lines followed by
+`INFO ... initial nav recovered after sign-in bounce` and a normal
+`load_more` sequence. A stale-cookie failure looks like every retry
+bouncing followed by `ERROR ... initial nav still on /sign_in after
+retries — declaring session_expired` and `WARN session expired —
+reporting back to Laravel` (with the enriched `last_phase`,
+`last_request_url`, `last_final_url`, `last_status`, `body_contains_*`
+fields for triage).
 
 The artifacts under `/app/debug/session_expired-*.html` are the actual
-sign-in page BE served (a sign-in form is what bucket-A genuine expiry
-looks like; bucket-B/C would have a 403 / 401 body without a form).
-Same retention guard as the other dumps (14d / 200MB).
+sign-in page BE served. A genuine expiry shows the standard Devise
+form (title `Inloggen BEX PMS`, `<form action="/users/sign_in">`,
+email + password fields) with NO flash message — BE just bounces
+unauthorized requests to the sign-in page without telling the client
+why. Bucket B/C (a 403/401 body without a sign-in form) has not been
+observed in production; if you see it in the artifacts, the scraper's
+classification needs the additional refinement noted in the task
+brief (require sign-in markers in the body before declaring
+`session_expired`, route plain-403 to a new `upstream_forbidden`
+reason). Same retention guard as the other dumps (14d / 200MB).
 
 ### Debugging parser failures (`token_missing` / `unparseable` / `token_echo`)
 
