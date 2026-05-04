@@ -14,6 +14,13 @@ use Tests\TestCase;
  * fresh deploy without that env var set must continue to behave exactly
  * as before, otherwise we'd brick ourselves on every initial bootstrap.
  * Test A pins that down. Don't delete it.
+ *
+ * Probe URL: we use `/` as the canonical "did the middleware let me
+ * through?" target. `/` redirects guests to `/login` (302), so the
+ * pass-through assertion is `assertRedirect('/login')` — what matters
+ * is that the response isn't a 403 from the IP filter. Don't switch
+ * the probe to `/up` or `/api/worker/*`: those paths are deliberately
+ * short-circuited by the middleware and would invalidate the test.
  */
 class IpAllowlistTest extends TestCase
 {
@@ -25,7 +32,7 @@ class IpAllowlistTest extends TestCase
 
         $this->withServerVariables(['REMOTE_ADDR' => '203.0.113.99'])
             ->get('/')
-            ->assertOk();
+            ->assertRedirect('/login');
     }
 
     public function test_allowed_literal_ip_passes(): void
@@ -34,7 +41,7 @@ class IpAllowlistTest extends TestCase
 
         $this->withServerVariables(['REMOTE_ADDR' => '93.119.3.188'])
             ->get('/')
-            ->assertOk();
+            ->assertRedirect('/login');
     }
 
     public function test_disallowed_ip_is_rejected(): void
@@ -57,7 +64,7 @@ class IpAllowlistTest extends TestCase
 
         $this->withServerVariables(['REMOTE_ADDR' => '10.0.0.42'])
             ->get('/')
-            ->assertOk();
+            ->assertRedirect('/login');
 
         $this->withServerVariables(['REMOTE_ADDR' => '10.0.1.1'])
             ->get('/')
@@ -89,7 +96,7 @@ class IpAllowlistTest extends TestCase
         $this->withServerVariables(['REMOTE_ADDR' => '104.23.166.126'])
             ->withHeaders(['CF-Connecting-IP' => '93.119.3.188'])
             ->get('/')
-            ->assertOk();
+            ->assertRedirect('/login');
 
         $this->withServerVariables(['REMOTE_ADDR' => '104.23.166.126'])
             ->withHeaders(['CF-Connecting-IP' => '1.2.3.4'])

@@ -34,6 +34,19 @@ class BexSessionCookieTtlTest extends TestCase
     {
         parent::setUp();
         $this->now = CarbonImmutable::create(2026, 5, 4, 17, 0, 0, 'UTC');
+        // BexSession::cookieTtlSummary calls $expires->isPast() under
+        // the hood, which always reads wall-clock "now" regardless of
+        // any $now we pass in. Pin Carbon's clock to $this->now so the
+        // helper sees the same time the assertions were written
+        // against — otherwise the test starts failing the moment real
+        // wall-clock time advances past the hardcoded $this->now.
+        CarbonImmutable::setTestNow($this->now);
+    }
+
+    protected function tearDown(): void
+    {
+        CarbonImmutable::setTestNow();
+        parent::tearDown();
     }
 
     public function test_session_only_auth_cookies_get_session_cookie_label(): void
