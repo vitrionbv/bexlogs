@@ -7,20 +7,14 @@ use App\Http\Controllers\JobsController;
 use App\Http\Controllers\LogExportController;
 use App\Http\Controllers\ManageController;
 use App\Http\Controllers\PageController;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Route;
-use Inertia\Inertia;
 
-// Root: marketing Welcome for guests, redirect straight to the Logs index
-// for signed-in users. The old /dashboard surface was removed; /logs is
-// the primary work surface so authenticated visits go there directly.
-Route::get('/', function () {
-    if (Auth::check()) {
-        return redirect('/logs');
-    }
-
-    return Inertia::render('Welcome');
-})->name('home');
+// Root has no public surface: signed-in users go to the Logs index,
+// guests are bounced to the login screen. The old /dashboard surface
+// and the public Welcome page were removed; /logs is the primary work
+// surface so authenticated visits land there directly.
+Route::get('/', fn () => auth()->check() ? redirect('/logs') : redirect('/login'))
+    ->name('home');
 
 // Public endpoint to download the browser extension zip.
 Route::get('/extension/download', [ExtensionController::class, 'download'])
