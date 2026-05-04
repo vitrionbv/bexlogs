@@ -5,6 +5,7 @@ use App\Http\Middleware\EnsureClientIpIsAllowed;
 use App\Http\Middleware\EnsureUserIsAdmin;
 use App\Http\Middleware\HandleAppearance;
 use App\Http\Middleware\HandleInertiaRequests;
+use App\Http\Middleware\SendRobotsHeader;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -45,6 +46,15 @@ return Application::configure(basePath: dirname(__DIR__))
             HandleAppearance::class,
             HandleInertiaRequests::class,
             AddLinkHeadersForPreloadedAssets::class,
+            SendRobotsHeader::class,
+        ]);
+
+        // Apply the X-Robots-Tag header on the API group too. There is no
+        // public crawler surface for /api/* routes, but if a search engine
+        // ever stumbles into one (e.g. via a stray link), the header makes
+        // the intent explicit.
+        $middleware->api(append: [
+            SendRobotsHeader::class,
         ]);
 
         $middleware->alias([

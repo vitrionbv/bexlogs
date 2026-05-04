@@ -14,7 +14,7 @@ use Illuminate\Queue\SerializesModels;
  *
  * Broadcast on:
  *   - private-page.{pageId}   — the live log feed (Logs/Show.vue)
- *   - private-user.{userId}   — sidebar / dashboard / Logs index refresh
+ *   - private-user.{userId}   — sidebar / Logs index refresh
  *
  * `ShouldBroadcastNow` (not the queued variant): the worker ships batches
  * in tight succession during a scrape; if these went through the queue the

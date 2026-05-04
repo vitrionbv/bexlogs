@@ -2,24 +2,45 @@
 
 use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\AuthenticateController;
-use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\ExtensionController;
 use App\Http\Controllers\JobsController;
 use App\Http\Controllers\LogExportController;
 use App\Http\Controllers\ManageController;
 use App\Http\Controllers\PageController;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Route;
+use Inertia\Inertia;
 
-Route::inertia('/', 'Welcome')->name('home');
+// Root: marketing Welcome for guests, redirect straight to the Logs index
+// for signed-in users. The old /dashboard surface was removed; /logs is
+// the primary work surface so authenticated visits go there directly.
+Route::get('/', function () {
+    if (Auth::check()) {
+        return redirect('/logs');
+    }
+
+    return Inertia::render('Welcome');
+})->name('home');
 
 // Public endpoint to download the browser extension zip.
 Route::get('/extension/download', [ExtensionController::class, 'download'])
     ->name('extension.download');
 
-Route::middleware(['auth', 'verified'])->group(function () {
-    Route::get('dashboard', [DashboardController::class, 'index'])
-        ->name('dashboard');
+// /robots.txt fallback. In production nginx serves the static file from
+// /public/ before the request reaches PHP (see docker/app/nginx.conf →
+// `location /` → `try_files $uri ...`). This route exists so that
+// `php artisan serve` and PHPUnit (`$this->get('/robots.txt')`) return
+// the same content. Disallow-all is intentional: this is a single-tenant
+// operator tool and we never want it indexed.
+Route::get('/robots.txt', function () {
+    return response(
+        "User-agent: *\nDisallow: /\n",
+        200,
+        ['Content-Type' => 'text/plain'],
+    );
+});
 
+Route::middleware(['auth', 'verified'])->group(function () {
     // BookingExperts authentication bridge.
     Route::get('authenticate', [AuthenticateController::class, 'index'])
         ->name('authenticate.index');

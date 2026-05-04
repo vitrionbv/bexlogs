@@ -5,7 +5,7 @@ import { defineComponent, h } from 'vue';
 import type { Component } from 'vue';
 import AppLogoIcon from '@/components/AppLogoIcon.vue';
 import { Button } from '@/components/ui/button';
-import { dashboard, login } from '@/routes';
+import { login } from '@/routes';
 
 const FeatureRow = defineComponent({
     name: 'FeatureRow',
@@ -48,7 +48,7 @@ const FeatureRow = defineComponent({
                 </div>
                 <nav class="flex items-center gap-2 text-sm">
                     <Button v-if="$page.props.auth.user" as-child variant="default">
-                        <Link :href="dashboard()">Open dashboard</Link>
+                        <Link href="/logs">Open logs</Link>
                     </Button>
                     <Button v-else as-child variant="default">
                         <Link :href="login()">Sign in</Link>
@@ -75,7 +75,7 @@ const FeatureRow = defineComponent({
                     </p>
                     <div class="flex flex-wrap items-center gap-3 pt-2">
                         <Button v-if="$page.props.auth.user" as-child size="lg">
-                            <Link :href="dashboard()">Go to dashboard</Link>
+                            <Link href="/logs">Go to logs</Link>
                         </Button>
                         <Button v-else as-child size="lg">
                             <Link :href="login()">Sign in to start</Link>

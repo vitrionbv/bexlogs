@@ -52,11 +52,3 @@ Broadcast::channel('job.{jobId}', function (User $user, int $jobId) {
         ->where('organizations.user_id', $user->id)
         ->exists();
 });
-
-/**
- * Live host metrics (CPU / memory / disk / load) for the admin dashboard.
- * Admin-only — non-admins never see host vitals even on a shared install.
- */
-Broadcast::channel('server-stats', function (User $user) {
-    return (bool) $user->is_admin;
-});
