@@ -118,6 +118,14 @@ class WorkerBatchStatsTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 3,
+                // `rows` is the legacy field — pre-fix the scraper sent
+                // it as `pages_processed × BATCH_SIZE`, which gave the
+                // Jobs UI suspiciously round counts instead of real
+                // row numbers. The validator still ACCEPTS the field
+                // (so a rolling-deploy worker still sending it doesn't
+                // 422) but the merge drops it before persisting. The
+                // contract is `rows_received` / `rows_inserted` from
+                // the /batch endpoint.
                 'rows' => 99,
                 'duration_ms' => 1000,
             ])
@@ -127,7 +135,11 @@ class WorkerBatchStatsTest extends TestCase
 
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
         $this->assertSame(3, (int) ($this->job->stats['pages'] ?? 0));
-        $this->assertSame(99, (int) ($this->job->stats['rows'] ?? 0));
+        $this->assertArrayNotHasKey(
+            'rows',
+            $this->job->stats,
+            'legacy stats.rows must be stripped at the /complete merge so it cannot re-pollute the Jobs UI',
+        );
         $this->assertSame(1, (int) ($this->job->stats['rows_inserted'] ?? 0));
         $this->assertSame(1, (int) ($this->job->stats['batches'] ?? 0));
     }
@@ -139,7 +151,6 @@ class WorkerBatchStatsTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 7,
-                'rows' => 42,
                 'duration_ms' => 2500,
                 'aborted_due_to_time' => false,
                 'early_stopped_due_to_duplicates' => true,

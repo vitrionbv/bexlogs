@@ -58,7 +58,6 @@ export async function completeJob(
     jobId: number,
     stats: {
         pages: number;
-        rows: number;
         duration_ms: number;
         aborted_due_to_time?: boolean;
         early_stopped_due_to_duplicates?: boolean;

@@ -136,7 +136,6 @@ const DEBUG_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
 
 export interface ScrapeResult {
     pages: number;
-    rows: number;
     duration_ms: number;
     aborted_due_to_time: boolean;
     early_stopped_due_to_duplicates: boolean;
@@ -152,6 +151,26 @@ export interface ScrapeResult {
      * fail or label a job because of this value.
      */
     token_echo_retries: number;
+}
+
+/**
+ * Local-only diagnostic: how many rows the scraper POSTed across all
+ * batches before the in-batch dedup step. Useful for the per-job
+ * "scrape complete" log line so operators can correlate scraper-side
+ * counts with the Laravel-side `rows_received` / `rows_inserted`
+ * accumulators. NOT serialized — the authoritative counters live on
+ * `scrape_jobs.stats` via the /batch endpoint (post in-batch dedup +
+ * post Postgres unique-index dedup), which is what the Jobs UI shows.
+ *
+ * Historically this value was also sent up as `stats.rows` on the
+ * /complete payload (and rendered in the UI as "Rows"), but it was
+ * empirically `pages_processed × BATCH_SIZE` and gave operators
+ * suspiciously round numbers (e.g. 6 pages × 25 = 150) instead of
+ * actual row counts. Removed from the payload; UI now shows
+ * `rows_received` / `rows_inserted` directly.
+ */
+interface ScrapeRunDiagnostics {
+    flushedRows: number;
 }
 
 /**
@@ -316,7 +335,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     jobId: job.id,
                     budgetMs,
                     pages: pageCount,
-                    rows: rowCount,
+                    flushedRows: rowCount,
                 });
                 abortedDueToTime = true;
                 stopReason = 'time_limit';
@@ -734,7 +753,6 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
 
         const stats: ScrapeResult = {
             pages: pageCount,
-            rows: rowCount,
             duration_ms: Date.now() - startedAt,
             aborted_due_to_time: abortedDueToTime,
             early_stopped_due_to_duplicates: earlyStoppedDueToDuplicates,
@@ -748,7 +766,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         // `running` rows — but it keeps the contract clean).
         heartbeatTicker.stop();
         await completeJob(job.id, stats);
-        log.info('scrape complete', { jobId: job.id, ...stats });
+        const diagnostics: ScrapeRunDiagnostics = { flushedRows: rowCount };
+        log.info('scrape complete', { jobId: job.id, ...stats, ...diagnostics });
         return stats;
     } catch (err) {
         // Same logic as the success path: stop the ticker before reporting

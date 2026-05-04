@@ -119,6 +119,12 @@ class WorkerBatchDedupTest extends TestCase
         $this->assertSame(8, (int) ($this->job->stats['rows_received'] ?? -1));
         $this->assertSame(8, (int) ($this->job->stats['rows_inserted'] ?? -1));
         $this->assertSame(0, (int) ($this->job->stats['total_duplicates'] ?? -1));
+        $this->assertArrayNotHasKey(
+            'rows',
+            $this->job->stats,
+            'the /batch endpoint must not write the legacy stats.rows counter; '
+                .'rows_received and rows_inserted are the contract',
+        );
         $this->assertSame(8, $this->countLogRowsForJob());
     }
 

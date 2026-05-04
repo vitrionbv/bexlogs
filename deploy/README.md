@@ -436,16 +436,19 @@ explaining why the worker stopped paginating. Two-tier semantics:
 | Badge | Status | What it means | Action |
 |---|---|---|---|
 | **Caught up** | completed (green) | Pagination reached already-scraped rows. The healthy "we're done" signal — every scrape on a steady-state subscription should land here. | None. |
+| **Caught up (live tip)** | completed (green) | Caught up to BookingExperts' live log tip — either the token-echo retry helper exhausted its budget (visible as `token_echo_retries: <TOKEN_ECHO_MAX_ATTEMPTS - 1>` in the Stats dialog, ≈297 s wall clock at defaults) or the eval-fallback path surfaced an echoed cursor on the very first `load_more` (fast path, `token_echo_retries: 0`, completes in seconds). Both indicate "no new events yet"; new events arrive on the next scheduled scrape. | None. |
 | **No activity** | completed (green) | Initial page returned zero rows and no `next_token`. The subscription had nothing to scrape in the requested window. | None. |
 | **Pagination limit** | completed (yellow) | Hit the `max_pages` cap before catching up to already-scraped data. | Raise `max_pages` on the subscription, or wait for the next scheduled run to catch up via `Caught up`. |
 | **Time limit** | completed (yellow) | Wall-clock budget exceeded. | Raise `max_duration_minutes` on the subscription, or split the time window. |
 | **Pagination error (422)** | failed (red) | BookingExperts returned 422 after 1 initial + 2 retried attempts. We're hitting them too hard. | Lower `MAX_CONCURRENT_SCRAPES` (see below). |
-| **Missing pagination token** | failed (red) | BookingExperts stopped returning a `next_token` mid-scrape. Should never happen. | Inspect scraper logs around the failed job. |
-| **Token echo** | failed (red) | BE handed back the same `next_token` we just sent. Pagination wedged. | Inspect scraper logs; may be a BE-side bug. |
+| **Missing pagination token** | failed (red) | BookingExperts stopped returning a `next_token` mid-scrape (`next_token` went null, distinct from "the same token came back"). Should never happen. | Inspect scraper logs around the failed job. |
+| **Token echo (legacy)** | completed/failed | Legacy badge for jobs that ran before the token-echo retry helper landed. Equivalent to **Caught up (live tip)**. | None. New runs no longer emit this; preserved for history. |
 | **Unparseable response** | failed (red) | BE response shape changed and our parsers couldn't recover. | Update `extractors.ts` / `parseLoadMoreResponse`. |
 | **Runaway safety** | failed (red) | Hit the cap on consecutive zero-row pages. BE handed out an apparently-infinite quiet window. | Inspect logs; usually a BE-side anomaly. |
 | **Session expired** | failed (red) | BE bounced us to `/users/sign_in` (or returned 401/403 on `load_more`) and the sign-in retry schedule (`SIGN_IN_RETRY_DELAYS_MS = [3s, 7s]`) didn't recover. Cookies look genuinely expired. | Re-authenticate via the browser extension. If you see this badge under N-way concurrent fan-out *and* the session validates fine on a single sequential check, the bounce is likely transient — see "Fixing frequent `Session expired` failures" below before re-linking. |
 | **Worker reaped** | failed (red) | Worker stopped heart-beating; the reaper failed the job. | Check `docker compose logs scraper` for crashes. |
+
+**`caught_up` is an umbrella reason** — it covers both the slow-path token-echo exhaustion and the fast-path eval-fallback echo on the very first `load_more`. Disambiguate via `token_echo_retries` in the Stats dialog: a run that completes in 6–9 s with `token_echo_retries: 0` is the fast path (BE returned an echoed cursor on attempt 1, no retries fired); a run that takes ~5 min with `token_echo_retries: 99` is the slow path (helper exhausted its budget). Both legitimately mean "no new events at the live tip" and don't require operator action. We deliberately keep them under one label rather than splitting into a separate `completed` reason because the operator-facing decision is the same in both cases (none).
 
 `Caught up` is the healthy completion badge. Everything other than
 **Caught up**, **No activity**, **Pagination limit**, or **Time limit**

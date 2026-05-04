@@ -27,7 +27,15 @@ type RecentJob = {
     created_at: string;
     completed_at: string | null;
     error: string | null;
-    rows: number | null;
+    // `rows_inserted` is the "useful work" number — rows that survived
+    // the Postgres unique index. `rows_received` is the pre-index count
+    // (post in-batch dedup) and is shown as a secondary number when the
+    // two diverge so the operator can spot duplicate-heavy runs at a
+    // glance. Both come straight from `scrape_jobs.stats` accumulated
+    // by WorkerController::batch — see App\Support\JobSummary for the
+    // server-side projection. The legacy `stats.rows` (round-numbered
+    // pages × BATCH_SIZE) is no longer read.
+    rows_inserted: number | null;
     rows_received: number | null;
 };
 
@@ -87,20 +95,29 @@ function compactSidebar(n: number): string {
     return String(n);
 }
 
-function runningRowsHint(job: RecentJob): string {
-    if (job.status !== 'running') {
+// Sidebar mini-row hint. We surface the inserted count as the primary
+// number ("useful work") and overlay a secondary `inserted/received`
+// ratio when the two diverge — that ratio means the scrape is walking
+// duplicate territory (overlap with a previous run), which is the
+// signal the operator usually wants out of the sidebar at a glance.
+// Used for both running AND completed jobs because the legacy `rows`
+// fallback was misleading (pages × BATCH_SIZE, not real row counts);
+// `rows_inserted` is the same field WorkerController accumulates per
+// /batch POST, so it's the same value whether the job is mid-flight or
+// already terminal.
+function rowsHint(job: RecentJob): string {
+    const ins = job.rows_inserted;
+    const rec = job.rows_received;
+
+    if (ins == null) {
         return '';
     }
 
-    if (job.rows != null && job.rows_received != null && job.rows_received > job.rows) {
-        return `${compactSidebar(job.rows)}/${compactSidebar(job.rows_received)}`;
+    if (rec != null && rec > ins) {
+        return `${compactSidebar(ins)}/${compactSidebar(rec)}`;
     }
 
-    if (job.rows != null) {
-        return compactSidebar(job.rows);
-    }
-
-    return '';
+    return compactSidebar(ins);
 }
 
 useUserChannel({
@@ -111,17 +128,14 @@ useUserChannel({
 
         if (typeof jobId === 'number' && rawStats && typeof rawStats === 'object' && summaryLocal.value) {
             const stats = rawStats as {
-                rows?: number;
                 rows_inserted?: number;
                 rows_received?: number;
             };
             const row = summaryLocal.value.recent.find((j) => j.id === jobId);
 
             if (row) {
-                if (status === 'running' && typeof stats.rows_inserted === 'number') {
-                    row.rows = stats.rows_inserted;
-                } else if (typeof stats.rows === 'number') {
-                    row.rows = stats.rows;
+                if (typeof stats.rows_inserted === 'number') {
+                    row.rows_inserted = stats.rows_inserted;
                 }
 
                 if (typeof stats.rows_received === 'number') {
@@ -246,7 +260,7 @@ return `${hr}h`;
                                 <span class="min-w-0 flex-1 truncate text-xs">{{ job.subscription_name }}</span>
                             </div>
                             <span class="text-muted-foreground shrink-0 text-[10px] tabular-nums text-right leading-tight">
-                                <span v-if="runningRowsHint(job)" class="block">{{ runningRowsHint(job) }}</span>
+                                <span v-if="rowsHint(job)" class="block">{{ rowsHint(job) }}</span>
                                 <span class="block">{{ relative(job.completed_at ?? job.created_at) }}</span>
                             </span>
                         </Link>

@@ -75,7 +75,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 5,
-                'rows' => 100,
                 'duration_ms' => 1500,
                 'aborted_due_to_time' => false,
                 'early_stopped_due_to_duplicates' => true,
@@ -88,6 +87,11 @@ class WorkerStopReasonTest extends TestCase
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
         $this->assertSame('duplicate_detection', $this->job->stats['stop_reason'] ?? null);
         $this->assertSame(5, (int) ($this->job->stats['pages'] ?? 0));
+        $this->assertArrayNotHasKey(
+            'rows',
+            $this->job->stats,
+            'legacy stats.rows must not be persisted (post-fix the Jobs UI reads rows_received/rows_inserted instead)',
+        );
     }
 
     public function test_complete_accepts_caught_up_stop_reason_and_token_echo_retries_counter(): void
@@ -102,7 +106,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 12,
-                'rows' => 240,
                 'duration_ms' => 90_000,
                 'aborted_due_to_time' => false,
                 'token_echo_retries' => 2,
@@ -127,7 +130,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 1,
-                'rows' => 0,
                 'duration_ms' => 100,
                 'stop_reason' => 'token_echo',
             ])
@@ -148,7 +150,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 1,
-                'rows' => 0,
                 'duration_ms' => 100,
                 'stop_reason' => 'natural_end',
             ])
@@ -176,7 +177,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 4,
-                'rows' => 20,
                 'duration_ms' => 800,
                 'stop_reason' => 'pagination_limit',
             ])
@@ -198,7 +198,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 1,
-                'rows' => 0,
                 'duration_ms' => 100,
                 'stop_reason' => 'definitely-not-a-real-reason',
             ])
@@ -217,7 +216,6 @@ class WorkerStopReasonTest extends TestCase
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 2,
-                'rows' => 7,
                 'duration_ms' => 200,
             ])
             ->assertNoContent();
@@ -225,6 +223,37 @@ class WorkerStopReasonTest extends TestCase
         $this->job->refresh();
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
         $this->assertArrayNotHasKey('stop_reason', $this->job->stats ?? []);
+    }
+
+    public function test_complete_drops_legacy_rows_field_at_merge_for_rolling_deploy_workers(): void
+    {
+        // Rolling-deploy guard: an older scraper image still in flight
+        // when the new server-side merge lands may keep sending the
+        // legacy `rows` field. We accept it through the validator (so
+        // the request doesn't 422 and the worker doesn't crash) but
+        // strip it before persisting so it can't re-pollute the Jobs
+        // UI's row counters. New workers in the same deploy cycle no
+        // longer send it.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 6,
+                'rows' => 150,
+                'duration_ms' => 8_000,
+                'stop_reason' => 'caught_up',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $stats = $this->job->stats ?? [];
+
+        $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
+        $this->assertSame('caught_up', $stats['stop_reason'] ?? null);
+        $this->assertSame(6, (int) ($stats['pages'] ?? 0));
+        $this->assertArrayNotHasKey(
+            'rows',
+            $stats,
+            'legacy stats.rows must not be persisted post-fix even if a rolling-deploy worker sends it',
+        );
     }
 
     public function test_fail_with_session_expired_sentinel_records_stop_reason(): void

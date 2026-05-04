@@ -42,6 +42,15 @@ class JobSummary
     /**
      * Most recent jobs for the sidebar mini-list.
      *
+     * The sidebar surfaces `rows_inserted` (genuinely-new rows that
+     * survived the (page_id, content_hash) unique index) as the
+     * primary "useful work" count, with `rows_received` (post in-batch
+     * dedup, pre Postgres dedup) tagging along so SidebarJobs.vue can
+     * render an `inserted/received` ratio when the two diverge during
+     * a duplicate-heavy run. The legacy `stats.rows` (pre-`35f3948`,
+     * empirically `pages_processed × BATCH_SIZE`) is no longer read —
+     * see SidebarJobs.vue for the rendering side.
+     *
      * @return array<int, array{
      *   id:int,
      *   subscription_name:string,
@@ -50,7 +59,7 @@ class JobSummary
      *   created_at:string,
      *   completed_at:?string,
      *   error:?string,
-     *   rows:?int,
+     *   rows_inserted:?int,
      *   rows_received:?int,
      * }>
      */
@@ -72,30 +81,15 @@ class JobSummary
                     'created_at' => $j->created_at?->toIso8601String() ?? '',
                     'completed_at' => $j->completed_at?->toIso8601String(),
                     'error' => $j->error,
-                    'rows' => self::sidebarRowCount($j),
+                    'rows_inserted' => isset($st['rows_inserted'])
+                        ? (int) $st['rows_inserted']
+                        : null,
                     'rows_received' => isset($st['rows_received'])
                         ? (int) $st['rows_received']
                         : null,
                 ];
             })
             ->all();
-    }
-
-    /**
-     * Prefer live `rows_inserted` while running; else final `rows` from completion.
-     */
-    private static function sidebarRowCount(ScrapeJob $j): ?int
-    {
-        $stats = $j->stats;
-        if ($stats === null) {
-            return null;
-        }
-
-        if ($j->status === ScrapeJob::STATUS_RUNNING && isset($stats['rows_inserted'])) {
-            return (int) $stats['rows_inserted'];
-        }
-
-        return isset($stats['rows']) ? (int) $stats['rows'] : null;
     }
 
     private static function baseQuery(User $user): Builder

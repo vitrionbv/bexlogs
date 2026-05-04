@@ -62,6 +62,16 @@ type StopReason =
     | 'worker_reaped';
 
 type ScrapeJobStats = {
+    /**
+     * Legacy counter — empirically `pages_processed × BATCH_SIZE`, not a
+     * real row count. Pre-`35f3948` the Jobs UI rendered this as "Rows"
+     * which gave operators suspiciously round numbers (150, 100, 125 =
+     * 6/4/5 pages × 25). We no longer write this on new completions
+     * (see WorkerController::complete) and the UI no longer reads it
+     * — the field is kept in the type only so old rows that already
+     * carry it don't trip TypeScript's index-access strict check when
+     * the JSON dump dialog renders the raw `stats` blob.
+     */
     rows?: number;
     rows_received?: number;
     rows_inserted?: number;
@@ -217,7 +227,7 @@ const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
     caught_up: {
         label: 'Caught up (live tip)',
         variant: 'secondary',
-        description: 'BookingExperts handed back the same next_token after our retry budget — we are at the live tip of the log stream (AWS CloudWatch Logs convention). New events arrive on the next scheduled scrape.',
+        description: 'Pagination caught up to the BookingExperts live log tip — either the token-echo retry helper exhausted its budget (see token_echo_retries in the stats dialog), or the eval-fallback path surfaced an echoed cursor on the very first load_more (fast path, retries=0). Both indicate "no new events yet"; new events arrive on the next scheduled scrape.',
     },
     empty_window: {
         label: 'No activity',
@@ -555,34 +565,36 @@ function formatLogWindowDuration(ms: number): string {
     return parts.join(' ');
 }
 
-function displayRows(job: Job): string {
+type RowCounts = {
+    received: number | null;
+    inserted: number | null;
+    duplicates: number;
+};
+
+// Pull the authoritative `rows_received` / `rows_inserted` /
+// `total_duplicates` triplet off `scrape_jobs.stats`. Both the table
+// cell and the detail dialog use this — the table renders the
+// two-line received/inserted stack, the dialog renders an explicit
+// three-field block above the raw JSON dump. Returns nullable
+// inserted / received because in-flight jobs that haven't shipped a
+// /batch POST yet have no stats. Duplicates fall back to 0 (the
+// canonical value when there's nothing to dedup) rather than null
+// because rendering "Duplicates: —" alongside concrete numbers reads
+// as a bug; "Duplicates: 0" reads as the truth.
+function jobRowCounts(job: Job): RowCounts {
     const s = job.stats;
 
     if (!s || typeof s !== 'object') {
-        return '—';
+        return { received: null, inserted: null, duplicates: 0 };
     }
 
-    const ins = typeof s.rows_inserted === 'number' ? s.rows_inserted : undefined;
-    const rec = typeof s.rows_received === 'number' ? s.rows_received : undefined;
-    const finalRows = typeof s.rows === 'number' ? s.rows : undefined;
+    const ins = typeof s.rows_inserted === 'number' ? s.rows_inserted : null;
+    const rec = typeof s.rows_received === 'number' ? s.rows_received : null;
+    const dup = typeof s.total_duplicates === 'number'
+        ? s.total_duplicates
+        : (rec !== null && ins !== null ? Math.max(0, rec - ins) : 0);
 
-    if (job.status === 'running' && ins !== undefined) {
-        if (rec !== undefined && rec !== ins) {
-            return `${compactCount(ins)} / ${compactCount(rec)}`;
-        }
-
-        return compactCount(ins);
-    }
-
-    if (finalRows !== undefined) {
-        return compactCount(finalRows);
-    }
-
-    if (ins !== undefined) {
-        return compactCount(ins);
-    }
-
-    return '—';
+    return { received: rec, inserted: ins, duplicates: dup };
 }
 
 const filterChips = computed(() =>
@@ -623,8 +635,9 @@ const Field = defineComponent({
                         Background work driven by the Playwright worker. Updates live over WebSocket.
                     </p>
                     <p class="text-muted-foreground text-xs max-w-xl">
-                        Rows are written on each <code class="text-xs">POST …/batch</code> (not only when the job completes); running jobs show
-                        inserted vs received when they differ (duplicates overlap).
+                        The Rows column shows <strong>received</strong> (rows the scraper POSTed after in-batch dedup) and
+                        <strong>inserted</strong> (rows that survived the Postgres unique index). Running jobs update on each
+                        <code class="text-xs">POST …/batch</code>.
                     </p>
                 </div>
                 <div class="flex flex-wrap items-center gap-2">
@@ -761,7 +774,18 @@ const Field = defineComponent({
                                 </TableCell>
                                 <TableCell class="text-muted-foreground tabular-nums text-xs">{{ duration(job) }}</TableCell>
                                 <TableCell class="tabular-nums">
-                                    {{ displayRows(job) }}
+                                    <template v-if="jobRowCounts(job).received !== null || jobRowCounts(job).inserted !== null">
+                                        <div
+                                            class="font-mono text-xs leading-tight"
+                                            :title="`${jobRowCounts(job).received ?? 0} received · ${jobRowCounts(job).inserted ?? 0} inserted (${jobRowCounts(job).duplicates} duplicates)`"
+                                        >
+                                            <div>{{ compactCount(jobRowCounts(job).received ?? 0) }} <span class="text-muted-foreground">received</span></div>
+                                            <div class="text-muted-foreground">{{ compactCount(jobRowCounts(job).inserted ?? 0) }} inserted</div>
+                                        </div>
+                                    </template>
+                                    <template v-else>
+                                        <span class="text-muted-foreground">—</span>
+                                    </template>
                                 </TableCell>
                                 <TableCell class="text-right" @click.stop>
                                     <div class="flex justify-end gap-1">
@@ -919,7 +943,31 @@ const Field = defineComponent({
                         </div>
                         <pre class="bg-muted max-h-60 overflow-auto rounded p-2 text-xs whitespace-pre-wrap break-all font-mono">{{ JSON.stringify(focused.params, null, 2) }}</pre>
                     </Field>
-                    <Field v-if="focused.stats" label="Stats">
+                    <Field v-if="focused.stats" label="Rows">
+                        <div
+                            class="bg-muted/60 mb-2 grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 rounded p-2 font-mono text-xs"
+                            :title="focused.status === 'running'
+                                ? 'Live counters from /api/worker/jobs/:id/batch — update on each POST.'
+                                : 'Final counters at job completion.'"
+                        >
+                            <span class="text-muted-foreground">Retrieved</span>
+                            <span class="tabular-nums">
+                                {{ jobRowCounts(focused).received ?? 0 }}
+                                <span
+                                    v-if="focused.status === 'running'"
+                                    class="text-muted-foreground ml-2 not-italic"
+                                >(live)</span>
+                            </span>
+                            <span class="text-muted-foreground">Inserted</span>
+                            <span class="tabular-nums">{{ jobRowCounts(focused).inserted ?? 0 }}</span>
+                            <span class="text-muted-foreground">Duplicates</span>
+                            <span class="tabular-nums">{{ jobRowCounts(focused).duplicates }}</span>
+                        </div>
+                        <small class="text-muted-foreground block mb-2 text-[11px]">
+                            Retrieved = rows POSTed to <code class="text-[11px]">…/batch</code> after in-batch dedup.
+                            Inserted = rows that survived the <code class="text-[11px]">(page_id, content_hash)</code> unique index.
+                            Duplicates = retrieved − inserted (rows the index rejected as already-scraped).
+                        </small>
                         <pre class="bg-muted max-h-60 overflow-auto rounded p-2 text-xs whitespace-pre-wrap break-all font-mono">{{ JSON.stringify(focused.stats, null, 2) }}</pre>
                     </Field>
                 </div>

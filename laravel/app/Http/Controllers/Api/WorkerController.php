@@ -327,6 +327,16 @@ class WorkerController extends Controller
     {
         $stats = $request->validate([
             'pages' => 'nullable|integer',
+            // Legacy field — pre-fix the worker sent this as
+            // `pages_processed × BATCH_SIZE`, which gave the Jobs UI
+            // suspiciously round "rows" counts (150, 100, 125 = 6/4/5
+            // pages × 25) instead of real row counts. Current workers
+            // no longer send it; the validator still accepts it for
+            // backward compat with an in-flight rolling deploy, but
+            // the merge below drops it before persisting so it can't
+            // re-appear in `stats` and re-pollute the Jobs UI.
+            // `rows_received` / `rows_inserted` from the /batch endpoint
+            // are the contract.
             'rows' => 'nullable|integer',
             'duration_ms' => 'nullable|integer',
             'aborted_due_to_time' => 'nullable|boolean',
@@ -346,7 +356,14 @@ class WorkerController extends Controller
         // `batches`, `last_batch_at`, `pages_processed`) with nulls when
         // the worker omits a field. Any explicit value — including
         // `stop_reason` — overlays cleanly via array_merge.
+        //
+        // `rows` is explicitly dropped here so a rolling-deploy worker
+        // still sending the legacy field can't re-pollute `stats.rows`
+        // on new completions. Old completed rows that already carry the
+        // field stay untouched (we don't backfill-delete) — the Jobs UI
+        // simply stops surfacing it.
         $incoming = array_filter($stats, fn ($v) => $v !== null);
+        unset($incoming['rows']);
         $current = $job->fresh();
         $mergedStats = array_merge($current->stats ?? [], $incoming);
 
