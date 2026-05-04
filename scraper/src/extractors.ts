@@ -276,14 +276,16 @@ export function extractRowsFromMain(): InitialPageResult {
  *   - `null` — couldn't recognize the response shape at all. The caller may
  *     fall back to in-page JS eval / regex strategies.
  *
- * `previousToken` is the token that was sent in the request that produced
- * this response. If the parsed `next_token` equals it, we return `null` to
- * defensively break the pagination loop ("token never advances").
+ * `nextToken` is whatever the response surfaced — including a value that
+ * matches the request's `next_token`. The pagination layer in `scrape.ts`
+ * is the single authority for echo detection (see the "pagination appears
+ * stuck" check). Pre-emptively nulling echoes here would collapse two
+ * distinct outcomes ("server echoed our token" vs "server returned no
+ * token at all") into the same `nextToken === null` signal, which is
+ * exactly how `token_echo` failures used to leak into the `token_missing`
+ * bucket.
  */
-export function parseLoadMoreResponse(
-    jsBody: string,
-    previousToken: string | null,
-): LoadMoreResult {
+export function parseLoadMoreResponse(jsBody: string): LoadMoreResult {
     const result: LoadMoreResult = { rowsHtml: null, nextToken: null, raw: jsBody };
 
     const ROWS_TARGET_RE = /log[-_]?event|logs|events/i;
@@ -411,12 +413,7 @@ export function parseLoadMoreResponse(
         } catch {
             // Keep raw value.
         }
-        if (previousToken !== null && decoded === previousToken) {
-            // Token did not advance — defensively break the loop.
-            result.nextToken = null;
-        } else {
-            result.nextToken = decoded;
-        }
+        result.nextToken = decoded;
     }
 
     // Recognized response shape (Turbo Stream or jQuery $().append/.html) but

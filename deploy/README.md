@@ -570,6 +570,60 @@ docker compose -f /opt/bexlogs/docker-compose.production.yml \
 # now redeploy as normal; /tmp survives
 ```
 
+#### If you see repeated `Missing pagination token` failures
+
+`token_missing` means the scraper exited the pagination loop with no
+forward-moving `next_token` and the page count was still under
+`max_pages` — i.e. the scraper had budget left to keep going but
+BookingExperts stopped giving us a cursor. Historically the most
+common (mis)trigger was the parser pre-emptively nulling out *echoed*
+tokens (server returned the same `next_token` we just sent), which
+should classify as `token_echo` instead. After that bug was fixed,
+genuine `token_missing` should be rare — investigate every occurrence.
+
+To triage, pull the artifacts and look at the body:
+
+```bash
+ssh root@<server>
+
+# List recent token_missing dumps (most recent first)
+docker compose -f /opt/bexlogs/docker-compose.production.yml \
+    --env-file /opt/bexlogs/laravel/.env \
+    exec -T scraper sh -c 'ls -1t /app/debug | grep ^token_missing | head -10'
+
+# Pull them down to /tmp/bexlogs-token-missing-$(date +%F)/
+LOCAL=/tmp/bexlogs-token-missing-$(date +%F)
+docker compose -f /opt/bexlogs/docker-compose.production.yml \
+    --env-file /opt/bexlogs/laravel/.env \
+    cp scraper:/app/debug "$LOCAL"
+ls -1 "$LOCAL"/token_missing-*.html | head
+```
+
+For each `.html` body, classify against these buckets:
+
+| pattern in body                                                                    | what's happening                                                                                                                                                                                  | next step                                                                                                                                                                  |
+|------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `$('#log-events').append("")` + load-more form whose `next_token=` URL-decodes to **the same value** as the sidecar's `previousToken` | BE wedged on the cursor (likely end of retention window). Should be classified as `token_echo`, not `token_missing`. | If you see this again post-fix it means the parser's echo-detection regressed. Check `parseLoadMoreResponse` in `extractors.ts` — it must return the echoed token, NOT `null`. The pagination loop then trips the `token_echo` branch in `scrape.ts`. |
+| `$('#log-events').append("")` + load-more form whose `next_token=` is **absent or empty** | Genuine end-of-stream with no further cursor; this is what `token_missing` was meant to surface. | Confirm `previousToken` was real and not malformed; if the subscription has been rotating cursors fine for hours and only the last page came up empty, this is a true upstream "no more data" without a cursor — surface to the BE team if it persists. |
+| Body contains `<form action="/users/sign_in"` or `<title>Sign in</title>`        | Cookie expired but the response status was 200 (so the existing 401/403 detection didn't trigger).                                                                                                | Expand the `session_expired` detector in `scrape.ts` to also check the body for sign-in markers on 200 responses.                                                          |
+| Body is a full HTML page with a BE error template / `<title>.*Error.*</title>`     | Upstream BE outage / 5xx rendered as 200.                                                                                                                                                         | Consider adding an `upstream_error` reason; do not extend the parser.                                                                                                      |
+| Body is empty / whitespace only                                                    | Some BE edge case where 200 OK has no body.                                                                                                                                                       | Map to `pagination_error` (existing hard-error bucket) or introduce `empty_response`. Decide based on whether retrying once or twice is worth it.                          |
+
+To compare the echoed token against `previousToken` quickly:
+
+```bash
+cd "$LOCAL"
+for f in token_missing-*.json; do
+    echo "=== $f ==="
+    rg -o 'next_token=[^"\\&]+' "${f%.json}.html" | head -1
+    rg -o '"previousToken":\s*"[^"]+"' "$f" | head -1
+    echo
+done
+```
+
+If `next_token=` URL-decodes to the same value as `previousToken`,
+that's the echo case (should be `token_echo`).
+
 ### Get a shell inside a service
 
 ```bash

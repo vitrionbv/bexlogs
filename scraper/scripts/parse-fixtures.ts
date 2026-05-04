@@ -1,6 +1,7 @@
 // Imperative test fixtures for parseLoadMoreResponse. Proves the parser
 // behaves correctly for both legacy jQuery and Turbo Stream response shapes,
-// and that it defensively rejects a token that didn't advance.
+// and that it surfaces echoed `next_token` values to the caller (which is
+// the single authority on echo detection — see scrape.ts).
 //
 // Run with:  npx tsx scripts/parse-fixtures.ts
 //
@@ -27,7 +28,7 @@ const legacyBody =
     `<td>order.created (Details)</td><td>POST</td></tr>");` +
     `$('#load-more-button').html("<form action=\\"/foo/load_more_logs.js?next_token=ABC\\">Load more</form>");`;
 {
-    const result = parseLoadMoreResponse(legacyBody, null);
+    const result = parseLoadMoreResponse(legacyBody);
     check('rowsHtml is non-null', result.rowsHtml !== null);
     check(
         'rowsHtml contains table__row',
@@ -49,7 +50,7 @@ const turboBody =
     `<template><a href="/foo?next_token=XYZ">Load more</a></template>` +
     `</turbo-stream>`;
 {
-    const result = parseLoadMoreResponse(turboBody, null);
+    const result = parseLoadMoreResponse(turboBody);
     check('rowsHtml is non-null', result.rowsHtml !== null);
     check(
         'rowsHtml contains table__row',
@@ -59,8 +60,14 @@ const turboBody =
     check('nextToken === "XYZ"', result.nextToken === 'XYZ', { nextToken: result.nextToken });
 }
 
-// ---- Fixture C: Turbo Stream with token == previousToken -------------------
-console.log('\nFixture C: Turbo Stream where token did not advance');
+// ---- Fixture C: Turbo Stream where token equals what was sent ------------
+// The parser is a pure response-shape decoder — it surfaces whatever
+// next_token the body advertised, including a value identical to the
+// token that produced this response. The pagination layer in scrape.ts
+// is the single authority on echo detection: it compares parsed.nextToken
+// to sentToken and trips `stop_reason = 'token_echo'`. Pre-emptively
+// nulling here used to leak echoes into the `token_missing` bucket.
+console.log('\nFixture C: parser passes echoed token through unchanged');
 const turboSameTokenBody =
     `<turbo-stream action="append" target="log-events">` +
     `<template><tr class="table__row"><td>x</td></tr></template>` +
@@ -69,10 +76,10 @@ const turboSameTokenBody =
     `<template><a href="/foo?next_token=ABC">Load more</a></template>` +
     `</turbo-stream>`;
 {
-    const result = parseLoadMoreResponse(turboSameTokenBody, 'ABC');
+    const result = parseLoadMoreResponse(turboSameTokenBody);
     check(
-        'nextToken === null (rejected because token did not advance)',
-        result.nextToken === null,
+        'nextToken === "ABC" (passes through; caller detects echo)',
+        result.nextToken === 'ABC',
         { nextToken: result.nextToken },
     );
 }
@@ -106,7 +113,7 @@ const realBody =
     `action=\\"/o/0/a/0/s/0/load_more_logs.js?next_token=PLACEHOLDER%2Fs\\" ` +
     `method=\\"get\\"><button>Laad meer...<\\/button><\\/form>");`;
 {
-    const result = parseLoadMoreResponse(realBody, null);
+    const result = parseLoadMoreResponse(realBody);
     check('rowsHtml is non-null', result.rowsHtml !== null);
     check(
         'rowsHtml contains table__row',
@@ -160,7 +167,7 @@ const quietWindowBody =
     `action=\\"/o/0/a/0/s/0/load_more_logs.js?next_token=QUIET%2Fnext\\" ` +
     `method=\\"get\\"><button>Laad meer...<\\/button><\\/form>");`;
 {
-    const result = parseLoadMoreResponse(quietWindowBody, 'OLDTOKEN');
+    const result = parseLoadMoreResponse(quietWindowBody);
     check(
         'rowsHtml === "" (recognized shape, zero rows)',
         result.rowsHtml === '',
@@ -169,11 +176,6 @@ const quietWindowBody =
     check(
         'nextToken decoded from load-more-button HTML',
         result.nextToken === 'QUIET/next',
-        { nextToken: result.nextToken },
-    );
-    check(
-        'nextToken advanced past previousToken',
-        result.nextToken !== null && result.nextToken !== 'OLDTOKEN',
         { nextToken: result.nextToken },
     );
 }
@@ -191,7 +193,7 @@ const endOfStreamBody =
     `$('#log-events').append("");\n` +
     `$('#load-more-button').html("");`;
 {
-    const result = parseLoadMoreResponse(endOfStreamBody, 'OLDTOKEN');
+    const result = parseLoadMoreResponse(endOfStreamBody);
     check(
         'rowsHtml === "" (recognized shape, zero rows)',
         result.rowsHtml === '',
@@ -212,7 +214,7 @@ const endOfStreamBody =
 console.log('\nFixture G: unrecognized response shape');
 const garbageBody = `if (window.alertBox) {\n}\n\n// nothing useful here`;
 {
-    const result = parseLoadMoreResponse(garbageBody, null);
+    const result = parseLoadMoreResponse(garbageBody);
     check(
         'rowsHtml === null (unrecognized shape)',
         result.rowsHtml === null,
@@ -222,6 +224,56 @@ const garbageBody = `if (window.alertBox) {\n}\n\n// nothing useful here`;
         'nextToken === null',
         result.nextToken === null,
         { nextToken: result.nextToken },
+    );
+}
+
+// ---- Fixture H: real production token-echo body (redacted) ---------------
+// Captured from /app/debug/token_missing-*.html on 2026-05-04 across nine
+// failed jobs (99-108) hitting different subscriptions at high page
+// numbers (323-387). Identical 769-byte shape every time:
+//
+//   - `$('#log-events').append("")` — no rows for this slice (recognized
+//     quiet-window shape, so rowsHtml === '').
+//   - `$('#load-more-button').html("…?next_token=<SAME>…")` — the load-more
+//     form is updated, but its `next_token` URL-decodes to the *same value*
+//     that produced this response. BookingExperts is wedged on the token
+//     (likely "no events left in retention; here's the same cursor").
+//
+// What the parser must do: surface the echoed token unchanged. Pre-empting
+// this to null is exactly the bug that caused 9 production jobs to fail
+// with `token_missing` instead of the correct `token_echo` classification.
+// Subscription IDs, organization IDs, and tokens below are placeholders.
+console.log('\nFixture H: production token-echo body (recognized shape, echoed token)');
+const ECHOED = 'b/12345678901234567890123456789012345678901234567890123456000/s';
+const echoedBody =
+    `if (window.alertBox) {\n}\n\n` +
+    `$('#log-events').append("");\n` +
+    `$('#load-more-button').html("<form data-remote=\\"true\\" ` +
+    `action=\\"/organizations/0/apps/developer/applications/0/application_subscriptions/0/load_more_logs.js?next_token=` +
+    encodeURIComponent(ECHOED).replace(/'/g, "\\'") +
+    `\\" accept-charset=\\"UTF-8\\" method=\\"get\\">` +
+    `<button type=\\"submit\\" class=\\"button button--neutral button--normal\\">` +
+    `<div class=\\"button__content\\">Laad meer...<\\/div><\\/button><\\/form>");`;
+{
+    const result = parseLoadMoreResponse(echoedBody);
+    check(
+        'rowsHtml === "" (recognized quiet-window shape, zero rows)',
+        result.rowsHtml === '',
+        { rowsHtml: result.rowsHtml },
+    );
+    check(
+        'nextToken passes through unchanged (echo detection lives in scrape.ts)',
+        result.nextToken === ECHOED,
+        { nextToken: result.nextToken, expected: ECHOED },
+    );
+    // Belt-and-suspenders: simulate what scrape.ts does at line 427 to
+    // confirm the echo would be detected end-to-end.
+    const sentToken = ECHOED;
+    const wouldFireTokenEcho = result.nextToken !== null && result.nextToken === sentToken;
+    check(
+        'caller-side token_echo check fires for this body',
+        wouldFireTokenEcho,
+        { nextToken: result.nextToken, sentToken },
     );
 }
 

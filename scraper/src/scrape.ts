@@ -245,7 +245,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             lastBodyPage = pageCount + 1;
             lastUrl = url;
             lastSentToken = sentToken;
-            const parsed = parseLoadMoreResponse(body, sentToken);
+            const parsed = parseLoadMoreResponse(body);
             let rows: RawRow[] = [];
             let parsedViaEval = false;
 
@@ -292,10 +292,14 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                         parsedViaEval = true;
                         const live = await page.evaluate(extractRowsFromMain);
                         rows = live.rows.slice(beforeCount);
-                        nextToken =
-                            live.nextToken && live.nextToken !== sentToken
-                                ? live.nextToken
-                                : null;
+                        // Pass the live page's next_token through unchanged —
+                        // the post-flush `token_echo` check at the bottom of
+                        // this loop is the single authority on echo detection.
+                        // Pre-emptively nulling an echoed live token here used
+                        // to misclassify it as `token_missing` once the loop
+                        // exited (same bug as the parser-side null-out we
+                        // removed in the recognized-shape path).
+                        nextToken = live.nextToken ?? null;
                         log.info('load_more batch via in-page eval', {
                             jobId: job.id,
                             page: pageCount + 1,
@@ -424,10 +428,15 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             // Belt-and-suspenders: if the new token equals the one we
             // just sent, the server is echoing it back. Treat as a hard
             // failure so the operator notices BE pagination has wedged.
+            // This is the single authority on echo detection — both
+            // parseLoadMoreResponse and the eval fallback above pass the
+            // raw next_token through unchanged so this check sees it.
             if (nextToken !== null && nextToken === sentToken) {
                 log.error('pagination appears stuck (next_token did not advance) — failing', {
                     jobId: job.id,
                     page: pageCount,
+                    pageReceived,
+                    tokenPrefix: sentToken.slice(0, 12),
                 });
                 stopReason = 'token_echo';
                 await dumpDebugArtifact(job.id, pageCount, body, 'token_echo', {
