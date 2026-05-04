@@ -71,32 +71,55 @@ const LOAD_MORE_422_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
 const SIGN_IN_RETRY_DELAYS_MS: readonly number[] = [3000, 7000];
 
 /**
- * Backoff schedule (ms between attempts) for the "BookingExperts echoed
- * the next_token back at us" path. The historical interpretation was a
- * hard failure (`stop_reason: token_echo` → throw), but the AWS
- * CloudWatch Logs `GetLogEvents` mental model fits the observed
- * behaviour better: `nextForwardToken === inputToken` means "you're at
- * the live tip of the stream — keep polling with the same token; new
- * events + a fresh token will appear once data arrives." BE's logs
- * page mirrors this because log events are continuously appended.
+ * Defensive floor for the token-echo retry delay (ms). Even if an
+ * operator drops `TOKEN_ECHO_RETRY_DELAY_MS` to 0 or 1ms by accident,
+ * the helper waits at least this long between attempts — hammering BE
+ * with zero-delay retries defeats the point of the helper and would
+ * either trip rate-limiting or load the upstream needlessly during a
+ * quiet-tip window. Production default is 3000ms; the floor only
+ * matters for misconfigured / test setups.
  *
- * Policy: retry up to twice with progressive waits to give BE a chance
- * to either flush the pending batch or append new events. If all three
- * attempts (1 initial + 2 retries) still echo, we accept that the
- * subscription has truly caught up to the live tip and complete the
- * job with `stop_reason: caught_up` — equivalent in spirit to
- * `duplicate_detection` ("we have all the data currently available").
- *
- * Total wall-clock cost on full exhaustion: ~17s of sleep plus the
- * three HTTP round-trips. This is a per-job budget cost that only
- * fires at the tail of a scrape (it takes a real echo to trigger), so
- * the overall throughput impact is negligible. The per-job
- * `budgetMs` check is honored: if a sleep would take us past the time
- * budget we bail to the existing `time_limit` exit instead. The
- * dedicated heartbeat ticker (see `heartbeat.ts`) keeps `last_heartbeat_at`
- * fresh during the sleep so the reaper doesn't false-fail us.
+ * Exported so the offline test harness can opt out of the floor (via
+ * `minDelayMs: 0`) for fast wall-clock-bounded scenarios. Production
+ * callers don't pass `minDelayMs` and inherit this default.
  */
-const TOKEN_ECHO_RETRY_DELAYS_MS: readonly number[] = [5000, 12000];
+export const TOKEN_ECHO_MIN_DELAY_MS = 500;
+
+/**
+ * Token-echo retry policy. When BookingExperts returns the same
+ * `next_token` we just sent (the AWS CloudWatch Logs `nextForwardToken
+ * === inputToken` "you're at the live tip" signal), we re-poll on a
+ * flat schedule (no ramp) up to a configurable cap. Defaults — both
+ * env-driven, see `scraper/src/config.ts`:
+ *
+ *   - `TOKEN_ECHO_MAX_ATTEMPTS = 100` (1 initial + 99 retries)
+ *   - `TOKEN_ECHO_RETRY_DELAY_MS = 3000`
+ *
+ * Wall-clock cost on full exhaustion at the defaults: 99 × 3s ≈ 5 min
+ * of sleep + 100 RTTs. Comfortably inside the 45-min per-subscription
+ * job budget, so the budget-bail (`time_limit`) only fires when the
+ * scrape actually spent its budget elsewhere. Heartbeat liveness is
+ * preserved across the sleeps because the dedicated ticker (see
+ * `heartbeat.ts`) runs on its own interval.
+ *
+ * Outcomes from `loadMoreWithTokenEchoRetry`:
+ *   - any retry advances the token → `advanced` (continue scraping)
+ *   - max attempts exhausted with no advance → `exhausted`, caller
+ *     stops with `stop_reason: caught_up` (the AWS-style "we're at
+ *     the live tip" completion).
+ *   - per-job `budgetMs` would be exceeded by the next sleep →
+ *     `budget_aborted`, caller stops with the existing `time_limit`
+ *     exit. Budget is checked BEFORE each sleep so we never oversleep
+ *     past the boundary.
+ *
+ * History: the previous policy was 1 initial + 2 retries with
+ * `[5000, 12000]ms` backoffs (hard-fail-into-`caught_up` on
+ * exhaustion). Operators chose to lift the cap dramatically because
+ * the retry budget is dwarfed by the per-job time budget anyway —
+ * "keep pushing the button" is cheap and gives BE many more chances
+ * to flush a pending batch before we declare the subscription caught
+ * up.
+ */
 
 const DEBUG_DUMP_DIR = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -182,8 +205,8 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     // Counts every wasted echo attempt across the scrape (across all
     // pages). We compute as `attempts - 1` per retry-helper invocation
     // so a clean run (no echoes) records zero and an exhausted tail
-    // contributes `TOKEN_ECHO_RETRY_DELAYS_MS.length` (currently 2).
-    // Surfaced via `stats.token_echo_retries` for diagnostic use only.
+    // contributes `TOKEN_ECHO_MAX_ATTEMPTS - 1` (default 99). Surfaced
+    // via `stats.token_echo_retries` for diagnostic use only.
     let tokenEchoRetries = 0;
     const earlyStopPages =
         job.params.early_stop_duplicate_pages ?? config.EARLY_STOP_DUPLICATE_PAGES;
@@ -381,10 +404,15 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 {
                     jobId: job.id,
                     page: pageCount + 1,
+                    maxAttempts: config.TOKEN_ECHO_MAX_ATTEMPTS,
+                    delayMs: config.TOKEN_ECHO_RETRY_DELAY_MS,
                     // Bail before sleeping if the per-job time budget
-                    // would be exceeded; the loop's existing `time_limit`
-                    // handling then takes over below.
-                    timeBudgetOk: () => Date.now() - startedAt < budgetMs,
+                    // would be exceeded by the time we'd wake up. The
+                    // helper checks BEFORE each sleep so we never
+                    // oversleep past the budget; the loop's existing
+                    // `time_limit` handling then takes over below.
+                    timeBudgetOk: (plannedDelayMs) =>
+                        Date.now() + plannedDelayMs - startedAt < budgetMs,
                 },
             );
 
@@ -1191,8 +1219,13 @@ export type TokenEchoOutcome<T> =
  * data arrives." BookingExperts' `/load_more_logs.js` mirrors this
  * because log events are continuously appended.
  *
- * Policy: up to 3 attempts (1 initial + 2 retries), with progressive
- * waits from `TOKEN_ECHO_RETRY_DELAYS_MS` between successive attempts.
+ * Policy: flat schedule (no ramp). `maxAttempts` total (1 initial +
+ * (maxAttempts - 1) retries) with `delayMs` between each attempt.
+ * Production defaults via `TOKEN_ECHO_MAX_ATTEMPTS` (100) and
+ * `TOKEN_ECHO_RETRY_DELAY_MS` (3000) — see `scraper/src/config.ts`.
+ * The delay is floored at `TOKEN_ECHO_MIN_DELAY_MS` (500ms) regardless
+ * of caller input — defensive against a misconfigured env knocking the
+ * delay to zero and DOSing BE.
  *
  * Detection: `attempt.nextToken === sentToken` (strict equality). The
  * caller's closure performs the entire HTTP fetch (including 422 /
@@ -1201,12 +1234,13 @@ export type TokenEchoOutcome<T> =
  * "advanced" — the caller's existing `token_missing` fall-through
  * handles that case differently.
  *
- * Budget: optional `timeBudgetOk` callback is consulted before EACH
- * sleep. If it returns false the helper bails with `budget_aborted`
- * instead of waiting further; the caller then falls through to its
- * existing `time_limit` exit. Heartbeat liveness is preserved across
- * the sleeps because the dedicated ticker (see `heartbeat.ts`) runs on
- * its own interval.
+ * Budget: optional `timeBudgetOk(plannedDelayMs)` callback is
+ * consulted BEFORE each sleep. If it returns false the helper bails
+ * with `budget_aborted` instead of waiting further — the caller then
+ * falls through to its existing `time_limit` exit. The pre-sleep
+ * check guarantees we never oversleep past the budget boundary.
+ * Heartbeat liveness is preserved across the sleeps because the
+ * dedicated ticker (see `heartbeat.ts`) runs on its own interval.
  *
  * Errors thrown inside `fetchAttempt` (network failures, the
  * `pagination_error` / SESSION_EXPIRED / generic-HTTP throws the
@@ -1227,16 +1261,38 @@ export async function loadMoreWithTokenEchoRetry<T>(
     opts: {
         jobId: number;
         page: number;
-        retryDelaysMs?: readonly number[];
-        timeBudgetOk?: () => boolean;
+        maxAttempts: number;
+        delayMs: number;
+        /**
+         * Floor applied to `delayMs`. Defaults to `TOKEN_ECHO_MIN_DELAY_MS`
+         * (500ms) — production callers pass nothing and inherit it. The
+         * offline test harness passes `0` for fast wall-clock-bounded
+         * scenarios; production never does.
+         */
+        minDelayMs?: number;
+        timeBudgetOk?: (plannedDelayMs: number) => boolean;
     },
 ): Promise<TokenEchoOutcome<T>> {
-    const { jobId, page } = opts;
-    const delays = opts.retryDelaysMs ?? TOKEN_ECHO_RETRY_DELAYS_MS;
-    const maxAttempts = delays.length + 1;
+    const { jobId, page, maxAttempts } = opts;
+    const minDelayMs = opts.minDelayMs ?? TOKEN_ECHO_MIN_DELAY_MS;
+    const delayMs = Math.max(minDelayMs, opts.delayMs);
     let last: TokenEchoAttempt<T> | null = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Surface the active policy on the first attempt so an operator
+        // reading the logs can confirm what the worker is actually
+        // running with (env override, default, etc.). Subsequent
+        // attempts log per-retry below.
+        if (attempt === 1) {
+            log.info('token-echo retry policy active for job/page', {
+                jobId,
+                page,
+                maxAttempts,
+                delayMs,
+                tokenPrefix: sentToken.slice(0, 12),
+            });
+        }
+
         last = await fetchAttempt(attempt);
 
         if (last.nextToken !== sentToken) {
@@ -1252,8 +1308,11 @@ export async function loadMoreWithTokenEchoRetry<T>(
         }
 
         if (attempt < maxAttempts) {
-            const delayMs = delays[attempt - 1] ?? 0;
-            if (opts.timeBudgetOk && !opts.timeBudgetOk()) {
+            // Budget is consulted BEFORE the sleep so we never wake up
+            // past the boundary. The callback receives the planned
+            // delay so the caller can compute `now + plannedDelay <
+            // budget` precisely.
+            if (opts.timeBudgetOk && !opts.timeBudgetOk(delayMs)) {
                 log.warn('token-echo retry would exceed time budget — skipping further sleeps', {
                     jobId,
                     page,

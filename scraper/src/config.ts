@@ -31,6 +31,20 @@ const envSchema = z.object({
     // consecutive silence — far beyond any realistic quiet window — and only
     // fires if the upstream gets stuck handing out an eternally-valid token.
     MAX_CONSECUTIVE_ZERO_ROW_PAGES: z.coerce.number().int().positive().default(500),
+    // Token-echo retry policy. When BookingExperts returns the same
+    // `next_token` we just sent (the AWS CloudWatch Logs `nextForwardToken
+    // === inputToken` "you're at the live tip" signal), we re-poll with
+    // a flat backoff — no ramp. Defaults are 1 initial + 99 retries with
+    // 3s between each, so a fully-exhausted echo cluster costs ~5 min of
+    // sleep + 100 RTTs at the tail of a scrape (well inside the 45-min
+    // job budget). Operator-tunable to balance "give BE more chances to
+    // flush new events" against scrape wall-clock.
+    //
+    // The delay is floored at 500ms in the helper (defensive; see
+    // `loadMoreWithTokenEchoRetry`) even if the env is set lower —
+    // hammering BE with zero-delay retries defeats the point.
+    TOKEN_ECHO_MAX_ATTEMPTS: z.coerce.number().int().positive().default(100),
+    TOKEN_ECHO_RETRY_DELAY_MS: z.coerce.number().int().positive().default(3000),
     HEADLESS: z
         .union([z.literal('true'), z.literal('false'), z.boolean()])
         .transform((v) => (typeof v === 'boolean' ? v : v === 'true'))

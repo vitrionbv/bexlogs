@@ -498,6 +498,70 @@ We deliberately do NOT auto-reduce concurrency in code — silently
 adapting would hide systemic upstream pressure that the operator should
 notice and act on.
 
+### Tuning the token-echo retry policy
+
+When BookingExperts returns the same `next_token` we just sent, the
+scraper interprets it as the AWS CloudWatch Logs "you're at the live
+tip — keep polling with this token, new events will arrive" signal
+and re-issues the same request on a flat schedule (no ramp). If a
+retry advances the token the scrape resumes; if all attempts exhaust
+the job completes with `stop_reason: caught_up` ("Caught up (live
+tip)" badge on the Jobs page).
+
+Two env vars control the policy. Both have usable defaults baked into
+the scraper, so a fresh deploy needs nothing in `laravel/.env`:
+
+| knob                        | where                                    | default | what it does                                                                                       |
+|-----------------------------|------------------------------------------|---------|----------------------------------------------------------------------------------------------------|
+| `TOKEN_ECHO_MAX_ATTEMPTS`   | `scraper/.env` / `scraper/src/config.ts` | `100`   | Total attempts (1 initial + 99 retries) before declaring `caught_up`.                              |
+| `TOKEN_ECHO_RETRY_DELAY_MS` | `scraper/.env` / `scraper/src/config.ts` | `3000`  | Flat delay between every attempt. Floored at 500ms in code regardless of this value (defensive).   |
+
+Wall-clock cost on full exhaustion at the defaults: 99 × 3s ≈ 5 min
+of sleep + 100 RTTs. Per-job, tail-only — fits comfortably inside the
+45-min subscription budget so the budget-bail (`time_limit`) only
+fires when the scrape actually spent its budget elsewhere. Heartbeat
+liveness is preserved across the sleeps because the dedicated ticker
+runs on its own interval.
+
+To override either knob (no production env additions are required for
+the defaults — only set these if you've decided to tune):
+
+```bash
+ssh root@<server>
+cd /opt/bexlogs
+
+KEY=TOKEN_ECHO_MAX_ATTEMPTS
+VAL=200
+ENV_FILE=/opt/bexlogs/laravel/.env
+
+if grep -qE "^${KEY}=" "$ENV_FILE"; then
+  sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$ENV_FILE"
+else
+  printf '\n%s=%s\n' "$KEY" "$VAL" >> "$ENV_FILE"
+fi
+
+# The scraper container reads these knobs directly from its env. If
+# docker-compose.production.yml doesn't pass the var through, add it
+# to the scraper service's `environment:` block (mirroring the pattern
+# used for MAX_CONCURRENT_SCRAPES) before recreating the container.
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    up -d --no-deps --force-recreate scraper
+```
+
+Each scrape logs the active policy on the first token-echo invocation
+of every page so operators can confirm which values are live:
+
+```bash
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    logs -f scraper | grep -iE "token-echo retry policy active|caught up to BookingExperts"
+```
+
+A healthy log line looks like:
+
+```
+INFO token-echo retry policy active for job/page jobId=… page=… maxAttempts=100 delayMs=3000 tokenPrefix=…
+```
+
 ### Diagnosing `Session expired` failures (and the "linked-but-failing" trap)
 
 When the Jobs page shows clusters of `Session expired` failures even

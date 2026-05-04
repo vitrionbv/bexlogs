@@ -493,6 +493,68 @@ function compactCount(n: number): string {
     return String(n);
 }
 
+// `params.start_time` / `params.end_time` are the BookingExperts log-window
+// bounds the scraper passes to /load_more_logs.js, NOT the scrape runtime.
+// The naming overlap ("start"/"end") confused operators reading the raw
+// JSON payload — this helper gives the dialog a labeled, human-readable
+// summary above the JSON dump. Returns null when either field is missing
+// or unparseable so the template hides the row entirely instead of
+// rendering "Invalid Date → Invalid Date (NaNm)".
+function formatLogWindow(
+    params: Record<string, unknown> | null,
+): { start: string; end: string; duration: string } | null {
+    if (!params) {
+        return null;
+    }
+
+    const start = params.start_time;
+    const end = params.end_time;
+
+    if (typeof start !== 'string' || typeof end !== 'string') {
+        return null;
+    }
+
+    const startMs = Date.parse(start);
+    const endMs = Date.parse(end);
+
+    if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+        return null;
+    }
+
+    return { start, end, duration: formatLogWindowDuration(endMs - startMs) };
+}
+
+// Human-readable d/h/m formatter for the log-window summary. Distinct from
+// the row-level `duration()` (seconds + minutes for in-flight scrape
+// runtimes) because log windows on the scheduled-scrape path are usually
+// hours-to-days rather than seconds.
+function formatLogWindowDuration(ms: number): string {
+    if (ms <= 0) {
+        return '0m';
+    }
+
+    const totalSec = Math.round(ms / 1000);
+    const days = Math.floor(totalSec / 86_400);
+    const hours = Math.floor((totalSec % 86_400) / 3600);
+    const minutes = Math.floor((totalSec % 3600) / 60);
+
+    const parts: string[] = [];
+
+    if (days > 0) {
+        parts.push(`${days}d`);
+    }
+
+    if (hours > 0) {
+        parts.push(`${hours}h`);
+    }
+
+    if (minutes > 0 || parts.length === 0) {
+        parts.push(`${minutes}m`);
+    }
+
+    return parts.join(' ');
+}
+
 function displayRows(job: Job): string {
     const s = job.stats;
 
@@ -533,6 +595,8 @@ const filterChips = computed(() =>
                 : props.statusCounts[status] ?? 0,
     })),
 );
+
+const focusedLogWindow = computed(() => formatLogWindow(focused.value?.params ?? null));
 
 const Field = defineComponent({
     name: 'Field',
@@ -837,6 +901,22 @@ const Field = defineComponent({
                         <pre class="bg-destructive/10 text-destructive max-h-72 overflow-auto rounded p-2 text-xs whitespace-pre-wrap break-all font-mono">{{ focused.error }}</pre>
                     </Field>
                     <Field v-if="focused.params" label="Params">
+                        <div
+                            v-if="focusedLogWindow"
+                            class="mb-2 space-y-1"
+                            title="Range of BookingExperts log events this run fetched — not the scrape runtime."
+                        >
+                            <div class="text-xs">
+                                <span class="text-muted-foreground">Log window:</span>
+                                <span class="font-mono ml-1">{{ focusedLogWindow.start }}</span>
+                                <span class="text-muted-foreground mx-1">→</span>
+                                <span class="font-mono">{{ focusedLogWindow.end }}</span>
+                                <span class="text-muted-foreground ml-1">({{ focusedLogWindow.duration }})</span>
+                            </div>
+                            <small class="text-muted-foreground block text-[11px]">
+                                Range of BookingExperts log events this run fetched — not the scrape runtime.
+                            </small>
+                        </div>
                         <pre class="bg-muted max-h-60 overflow-auto rounded p-2 text-xs whitespace-pre-wrap break-all font-mono">{{ JSON.stringify(focused.params, null, 2) }}</pre>
                     </Field>
                     <Field v-if="focused.stats" label="Stats">
