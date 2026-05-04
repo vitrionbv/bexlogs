@@ -52,6 +52,8 @@ interface SubRow {
     max_pages_per_scrape: number;
     lookback_days_first_scrape: number;
     max_duration_minutes: number;
+    max_concurrent_jobs: number;
+    job_spacing_minutes: number;
     last_scraped_at: string | null;
 }
 interface AppRow {
@@ -120,10 +122,26 @@ function updateInterval(sub: SubRow, value: number): void {
 type BudgetField =
     | 'max_pages_per_scrape'
     | 'lookback_days_first_scrape'
-    | 'max_duration_minutes';
+    | 'max_duration_minutes'
+    | 'max_concurrent_jobs'
+    | 'job_spacing_minutes';
+
+// Per-field bounds that mirror ManageController::updateSubscription's
+// validation. Keep the UI's `min`/`max` attributes in sync with these so
+// rejected values are caught client-side rather than round-tripping a
+// 422.
+const BUDGET_BOUNDS: Record<BudgetField, { min: number; max: number }> = {
+    max_pages_per_scrape: { min: 1, max: 5000 },
+    lookback_days_first_scrape: { min: 1, max: 365 },
+    max_duration_minutes: { min: 1, max: 120 },
+    max_concurrent_jobs: { min: 1, max: 10 },
+    job_spacing_minutes: { min: 1, max: 120 },
+};
 
 function updateBudget(sub: SubRow, field: BudgetField, value: number): void {
-    if (!Number.isFinite(value) || value < 1) {
+    const bounds = BUDGET_BOUNDS[field];
+
+    if (!Number.isFinite(value) || value < bounds.min || value > bounds.max) {
         return;
     }
 
@@ -146,12 +164,16 @@ function deleteSub(sub: SubRow): void {
 }
 
 function scrapeNow(sub: SubRow): void {
+    // Both the success path and the guard-denial paths flash a `toast`
+    // session value (`Inertia::flash('toast', ...)`) which the global
+    // `initializeFlashToast` handler surfaces. Inertia's `onSuccess`
+    // fires for any 2xx/3xx outcome and can't tell success from
+    // gated-denial, so emitting a local toast here would double up.
     router.post(
         `/manage/subscriptions/${sub.id}/scrape`,
         {},
         {
             preserveScroll: true,
-            onSuccess: () => toast.success(`Scrape job queued for ${sub.name}`),
             onError: (errs) => {
                 const first = Object.values(errs)[0];
 
@@ -911,6 +933,63 @@ const ManualNickname = defineComponent({
                                 </div>
                                 <p class="text-muted-foreground text-[10px]">
                                     Wall-clock budget; jobs abort cleanly when reached.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div
+                            class="border-border/60 grid grid-cols-1 gap-3 border-t pt-2 sm:grid-cols-2"
+                            data-testid="concurrency-block"
+                        >
+                            <div class="space-y-1">
+                                <Label
+                                    :for="`max-concurrent-${sub.id}`"
+                                    class="text-muted-foreground text-[10px] uppercase tracking-wide"
+                                >
+                                    Max concurrent jobs
+                                </Label>
+                                <div class="flex items-center gap-1">
+                                    <Input
+                                        :id="`max-concurrent-${sub.id}`"
+                                        type="number"
+                                        min="1"
+                                        max="10"
+                                        class="h-8 w-24"
+                                        :model-value="sub.max_concurrent_jobs"
+                                        @change="(e: Event) => updateBudget(sub, 'max_concurrent_jobs', Number((e.target as HTMLInputElement).value))"
+                                    />
+                                    <span class="text-muted-foreground text-xs">jobs</span>
+                                </div>
+                                <p class="text-muted-foreground text-[10px]">
+                                    Cap on jobs running at the same time for this
+                                    subscription. 1 preserves today's behaviour. Raise
+                                    when a single run can't keep up (e.g. EuroParcs).
+                                </p>
+                            </div>
+
+                            <div class="space-y-1">
+                                <Label
+                                    :for="`spacing-${sub.id}`"
+                                    class="text-muted-foreground text-[10px] uppercase tracking-wide"
+                                >
+                                    Spacing between jobs (minutes)
+                                </Label>
+                                <div class="flex items-center gap-1">
+                                    <Input
+                                        :id="`spacing-${sub.id}`"
+                                        type="number"
+                                        min="1"
+                                        max="120"
+                                        class="h-8 w-24"
+                                        :model-value="sub.job_spacing_minutes"
+                                        @change="(e: Event) => updateBudget(sub, 'job_spacing_minutes', Number((e.target as HTMLInputElement).value))"
+                                    />
+                                    <span class="text-muted-foreground text-xs">min</span>
+                                </div>
+                                <p class="text-muted-foreground text-[10px]">
+                                    Minimum wait before a new concurrent job can be
+                                    dispatched. A freshly-started job reserves the slot
+                                    for this long. 10 minutes is a reasonable default.
                                 </p>
                             </div>
                         </div>

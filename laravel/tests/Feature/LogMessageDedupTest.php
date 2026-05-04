@@ -131,12 +131,59 @@ class LogMessageDedupTest extends TestCase
         $this->assertSame(1, $this->countLogs());
     }
 
+    /**
+     * Two concurrent scrape jobs for the same subscription must share a
+     * Page row (the `pages_unique_idx` on (org_id, app_id, subscription_id)
+     * forces it) and therefore the `(page_id, content_hash)` unique index
+     * dedupes their writes naturally — even though the jobs themselves
+     * have separate ids. This is the property the per-subscription
+     * concurrency feature relies on for `duplicate_detection` early-stop.
+     */
+    public function test_two_concurrent_jobs_for_same_subscription_dedup_via_shared_page(): void
+    {
+        $secondJob = ScrapeJob::create([
+            'subscription_id' => $this->subId,
+            'bex_session_id' => $this->job->bex_session_id,
+            'status' => ScrapeJob::STATUS_RUNNING,
+            'started_at' => now(),
+            'last_heartbeat_at' => now(),
+        ]);
+
+        $msg = $this->message();
+
+        $this->postBatch([$msg])->assertOk();
+        $this->postBatchAs($secondJob, [$msg])->assertOk();
+
+        $this->assertSame(
+            1,
+            $this->countLogs(),
+            'Two jobs writing the same payload for the same subscription must dedup to one row.',
+        );
+
+        $pageIds = Page::query()
+            ->where('subscription_id', $this->subId)
+            ->pluck('id')
+            ->all();
+
+        $this->assertCount(
+            1,
+            $pageIds,
+            'A subscription must have exactly one Page row regardless of how many jobs touch it.',
+        );
+    }
+
     /** @param array<int, array<string, mixed>> $messages */
     private function postBatch(array $messages): TestResponse
     {
+        return $this->postBatchAs($this->job, $messages);
+    }
+
+    /** @param array<int, array<string, mixed>> $messages */
+    private function postBatchAs(ScrapeJob $job, array $messages): TestResponse
+    {
         return $this
             ->withToken('test-worker-token')
-            ->postJson("/api/worker/jobs/{$this->job->id}/batch", ['messages' => $messages]);
+            ->postJson("/api/worker/jobs/{$job->id}/batch", ['messages' => $messages]);
     }
 
     private function countLogs(): int

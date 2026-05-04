@@ -9,7 +9,9 @@ use App\Models\Organization;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use App\Services\BookingExpertsBrowser;
-use Illuminate\Database\QueryException;
+use App\Services\MayEnqueueResult;
+use App\Services\ScrapeEnqueueGuard;
+use App\Services\ScrapeWindowPlanner;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -45,6 +47,8 @@ class ManageController extends Controller
                         'max_pages_per_scrape' => $s->max_pages_per_scrape,
                         'lookback_days_first_scrape' => $s->lookback_days_first_scrape,
                         'max_duration_minutes' => $s->max_duration_minutes,
+                        'max_concurrent_jobs' => $s->max_concurrent_jobs,
+                        'job_spacing_minutes' => $s->job_spacing_minutes,
                         'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
                     ]),
                 ]),
@@ -108,6 +112,8 @@ class ManageController extends Controller
             'max_pages_per_scrape' => 'sometimes|integer|min:1|max:5000',
             'lookback_days_first_scrape' => 'sometimes|integer|min:1|max:365',
             'max_duration_minutes' => 'sometimes|integer|min:1|max:120',
+            'max_concurrent_jobs' => 'sometimes|integer|min:1|max:10',
+            'job_spacing_minutes' => 'sometimes|integer|min:1|max:120',
             'environment' => 'sometimes|in:production,staging',
         ]);
         $subscription->update($data);
@@ -123,8 +129,12 @@ class ManageController extends Controller
         return back()->with('status', 'subscription-deleted');
     }
 
-    public function enqueueScrape(Request $request, Subscription $subscription): RedirectResponse
-    {
+    public function enqueueScrape(
+        Request $request,
+        Subscription $subscription,
+        ScrapeEnqueueGuard $guard,
+        ScrapeWindowPlanner $planner,
+    ): RedirectResponse {
         $this->authorize($request, $subscription);
 
         $session = $request->user()->activeBexSession($subscription->environment);
@@ -141,44 +151,24 @@ class ManageController extends Controller
             'max_duration_minutes' => 'nullable|integer|min:1|max:120',
         ]);
 
-        // Per-subscription budgets are the defaults for on-demand scrapes too;
-        // request body overrides win when supplied.
-        $defaults = [
-            'max_pages' => (int) ($subscription->max_pages_per_scrape ?? 200),
-            'max_duration_minutes' => (int) ($subscription->max_duration_minutes ?? 10),
-        ];
-
-        // App-level fast-path so the common case (no overlap) doesn't have
-        // to round-trip an INSERT and roll back. The DB partial unique
-        // index `scrape_jobs_active_unique_idx` is the authoritative
-        // race-proof guard — it catches the SELECT-then-INSERT window
-        // that a double-click or scheduler-vs-click collision can drive
-        // through this check.
-        $alreadyQueued = ScrapeJob::query()
-            ->where('subscription_id', $subscription->id)
-            ->whereIn('status', [ScrapeJob::STATUS_QUEUED, ScrapeJob::STATUS_RUNNING])
-            ->exists();
-
-        if ($alreadyQueued) {
-            return $this->scrapeAlreadyQueuedResponse();
+        // Application-level concurrency gate. The Postgres partial unique
+        // index that previously made "exactly one queued/running job per
+        // subscription" a hard rule was dropped in 2026_05_04_205500 in
+        // favour of the configurable (max_concurrent_jobs, job_spacing_minutes)
+        // pair. The guard inspects the same scrape_jobs query the index
+        // used to back, plus a spacing-window check so a double-click or
+        // a scheduler tick that overlaps a manual click doesn't pile on.
+        $decision = $guard->mayEnqueue($subscription);
+        if (! $decision->allowed) {
+            return $this->scrapeDeniedResponse($decision);
         }
 
-        try {
-            $job = ScrapeJob::create([
-                'subscription_id' => $subscription->id,
-                'bex_session_id' => $session->id,
-                'status' => ScrapeJob::STATUS_QUEUED,
-                'params' => array_merge($defaults, array_filter($overrides, fn ($v) => $v !== null)),
-            ]);
-        } catch (QueryException $e) {
-            // The partial unique index fired — another request beat us
-            // to the insert. Treat it identically to the fast-path
-            // "already queued" response so the UX is consistent.
-            if ($this->isUniqueViolation($e)) {
-                return $this->scrapeAlreadyQueuedResponse();
-            }
-            throw $e;
-        }
+        $job = ScrapeJob::create([
+            'subscription_id' => $subscription->id,
+            'bex_session_id' => $session->id,
+            'status' => ScrapeJob::STATUS_QUEUED,
+            'params' => $planner->buildParamsWithOverrides($subscription, $overrides),
+        ]);
 
         broadcast(new ScrapeJobUpdated(
             userId: (int) $request->user()->id,
@@ -187,26 +177,38 @@ class ManageController extends Controller
             status: $job->status,
         ));
 
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => "Scrape queued for {$subscription->name}.",
+        ]);
+
         return back()->with('status', 'scrape-enqueued');
     }
 
-    private function scrapeAlreadyQueuedResponse(): RedirectResponse
+    /**
+     * Map a guard denial onto a redirect with a flash status keyed on the
+     * reason. The Vue side flashes a toast keyed off `status`.
+     */
+    private function scrapeDeniedResponse(MayEnqueueResult $decision): RedirectResponse
     {
+        $statusByReason = [
+            'concurrency_cap_reached' => 'scrape-concurrency-cap',
+            'within_spacing_window' => 'scrape-spacing-window',
+            'prior_job_not_yet_started' => 'scrape-queued-not-started',
+        ];
+
+        $statusKey = $statusByReason[$decision->reason ?? ''] ?? 'scrape-already-queued';
+
         Inertia::flash('toast', [
             'type' => 'warning',
-            'message' => 'A scrape is already running for this subscription. Wait for it to finish.',
+            'message' => $decision->message ?? 'A scrape is already running for this subscription.',
+            'retry_after_seconds' => $decision->retryAfterSeconds,
         ]);
 
-        return back()->with('status', 'scrape-already-queued');
-    }
-
-    /**
-     * Detect Postgres SQLSTATE 23505 (unique_violation). Other QueryExceptions
-     * (FK failures, deadlocks) keep bubbling so we don't swallow real bugs.
-     */
-    private function isUniqueViolation(QueryException $e): bool
-    {
-        return $e->getCode() === '23505';
+        return back()
+            ->with('status', $statusKey)
+            ->with('scrape_denied_reason', $decision->reason)
+            ->with('scrape_denied_message', $decision->message);
     }
 
     // ─── Browse endpoints (Add Subscription → Browse tab, app-first cascade) ────────
