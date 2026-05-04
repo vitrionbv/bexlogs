@@ -30,3 +30,10 @@ Schedule::command('bex:refresh-sessions')
     ->hourly()
     ->withoutOverlapping(30)
     ->runInBackground();
+
+// Push host CPU / memory / disk to the operator dashboard. 5s feels live
+// without flooding the WS or the runqueue; the command itself takes
+// ~200ms (it samples /proc/stat twice).
+Schedule::command('server-stats:broadcast')
+    ->everyFiveSeconds()
+    ->withoutOverlapping();

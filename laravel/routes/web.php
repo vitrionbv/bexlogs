@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\AuthenticateController;
+use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\ExtensionController;
 use App\Http\Controllers\JobsController;
 use App\Http\Controllers\LogExportController;
@@ -35,6 +36,14 @@ Route::get('/robots.txt', function () {
 });
 
 Route::middleware(['auth', 'verified'])->group(function () {
+    // Operator dashboard: at-a-glance counts (sessions, subscriptions,
+    // jobs, logs), recent scrape activity, and live host vitals (CPU /
+    // memory / disk via private-server-stats Reverb channel for admins).
+    // Reachable as a separate page; post-login still lands on /logs (the
+    // primary work surface, see config('fortify.home')).
+    Route::get('dashboard', [DashboardController::class, 'index'])
+        ->name('dashboard');
+
     // BookingExperts authentication bridge.
     Route::get('authenticate', [AuthenticateController::class, 'index'])
         ->name('authenticate.index');

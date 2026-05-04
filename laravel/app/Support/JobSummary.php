@@ -2,13 +2,16 @@
 
 namespace App\Support;
 
+use App\Models\Page as LogPage;
 use App\Models\ScrapeJob;
+use App\Models\Subscription;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 
 /**
- * Read-side helpers that the sidebar / jobs page share.
+ * Read-side helpers that the sidebar / dashboard / jobs page all share.
  * Keeps the same shape so partial Inertia reloads stay cheap.
  */
 class JobSummary
@@ -90,6 +93,58 @@ class JobSummary
                 ];
             })
             ->all();
+    }
+
+    /**
+     * Dashboard summary: counts + sessions + pages + recent activity.
+     *
+     * Returned `recent[]` rows carry `rows_inserted` / `rows_received`
+     * (modern accurate shape — see commit 642768b "Accurate row counts on
+     * Jobs UI"); the legacy `stats.rows` synthetic count is no longer
+     * read. Dashboard.vue mirrors the same shape.
+     *
+     * @return array<string, mixed>
+     */
+    public static function dashboardForUser(User $user): array
+    {
+        $counts = self::countsForUser($user);
+
+        $sessionsTotal = $user->bexSessions()->count();
+        $sessionsActive = $user->bexSessions()->whereNull('expired_at')->count();
+
+        $subscriptions = Subscription::query()
+            ->whereExists(function ($q) use ($user) {
+                $q->from('applications')
+                    ->whereColumn('applications.id', 'subscriptions.application_id')
+                    ->whereExists(function ($q) use ($user) {
+                        $q->from('organizations')
+                            ->whereColumn('organizations.id', 'applications.organization_id')
+                            ->where('organizations.user_id', $user->id);
+                    });
+            });
+
+        $logsTotal = (int) DB::table('log_messages')
+            ->whereIn(
+                'page_id',
+                LogPage::query()
+                    ->whereExists(function ($q) use ($user) {
+                        $q->from('organizations')
+                            ->whereColumn('organizations.id', 'pages.organization_id')
+                            ->where('organizations.user_id', $user->id);
+                    })
+                    ->select('id'),
+            )
+            ->count();
+
+        return [
+            'counts' => $counts,
+            'sessions_total' => $sessionsTotal,
+            'sessions_active' => $sessionsActive,
+            'subscriptions_total' => $subscriptions->count(),
+            'subscriptions_auto' => $subscriptions->where('auto_scrape', true)->count(),
+            'logs_total' => $logsTotal,
+            'recent' => self::recentForUser($user, 8),
+        ];
     }
 
     private static function baseQuery(User $user): Builder
