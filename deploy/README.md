@@ -428,6 +428,76 @@ docker compose -f docker-compose.production.yml restart reverb
 docker compose -f docker-compose.production.yml restart scraper
 ```
 
+### Reading scrape-job `stop_reason` badges on the Jobs page
+
+Each completed/failed scrape job on `/jobs` shows a secondary badge
+explaining why the worker stopped paginating. Two-tier semantics:
+
+| Badge | Status | What it means | Action |
+|---|---|---|---|
+| **Caught up** | completed (green) | Pagination reached already-scraped rows. The healthy "we're done" signal — every scrape on a steady-state subscription should land here. | None. |
+| **No activity** | completed (green) | Initial page returned zero rows and no `next_token`. The subscription had nothing to scrape in the requested window. | None. |
+| **Pagination limit** | completed (yellow) | Hit the `max_pages` cap before catching up to already-scraped data. | Raise `max_pages` on the subscription, or wait for the next scheduled run to catch up via `Caught up`. |
+| **Time limit** | completed (yellow) | Wall-clock budget exceeded. | Raise `max_duration_minutes` on the subscription, or split the time window. |
+| **Pagination error (422)** | failed (red) | BookingExperts returned 422 after 1 initial + 2 retried attempts. We're hitting them too hard. | Lower `MAX_CONCURRENT_SCRAPES` (see below). |
+| **Missing pagination token** | failed (red) | BookingExperts stopped returning a `next_token` mid-scrape. Should never happen. | Inspect scraper logs around the failed job. |
+| **Token echo** | failed (red) | BE handed back the same `next_token` we just sent. Pagination wedged. | Inspect scraper logs; may be a BE-side bug. |
+| **Unparseable response** | failed (red) | BE response shape changed and our parsers couldn't recover. | Update `extractors.ts` / `parseLoadMoreResponse`. |
+| **Runaway safety** | failed (red) | Hit the cap on consecutive zero-row pages. BE handed out an apparently-infinite quiet window. | Inspect logs; usually a BE-side anomaly. |
+| **Session expired** | failed (red) | BE returned 401/403 — cookies expired. | Re-authenticate via the browser extension. |
+| **Worker reaped** | failed (red) | Worker stopped heart-beating; the reaper failed the job. | Check `docker compose logs scraper` for crashes. |
+
+`Caught up` is the healthy completion badge. Everything other than
+**Caught up**, **No activity**, **Pagination limit**, or **Time limit**
+should be investigated.
+
+### Fixing frequent `Pagination error (422)` failures
+
+If the Jobs page shows recurring `Pagination error (422)` badges, the
+scraper is hammering BookingExperts hard enough to trip their rate limit.
+The retry helper (1 initial + 2 retries with 2s and 5s backoffs) gives a
+single 422 a chance to recover; the failure means three consecutive 422s
+in the same call. The fix is operator-driven — lower
+`MAX_CONCURRENT_SCRAPES` so fewer jobs run in parallel:
+
+```bash
+ssh root@<server>
+cd /opt/bexlogs
+
+# Try 4 first; if 422s persist, try 2.
+KEY=MAX_CONCURRENT_SCRAPES
+VAL=4
+ENV_FILE=/opt/bexlogs/laravel/.env
+
+if grep -qE "^${KEY}=" "$ENV_FILE"; then
+  sed -i "s|^${KEY}=.*|${KEY}=${VAL}|" "$ENV_FILE"
+else
+  printf '\n%s=%s\n' "$KEY" "$VAL" >> "$ENV_FILE"
+fi
+
+# Recreate the scraper container so it picks up the new value.
+# (No need to touch app/queue/scheduler — they don't read this knob.)
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    up -d --no-deps --force-recreate scraper
+```
+
+To watch retries land in real time during the next scrape window:
+
+```bash
+docker compose -f docker-compose.production.yml --env-file laravel/.env \
+    logs -f scraper | grep -iE "stop_reason|422|caught up"
+```
+
+A healthy 422 recovery looks like one `WARN load_more returned 422 —
+backing off and retrying` followed by a normal `INFO load_more batch
+parsed`. A surrender looks like two `WARN` lines followed by an
+`ERROR load_more 422 exhausted retries — surrendering` and the job
+landing as `failed` with `stats.stop_reason = pagination_error`.
+
+We deliberately do NOT auto-reduce concurrency in code — silently
+adapting would hide systemic upstream pressure that the operator should
+notice and act on.
+
 ### Get a shell inside a service
 
 ```bash

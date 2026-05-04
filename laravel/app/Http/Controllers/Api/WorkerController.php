@@ -29,16 +29,30 @@ class WorkerController extends Controller
     private const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
 
     /**
-     * Allowed values for `stats.stop_reason`. Mirrors the `StopReason` union
-     * in `scraper/src/types.ts` plus the `worker_reaped` value emitted by
-     * `ScrapeReapStale`. The Jobs UI maps these to human-readable labels in
-     * `pages/Jobs/Index.vue`.
+     * Allowed values for `stats.stop_reason`. Mirrors the `StopReason`
+     * union in `scraper/src/types.ts` plus the `worker_reaped` value
+     * emitted by `ScrapeReapStale`. The Jobs UI maps these to
+     * human-readable labels in `pages/Jobs/Index.vue`.
+     *
+     * Two-tier semantics:
+     *   - completions: `duplicate_detection` (the only "we caught up
+     *     naturally" signal), `empty_window`, `pagination_limit`,
+     *     `time_limit`.
+     *   - failures: `pagination_error` (422 exhausted retries),
+     *     `token_missing` (next_token went null mid-scrape),
+     *     `unparseable`, `token_echo`, `runaway_safety`,
+     *     `session_expired`, `worker_reaped`.
+     *
+     * `natural_end` was retired in favor of the two new keys —
+     * historical rows may still carry it in `stats`; the Jobs UI
+     * falls back to a label-less "Completed" badge for unknown reasons.
      */
     public const STOP_REASONS = [
-        'natural_end',
         'duplicate_detection',
         'pagination_limit',
         'time_limit',
+        'pagination_error',
+        'token_missing',
         'unparseable',
         'token_echo',
         'runaway_safety',
@@ -308,22 +322,32 @@ class WorkerController extends Controller
         $payload = $request->validate([
             'error' => 'required|string',
             'retryable' => 'nullable|boolean',
+            'stop_reason' => ['nullable', 'string', 'in:'.implode(',', self::STOP_REASONS)],
         ]);
 
-        // Only the session-expired path gets a labelled stop_reason on
-        // failure — every other error message is generic enough that
-        // forcing a category would mislead operators. Generic failures
-        // leave stop_reason unset; the UI hides the badge in that case.
         $update = [
             'status' => ScrapeJob::STATUS_FAILED,
             'completed_at' => now(),
             'error' => $payload['error'],
         ];
 
-        if ($payload['error'] === self::SESSION_EXPIRED_SENTINEL) {
+        // Resolve stop_reason in priority order:
+        //   1. Whatever the worker explicitly sent (the new path —
+        //      scraper sets pagination_error, token_missing, unparseable,
+        //      token_echo, runaway_safety inline before calling /fail).
+        //   2. SESSION_EXPIRED sentinel detection (legacy fallback for
+        //      older worker builds and the catch-block path that doesn't
+        //      know to label session expiry as anything other than the
+        //      sentinel error string).
+        //   3. Nothing (generic failure — UI hides the badge).
+        $explicitReason = $payload['stop_reason'] ?? null;
+        $effectiveReason = $explicitReason
+            ?? ($payload['error'] === self::SESSION_EXPIRED_SENTINEL ? 'session_expired' : null);
+
+        if ($effectiveReason !== null) {
             $update['stats'] = array_merge(
                 $job->stats ?? [],
-                ['stop_reason' => 'session_expired'],
+                ['stop_reason' => $effectiveReason],
             );
         }
 

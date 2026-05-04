@@ -319,11 +319,14 @@ class ScrapeReapStaleTest extends TestCase
             'stats' => ['rows_inserted' => 42, 'batches' => 3],
         ]);
 
-        // Worker /complete lands before the reaper tick.
+        // Worker /complete lands before the reaper tick. `duplicate_detection`
+        // is the canonical "natural end" reason post-revamp; it survives
+        // here unchanged since the reaper-skips-the-row contract is what's
+        // under test, not the reason itself.
         $job->update([
             'status' => ScrapeJob::STATUS_COMPLETED,
             'completed_at' => now(),
-            'stats' => ['rows_inserted' => 42, 'batches' => 3, 'stop_reason' => 'natural_end'],
+            'stats' => ['rows_inserted' => 42, 'batches' => 3, 'stop_reason' => 'duplicate_detection'],
         ]);
 
         $this->artisan('scrape:reap-stale')
@@ -332,7 +335,7 @@ class ScrapeReapStaleTest extends TestCase
 
         $job->refresh();
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $job->status);
-        $this->assertSame('natural_end', $job->stats['stop_reason']);
+        $this->assertSame('duplicate_detection', $job->stats['stop_reason']);
         $this->assertNull($job->error);
         Event::assertNotDispatched(ScrapeJobUpdated::class);
     }
@@ -377,7 +380,7 @@ class ScrapeReapStaleTest extends TestCase
                 ->update([
                     'status' => ScrapeJob::STATUS_COMPLETED,
                     'completed_at' => now(),
-                    'stats' => ['rows_inserted' => 7, 'batches' => 1, 'stop_reason' => 'natural_end'],
+                    'stats' => ['rows_inserted' => 7, 'batches' => 1, 'stop_reason' => 'duplicate_detection'],
                 ]);
         });
 
@@ -388,7 +391,7 @@ class ScrapeReapStaleTest extends TestCase
         $job->refresh();
         $this->assertTrue($flipped, 'retrieved listener should have fired');
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $job->status);
-        $this->assertSame('natural_end', $job->stats['stop_reason']);
+        $this->assertSame('duplicate_detection', $job->stats['stop_reason']);
         $this->assertNull($job->error);
 
         Event::assertNotDispatched(ScrapeJobUpdated::class);

@@ -78,8 +78,14 @@ export async function completeJob(
 
 export async function failJob(
     jobId: number,
-    payload: { error: string; retryable?: boolean },
+    payload: { error: string; retryable?: boolean; stop_reason?: StopReason },
 ): Promise<void> {
+    // JSON.stringify drops `undefined` keys, so when the caller doesn't
+    // know a typed reason (generic HTTP failure, etc.) we send the
+    // existing `{error, retryable}` shape verbatim — Laravel's fail()
+    // endpoint then leaves stats.stop_reason untouched (or applies its
+    // own SESSION_EXPIRED fallback). When stop_reason IS supplied,
+    // Laravel persists it onto stats.stop_reason verbatim.
     const res = await fetch(url(`/api/worker/jobs/${jobId}/fail`), {
         method: 'POST',
         headers: jsonHeaders(),

@@ -48,10 +48,11 @@ import {
 import { useUserChannel } from '@/composables/useRealtime';
 
 type StopReason =
-    | 'natural_end'
     | 'duplicate_detection'
     | 'pagination_limit'
     | 'time_limit'
+    | 'pagination_error'
+    | 'token_missing'
     | 'unparseable'
     | 'token_echo'
     | 'runaway_safety'
@@ -180,40 +181,52 @@ type StopReasonMeta = {
 // Each entry maps the scraper-emitted enum value (`StopReason` in
 // scraper/src/types.ts + `worker_reaped` from `ScrapeReapStale`) to the
 // human-readable badge surface and a tooltip blurb. Variant choice:
-//   - secondary  → expected, harmless terminations (natural end / quiet window)
-//   - warning    → policy-driven cuts the operator may want to revisit
-//                  (duplicate dedup, page cap, budget cap)
-//   - destructive → worker hit a real fault path
+//   - secondary  → expected, healthy terminations. Only `duplicate_detection`
+//                  ("Caught up") and `empty_window` ("No activity") qualify.
+//   - warning    → operator-visible caps that may need revisiting
+//                  (pagination_limit, time_limit). The job completed; the
+//                  cap just got in the way.
+//   - destructive → hard failure paths. Anything in this bucket should be
+//                   investigated: BE rate-limited us (pagination_error),
+//                   pagination broke (token_missing / token_echo /
+//                   runaway_safety), the response shape changed
+//                   (unparseable), our session died (session_expired), or
+//                   the worker died (worker_reaped).
 const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
-    natural_end: {
-        label: 'Natural end',
+    duplicate_detection: {
+        label: 'Caught up',
         variant: 'secondary',
-        description: 'Pagination exhausted (no next_token / 422 from BookingExperts).',
+        description: 'Pagination reached already-scraped rows — the healthy "we are done" signal.',
     },
     empty_window: {
         label: 'No activity',
         variant: 'secondary',
-        description: 'Initial page had zero rows and no next_token to chase.',
-    },
-    duplicate_detection: {
-        label: 'Duplicate detection',
-        variant: 'warning',
-        description: 'Stopped early — pagination re-walked already-scraped territory.',
+        description: 'Initial page had zero rows and no next_token to chase — nothing to scrape.',
     },
     pagination_limit: {
         label: 'Pagination limit',
         variant: 'warning',
-        description: 'Reached max_pages cap before exhausting pagination.',
+        description: 'Reached max_pages cap before catching up. Raise max_pages or wait for the next run to catch up via duplicate detection.',
     },
     time_limit: {
         label: 'Time limit',
         variant: 'warning',
-        description: 'Wall-clock budget exceeded — job was aborted cleanly.',
+        description: 'Wall-clock budget exceeded — job was aborted cleanly. Raise max_duration_minutes or split the time window.',
+    },
+    pagination_error: {
+        label: 'Pagination error (422)',
+        variant: 'destructive',
+        description: 'BookingExperts returned 422 after retries — we are hitting them too hard. Lower MAX_CONCURRENT_SCRAPES.',
+    },
+    token_missing: {
+        label: 'Missing pagination token',
+        variant: 'destructive',
+        description: 'BookingExperts stopped returning a next_token mid-scrape. This should never happen — investigate.',
     },
     unparseable: {
         label: 'Unparseable response',
         variant: 'destructive',
-        description: 'load_more body could not be parsed and no fallback succeeded.',
+        description: 'load_more body could not be parsed and no fallback succeeded. BE response shape may have changed.',
     },
     token_echo: {
         label: 'Token echo',
@@ -223,7 +236,7 @@ const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
     runaway_safety: {
         label: 'Runaway safety',
         variant: 'destructive',
-        description: 'Hit the cap on consecutive zero-row pages.',
+        description: 'Hit the cap on consecutive zero-row pages. BE may be handing out an apparently-infinite quiet window.',
     },
     session_expired: {
         label: 'Session expired',
@@ -237,6 +250,13 @@ const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
     },
 };
 
+// Returns the stop_reason key only when it's both present in stats AND
+// known to STOP_REASON_META. Unknown values (notably legacy `natural_end`
+// on rows persisted before the semantics revamp) fall through to `null`,
+// which hides the secondary badge — the row still renders normally and
+// the primary status badge ("Completed" / "Failed") carries the outcome.
+// We deliberately don't backfill old rows; this guard keeps the page
+// rendering for them without rewriting history.
 function jobStopReason(job: Job): StopReason | null {
     if (job.status !== 'completed' && job.status !== 'failed') {
         return null;

@@ -68,22 +68,47 @@ class WorkerStopReasonTest extends TestCase
 
     public function test_complete_stamps_stop_reason_into_stats_blob(): void
     {
+        // duplicate_detection is the canonical "healthy completion" reason
+        // post-revamp — the only signal that survives the rule "natural =
+        // duplicates found". Picking it here also exercises the path the
+        // Jobs UI cares most about (the green "Caught up" badge).
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 5,
                 'rows' => 100,
                 'duration_ms' => 1500,
                 'aborted_due_to_time' => false,
-                'early_stopped_due_to_duplicates' => false,
-                'total_duplicates' => 0,
-                'stop_reason' => 'natural_end',
+                'early_stopped_due_to_duplicates' => true,
+                'total_duplicates' => 12,
+                'stop_reason' => 'duplicate_detection',
             ])
             ->assertNoContent();
 
         $this->job->refresh();
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
-        $this->assertSame('natural_end', $this->job->stats['stop_reason'] ?? null);
+        $this->assertSame('duplicate_detection', $this->job->stats['stop_reason'] ?? null);
         $this->assertSame(5, (int) ($this->job->stats['pages'] ?? 0));
+    }
+
+    public function test_complete_rejects_retired_natural_end_reason(): void
+    {
+        // `natural_end` was retired in favor of `duplicate_detection`
+        // (caught up) and `token_missing` / `pagination_error` (the
+        // anomaly paths it used to silently absorb). The validator
+        // must reject the legacy key so a stray older worker can't
+        // re-introduce it through /complete.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 1,
+                'rows' => 0,
+                'duration_ms' => 100,
+                'stop_reason' => 'natural_end',
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['stop_reason']);
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_RUNNING, $this->job->status);
     }
 
     public function test_complete_preserves_existing_per_batch_counters_on_stop_reason_merge(): void
@@ -205,5 +230,78 @@ class WorkerStopReasonTest extends TestCase
         $this->assertSame(ScrapeJob::STATUS_FAILED, $this->job->status);
         $stats = $this->job->stats ?? [];
         $this->assertArrayNotHasKey('stop_reason', $stats);
+    }
+
+    public function test_fail_with_explicit_pagination_error_persists_typed_reason(): void
+    {
+        // 422-after-retries path: scraper sets stop_reason = pagination_error
+        // before throwing, then forwards it through failJob({ stop_reason }).
+        // The Jobs UI then renders the destructive "Pagination error (422)"
+        // badge so the operator notices we hit BE too hard.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/fail", [
+                'error' => 'BookingExperts returned 422 after 3 attempts (1 initial + 2 retries). Consider lowering MAX_CONCURRENT_SCRAPES.',
+                'retryable' => true,
+                'stop_reason' => 'pagination_error',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_FAILED, $this->job->status);
+        $this->assertSame('pagination_error', $this->job->stats['stop_reason'] ?? null);
+        $this->assertStringContainsString('MAX_CONCURRENT_SCRAPES', (string) $this->job->error);
+    }
+
+    public function test_fail_with_explicit_token_missing_persists_typed_reason(): void
+    {
+        // Mid-scrape next_token === null path: scraper sets
+        // stop_reason = token_missing before throwing. The Jobs UI then
+        // renders the destructive "Missing pagination token" badge.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/fail", [
+                'error' => 'BookingExperts stopped returning a next_token mid-scrape; pagination state lost — treating as anomaly.',
+                'retryable' => true,
+                'stop_reason' => 'token_missing',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_FAILED, $this->job->status);
+        $this->assertSame('token_missing', $this->job->stats['stop_reason'] ?? null);
+    }
+
+    public function test_fail_explicit_stop_reason_wins_over_session_expired_sentinel_detection(): void
+    {
+        // Edge case: the worker forwards an explicit stop_reason AND
+        // happens to use the SESSION_EXPIRED string as the error message
+        // (e.g. a future code path that wants to label session expiry
+        // differently than the legacy sentinel). Explicit > sentinel
+        // detection — the SESSION_EXPIRED fallback only kicks in when no
+        // stop_reason is supplied at all.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/fail", [
+                'error' => 'SESSION_EXPIRED',
+                'retryable' => false,
+                'stop_reason' => 'pagination_error',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_FAILED, $this->job->status);
+        $this->assertSame('pagination_error', $this->job->stats['stop_reason'] ?? null);
+    }
+
+    public function test_fail_rejects_retired_natural_end_reason(): void
+    {
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/fail", [
+                'error' => 'load_more HTTP 500',
+                'stop_reason' => 'natural_end',
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['stop_reason']);
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_RUNNING, $this->job->status);
     }
 }

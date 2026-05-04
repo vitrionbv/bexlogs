@@ -1,7 +1,14 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium, type APIRequestContext, type Browser, type BrowserContext, type Page } from 'playwright';
+import {
+    chromium,
+    type APIRequestContext,
+    type APIResponse,
+    type Browser,
+    type BrowserContext,
+    type Page,
+} from 'playwright';
 import { config, BEX_BASE_URLS, type Environment } from './config.js';
 import { extractRowsFromMain, parseLoadMoreResponse, type RawRow } from './extractors.js';
 import { rowToMessage } from './rowParser.js';
@@ -11,6 +18,18 @@ import { startHeartbeatTicker } from './heartbeat.js';
 import type { ParsedLogMessage, ScrapeJob, StopReason } from './types.js';
 
 const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
+
+/**
+ * Backoff schedule (ms between attempts) for /load_more_logs.js when
+ * BookingExperts replies with 422. The user-facing semantics: 422 means
+ * we're hitting BE too hard (rate limit / concurrency cap), so a single
+ * 422 isn't a job-killer — but if it survives a 2s and a 5s pause we
+ * surrender and fail the job so the operator notices and lowers
+ * MAX_CONCURRENT_SCRAPES. Total wall-clock cost on full exhaustion:
+ * 7s + the three HTTP round-trips themselves (well within the 30s per-
+ * request timeout, well below the 3-min reaper threshold).
+ */
+const LOAD_MORE_422_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
 
 const DEBUG_DUMP_DIR = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -59,14 +78,13 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     let pageCount = 0;
     let rowCount = 0;
     let abortedDueToTime = false;
-    // Track which break/return path the main loop exits through. Default
-    // to `natural_end` so a clean fall-through (nextToken === null with no
-    // earlier reason set) reports the boring "we ran out of pages" case.
-    // `stopReasonSet` distinguishes an explicit assignment from the default
-    // — needed to tell `natural_end` (token went null) from `pagination_limit`
-    // (loop condition exit while a token is still in hand).
-    let stopReason: StopReason = 'natural_end';
-    let stopReasonSet = false;
+    // Tracks which break/return path the main loop took. `undefined` until
+    // a branch sets it explicitly: the post-loop fall-through then decides
+    // between the two ambiguous cases (pagination_limit vs token_missing)
+    // by inspecting pageCount/maxPages. The catch block forwards whatever
+    // is set when the job fails so failJob can persist a typed reason
+    // alongside the freeform error message.
+    let stopReason: StopReason | undefined;
     // Early-stop tracking: count how many consecutive load_more pages came
     // back as 100% duplicates (received > 0 && inserted === 0), and the
     // running total of (received - inserted) across the whole job. The
@@ -120,14 +138,13 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         totalDuplicatesObserved += initialStats.duplicates;
         pageCount++;
 
-        // Job 72 pattern: server gave us a fully-rendered page with zero
-        // rows AND no next_token to chase. There's nothing to paginate
-        // through and nothing to show — distinct enough from "natural_end"
-        // (which implies we walked at least some real data) that it gets
-        // its own label so operators can spot quiet windows at a glance.
+        // Server gave us a fully-rendered page with zero rows AND no
+        // next_token to chase — there's nothing to paginate through and
+        // nothing to show. This is the only "no next_token" case that
+        // counts as a clean completion; everywhere else a missing
+        // next_token is treated as `token_missing` (failure).
         if (initial.rows.length === 0 && !initial.nextToken) {
             stopReason = 'empty_window';
-            stopReasonSet = true;
         }
 
         // Subsequent pages: pure XHR via APIRequestContext (no clicks).
@@ -153,7 +170,6 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 });
                 abortedDueToTime = true;
                 stopReason = 'time_limit';
-                stopReasonSet = true;
                 nextToken = null;
                 break;
             }
@@ -161,23 +177,27 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             const url = buildLoadMoreUrl(job, nextToken);
             log.debug('load_more', { jobId: job.id, page: pageCount, url });
 
-            const xhr = await apiCtx.get(url, {
-                headers: {
-                    Accept: 'text/javascript, application/javascript, */*; q=0.01',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    Referer: referer,
-                },
-                failOnStatusCode: false,
-                timeout: 30_000,
+            const xhrResult = await loadMoreWithRetry(apiCtx, url, referer, {
+                jobId: job.id,
+                page: pageCount + 1,
+                retryDelaysMs: LOAD_MORE_422_RETRY_DELAYS_MS,
             });
 
-            if (xhr.status() === 422) {
-                log.info('load_more returned 422 — pagination exhausted', { jobId: job.id });
-                stopReason = 'natural_end';
-                stopReasonSet = true;
-                nextToken = null;
-                break;
+            if (xhrResult === '422_exhausted') {
+                // We retried twice with backoffs and BookingExperts is
+                // still rate-limiting us. Surface this as a hard failure
+                // so the operator notices and can lower
+                // MAX_CONCURRENT_SCRAPES — silently completing here would
+                // hide a systemic concurrency problem.
+                stopReason = 'pagination_error';
+                throw new Error(
+                    `BookingExperts returned 422 after ${LOAD_MORE_422_RETRY_DELAYS_MS.length + 1} attempts `
+                        + `(1 initial + ${LOAD_MORE_422_RETRY_DELAYS_MS.length} retries). `
+                        + 'Consider lowering MAX_CONCURRENT_SCRAPES.',
+                );
             }
+
+            const xhr: APIResponse = xhrResult;
             if (xhr.status() === 401 || xhr.status() === 403) {
                 throw new Error(SESSION_EXPIRED_SENTINEL);
             }
@@ -273,13 +293,20 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                         });
                         nextToken = parsed.nextToken;
                     } else {
-                        log.warn('load_more response had no parseable HTML payload — stopping', {
+                        // Hard fail: response shape is unrecognized AND
+                        // pagination state is gone. Pretending this is a
+                        // clean completion would mask a real upstream
+                        // change (BookingExperts revising the load_more
+                        // JS shape). Surface as a destructive badge.
+                        log.error('load_more response had no parseable HTML payload — failing', {
                             jobId: job.id,
                             bodyPreview: previewBody(body, 240),
                         });
                         stopReason = 'unparseable';
-                        stopReasonSet = true;
-                        break;
+                        throw new Error(
+                            'load_more response had no parseable HTML payload and no next_token — '
+                                + 'BookingExperts response shape may have changed.',
+                        );
                     }
                 }
             }
@@ -313,7 +340,12 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 consecutiveAllDuplicatePages >= earlyStopPages
                 && totalDuplicatesObserved >= earlyStopMinDups
             ) {
-                log.info('early-stop: pagination is in already-scraped territory', {
+                // The healthy completion path: pagination has caught up
+                // with already-scraped data. This is the ONLY signal that
+                // means "we're done in the natural sense" — every other
+                // exit condition is either an operator-visible cap or a
+                // hard failure.
+                log.info('early-stop: caught up with already-scraped territory', {
                     jobId: job.id,
                     consecutiveAllDuplicatePages,
                     totalDuplicatesObserved,
@@ -322,7 +354,6 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 nextToken = null;
                 earlyStoppedDueToDuplicates = true;
                 stopReason = 'duplicate_detection';
-                stopReasonSet = true;
                 break;
             }
 
@@ -340,30 +371,35 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     nextTokenPresent: !!nextToken,
                 });
                 if (consecutiveZeroRowPages >= config.MAX_CONSECUTIVE_ZERO_ROW_PAGES) {
-                    log.warn('runaway-safety cap hit: too many consecutive zero-row pages', {
+                    log.error('runaway-safety cap hit: too many consecutive zero-row pages — failing', {
                         jobId: job.id,
                         page: pageCount,
                         consecutive: consecutiveZeroRowPages,
                         lastTokenPrefix: nextToken ? nextToken.slice(0, 12) : null,
                     });
                     stopReason = 'runaway_safety';
-                    stopReasonSet = true;
-                    break;
+                    throw new Error(
+                        `Hit the cap on consecutive zero-row pages (${consecutiveZeroRowPages}); `
+                            + 'BookingExperts is handing out an apparently-infinite quiet window.',
+                    );
                 }
             } else {
                 consecutiveZeroRowPages = 0;
             }
 
-            // Belt-and-suspenders: if the new token equals the one we just
-            // sent, the server is echoing it back. Stop instead of looping.
+            // Belt-and-suspenders: if the new token equals the one we
+            // just sent, the server is echoing it back. Treat as a hard
+            // failure so the operator notices BE pagination has wedged.
             if (nextToken !== null && nextToken === sentToken) {
-                log.warn('pagination appears stuck (next_token did not advance)', {
+                log.error('pagination appears stuck (next_token did not advance) — failing', {
                     jobId: job.id,
                     page: pageCount,
                 });
                 stopReason = 'token_echo';
-                stopReasonSet = true;
-                break;
+                throw new Error(
+                    `BookingExperts handed back the same next_token on page ${pageCount}; `
+                        + 'pagination is stuck.',
+                );
             }
 
             // Redundant with the dedicated ticker started at the top of
@@ -374,15 +410,28 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             await sleep(jitter(200, 800));
         }
 
-        // Loop exit. If nothing inside the loop captured a specific reason,
-        // distinguish "ran out of pages" (token went null) from "hit the
-        // page-cap" (max_pages clamp). Either is a clean exit, but the
-        // operator-visible labels carry different signals: `pagination_limit`
-        // hints that raising the cap might recover more rows; `natural_end`
-        // means we're caught up.
-        if (!stopReasonSet) {
+        // Loop exit fall-through. If nothing inside the loop captured a
+        // specific reason, distinguish:
+        //   - pageCount hit the max_pages cap → `pagination_limit`
+        //     (operator-visible cap, completion).
+        //   - nextToken became null with pages still in budget →
+        //     `token_missing` (anomaly: BookingExperts stopped giving us
+        //     a forward-moving cursor; per the new semantics that's a
+        //     hard failure rather than a clean end).
+        // empty_window (set BEFORE the loop) short-circuits this block —
+        // its initial-page-with-zero-rows case is the one legitimate
+        // "no next_token" completion.
+        if (stopReason === undefined) {
             const maxPages = job.params.max_pages ?? config.MAX_PAGES_PER_JOB;
-            stopReason = pageCount >= maxPages ? 'pagination_limit' : 'natural_end';
+            if (pageCount >= maxPages) {
+                stopReason = 'pagination_limit';
+            } else {
+                stopReason = 'token_missing';
+                throw new Error(
+                    'BookingExperts stopped returning a next_token mid-scrape; '
+                        + 'pagination state lost — treating as anomaly.',
+                );
+            }
         }
 
         const stats: ScrapeResult = {
@@ -409,11 +458,10 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         heartbeatTicker.stop();
         const message = err instanceof Error ? err.message : String(err);
         const isExpired = message === SESSION_EXPIRED_SENTINEL || /sign_in/.test(message);
-        // Laravel's WorkerController::fail() detects this same sentinel on
-        // the server side and writes `stop_reason: session_expired` into
-        // stats; setting it here too keeps scraper logs honest about why
-        // the loop unwound (especially useful for replaying via
-        // `npm run scrape:once`).
+        // session_expired has its own remediation (re-auth via the
+        // extension) and overrides any pre-set reason. Laravel's
+        // WorkerController::fail() also detects the same sentinel on the
+        // server side as a fallback for older worker builds.
         if (isExpired) {
             stopReason = 'session_expired';
             log.warn('session expired — reporting back to Laravel', {
@@ -423,9 +471,24 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             });
             await reportSessionExpired(job.session.id).catch(() => undefined);
         } else {
-            log.error('scrape failed', { jobId: job.id, error: message });
+            log.error('scrape failed', {
+                jobId: job.id,
+                error: message,
+                stopReason: stopReason ?? null,
+            });
         }
-        await failJob(job.id, { error: message, retryable: !isExpired }).catch(() => undefined);
+        // Forward the typed reason so Laravel persists it onto
+        // stats.stop_reason instead of relying on the freeform error
+        // string. Generic failures (no reason captured upstream, no
+        // SESSION_EXPIRED match) pass `stop_reason: undefined`, which
+        // JSON.stringify drops — the server-side fail() then leaves
+        // stats.stop_reason absent (or applies its own SESSION_EXPIRED
+        // fallback if the error string matches the sentinel).
+        await failJob(job.id, {
+            error: message,
+            retryable: !isExpired,
+            stop_reason: stopReason,
+        }).catch(() => undefined);
         throw err;
     } finally {
         // Idempotent — the success/failure paths above already called
@@ -644,6 +707,83 @@ function buildLogsUrl(job: ScrapeJob): string {
     if (job.params.start_time) u.searchParams.set('start_time', job.params.start_time);
     if (job.params.end_time) u.searchParams.set('end_time', job.params.end_time);
     return u.toString();
+}
+
+/**
+ * GET /load_more_logs.js with bounded retries on 422. BookingExperts
+ * uses 422 as a "you're going too fast" signal — a single occurrence
+ * doesn't mean pagination is broken, but if it survives our backoff
+ * schedule we surrender and the caller fails the job so the operator
+ * notices the concurrency cap is too aggressive.
+ *
+ * Return contract:
+ *   - `APIResponse` (status !== 422): caller inspects status as before
+ *     (401/403 → SESSION_EXPIRED, !ok() → generic HTTP failure, ok() →
+ *     proceed with body parsing).
+ *   - `'422_exhausted'`: caller MUST treat this as a hard failure (set
+ *     `stop_reason = 'pagination_error'` and throw). We don't retry
+ *     forever because there's no recovery path a single worker can take
+ *     besides slowing down — and that's an operator decision, not ours.
+ *
+ * Logging:
+ *   - Each transient 422: `warn` with attempt number + next backoff.
+ *   - Final surrender: `error` with the total attempt count.
+ *   - Success on retry: caller emits the normal `load_more batch parsed`
+ *     line, so we don't double-log here.
+ *
+ * Out of scope: this helper deliberately does NOT auto-reduce
+ * concurrency. That's a tunable in `MAX_CONCURRENT_SCRAPES` — silently
+ * dropping concurrency in code would mask the upstream pressure signal.
+ *
+ * Exported so the offline test harness in `scripts/load-more-retry-test.ts`
+ * can drive it with a stub APIRequestContext; no production caller other
+ * than runScrapeJob exists.
+ */
+export async function loadMoreWithRetry(
+    apiCtx: APIRequestContext,
+    url: string,
+    referer: string,
+    opts: { jobId: number; page: number; retryDelaysMs: readonly number[] },
+): Promise<APIResponse | '422_exhausted'> {
+    const { jobId, page, retryDelaysMs } = opts;
+    const maxAttempts = retryDelaysMs.length + 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const xhr = await apiCtx.get(url, {
+            headers: {
+                Accept: 'text/javascript, application/javascript, */*; q=0.01',
+                'X-Requested-With': 'XMLHttpRequest',
+                Referer: referer,
+            },
+            failOnStatusCode: false,
+            timeout: 30_000,
+        });
+
+        if (xhr.status() !== 422) {
+            return xhr;
+        }
+
+        if (attempt < maxAttempts) {
+            const delay = retryDelaysMs[attempt - 1] ?? 0;
+            log.warn('load_more returned 422 — backing off and retrying', {
+                jobId,
+                page,
+                attempt,
+                attemptsRemaining: maxAttempts - attempt,
+                nextDelayMs: delay,
+            });
+            await sleep(delay);
+            continue;
+        }
+
+        log.error('load_more 422 exhausted retries — surrendering', {
+            jobId,
+            page,
+            attempts: maxAttempts,
+        });
+    }
+
+    return '422_exhausted';
 }
 
 function buildLoadMoreUrl(job: ScrapeJob, nextToken: string): string {
