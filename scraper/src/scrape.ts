@@ -11,7 +11,12 @@ import {
     type Response,
 } from 'playwright';
 import { config, BEX_BASE_URLS, type Environment } from './config.js';
-import { extractRowsFromMain, parseLoadMoreResponse, type RawRow } from './extractors.js';
+import {
+    extractRowsFromMain,
+    parseLoadMoreResponse,
+    type InitialPageResult,
+    type RawRow,
+} from './extractors.js';
 import { rowToMessage } from './rowParser.js';
 import { log } from './log.js';
 import { postBatch, completeJob, failJob, heartbeat, reportSessionExpired } from './api.js';
@@ -151,6 +156,25 @@ export interface ScrapeResult {
      * fail or label a job because of this value.
      */
     token_echo_retries: number;
+    /**
+     * Number of extra initial-page attempts spent re-issuing the whole
+     * navigate + extract pipeline because the first try came back empty
+     * (zero rows AND null next_token). Computed as `attempts - 1` of
+     * `loadInitialPageWithRetry`, so:
+     *   - 0    → first attempt already had rows or a forward token
+     *            (the common fast path; the helper fired once).
+     *   - N>0  → N transient-empty attempts before a real render
+     *            recovered the scrape.
+     *   - TOKEN_ECHO_MAX_ATTEMPTS - 1 (default 99) → helper exhausted;
+     *            the job completes with `stop_reason: empty_window`
+     *            legitimately (after 100 attempts, not a 1-attempt
+     *            fast-exit). Paired with the `empty_window` debug
+     *            artifact dumped on exhaust so operators can tell
+     *            "truly empty" from "bot challenge / login bounce".
+     * Not a `stop_reason` on its own — pure observability, same
+     * treatment as `token_echo_retries`.
+     */
+    initial_page_retries: number;
 }
 
 /**
@@ -227,6 +251,17 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     // contributes `TOKEN_ECHO_MAX_ATTEMPTS - 1` (default 99). Surfaced
     // via `stats.token_echo_retries` for diagnostic use only.
     let tokenEchoRetries = 0;
+    // Count of extra initial-page attempts the retry helper spent
+    // before either producing real content (rows OR next_token) or
+    // giving up on the whole window. Computed as `attempts - 1` of
+    // `loadInitialPageWithRetry` so:
+    //   - 0 → first attempt already had data (common fast path).
+    //   - N>0 → N transient-empty retries before recovery.
+    //   - TOKEN_ECHO_MAX_ATTEMPTS - 1 → full exhaust (paired with
+    //     the `empty_window` debug artifact dumped on exhaust).
+    // Surfaced via `stats.initial_page_retries` for diagnostic use
+    // only; same treatment as `token_echo_retries`.
+    let initialPageRetries = 0;
     const earlyStopPages =
         job.params.early_stop_duplicate_pages ?? config.EARLY_STOP_DUPLICATE_PAGES;
     const earlyStopMinDups =
@@ -258,53 +293,157 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         const initialUrl = buildLogsUrl(job);
         log.info('navigating to logs page', { jobId: job.id, url: initialUrl });
 
-        const navResult = await navigateInitialWithSignInRetry(page, initialUrl, job.id);
-        const response = navResult.response;
-        lastDiagnostic = {
-            phase: 'initial',
-            requestUrl: initialUrl,
-            finalUrl: page.url(),
-            status: response.status(),
-            bodyPreview: navResult.bouncedToSignIn
-                ? previewBody(navResult.lastBody)
-                : null,
-        };
+        // Retry the whole navigate + extract pipeline when the first
+        // attempt lands on a fully-rendered-but-empty page (zero rows
+        // AND no next_token). Empirically this is almost always
+        // transient — BE load spikes, a Cloudflare interstitial still
+        // resolving, a cookie-refresh race, delayed hydration after
+        // `domcontentloaded` — and treating it as a clean
+        // `empty_window` exit after a single 800ms attempt throws away
+        // real data. Closure semantics: each call does a fresh
+        // page.goto() (via `navigateInitialWithSignInRetry`, which
+        // itself has the sign_in retry layer nested inside) plus a
+        // fresh DOM extraction; any thrown error (SESSION_EXPIRED,
+        // non-200, network failure) propagates out of the helper
+        // unchanged to the outer catch block. We reuse the
+        // `TOKEN_ECHO_*` knobs here because the mental model is
+        // identical — "keep hitting the button on the flat schedule
+        // until real data arrives or the budget runs out."
+        const initialOutcome = await loadInitialPageWithRetry<{
+            bodyForDump: string;
+            navUrl: string;
+            status: number;
+            diagnostics: InitialPageResult['diagnostics'];
+        }>(
+            async (attempt) => {
+                const navResult = await navigateInitialWithSignInRetry(page, initialUrl, job.id);
+                const response = navResult.response;
+                lastDiagnostic = {
+                    phase: 'initial',
+                    requestUrl: initialUrl,
+                    finalUrl: page.url(),
+                    status: response.status(),
+                    bodyPreview: navResult.bouncedToSignIn
+                        ? previewBody(navResult.lastBody)
+                        : null,
+                };
 
-        if (navResult.bouncedToSignIn) {
-            await dumpDebugArtifact(job.id, 0, navResult.lastBody, 'session_expired', {
-                subscription: job.subscription,
-                pageCount: 0,
-                previousToken: null,
-                url: page.url(),
+                if (navResult.bouncedToSignIn) {
+                    await dumpDebugArtifact(job.id, 0, navResult.lastBody, 'session_expired', {
+                        subscription: job.subscription,
+                        pageCount: 0,
+                        previousToken: null,
+                        url: page.url(),
+                    });
+                    throw new Error(SESSION_EXPIRED_SENTINEL);
+                }
+                if (response.status() >= 400) {
+                    throw new Error(`initial page HTTP ${response.status()}`);
+                }
+
+                const extracted = await page.evaluate(extractRowsFromMain);
+                log.debug('initial extraction diagnostics', {
+                    attempt,
+                    ...extracted.diagnostics,
+                });
+                log.info('initial batch parsed', {
+                    jobId: job.id,
+                    attempt,
+                    rows: extracted.rows.length,
+                    hasNextToken: !!extracted.nextToken,
+                });
+
+                // Only lazy-capture page content when the attempt is
+                // empty — we'll need it if the helper exhausts, but
+                // the common fast-path advance skips the cost entirely.
+                const isEmptyAttempt = extracted.rows.length === 0 && !extracted.nextToken;
+                const bodyForDump = isEmptyAttempt
+                    ? await page.content().catch(() => '<page.content() failed>')
+                    : '';
+
+                return {
+                    rows: extracted.rows,
+                    nextToken: extracted.nextToken,
+                    payload: {
+                        bodyForDump,
+                        navUrl: page.url(),
+                        status: response.status(),
+                        diagnostics: extracted.diagnostics,
+                    },
+                };
+            },
+            {
+                jobId: job.id,
+                maxAttempts: config.TOKEN_ECHO_MAX_ATTEMPTS,
+                delayMs: config.TOKEN_ECHO_RETRY_DELAY_MS,
+                // Same pre-sleep budget check `loadMoreWithTokenEchoRetry`
+                // uses — never oversleep past the per-job boundary.
+                timeBudgetOk: (plannedDelayMs) =>
+                    Date.now() + plannedDelayMs - startedAt < budgetMs,
+            },
+        );
+
+        initialPageRetries = Math.max(0, initialOutcome.attempts - 1);
+
+        // `nextToken` feeds the load_more loop below. It carries the
+        // advanced token only for the `advanced` outcome; `exhausted`
+        // and `budget_aborted` leave it null so the loop short-
+        // circuits, and `stopReason` (set by this block) carries the
+        // completion reason to the post-loop fall-through.
+        let nextToken: string | null = null;
+
+        if (initialOutcome.kind === 'budget_aborted') {
+            log.warn('initial-page retry would exceed time budget — aborting cleanly', {
+                jobId: job.id,
+                attempts: initialOutcome.attempts,
             });
-            throw new Error(SESSION_EXPIRED_SENTINEL);
-        }
-        if (response.status() >= 400) throw new Error(`initial page HTTP ${response.status()}`);
-
-        // First batch: parse the rendered DOM.
-        const initial = await page.evaluate(extractRowsFromMain);
-        log.debug('initial extraction diagnostics', initial.diagnostics);
-        log.info('initial batch parsed', { jobId: job.id, rows: initial.rows.length, hasNextToken: !!initial.nextToken });
-
-        if (initial.rows.length === 0) {
-            log.warn('no rows on initial page — selector resolution may need an update', initial.diagnostics);
-        }
-
-        const initialStats = await flushRows(job, initial.rows, (n) => (rowCount += n), 1);
-        totalDuplicatesObserved += initialStats.duplicates;
-        pageCount++;
-
-        // Server gave us a fully-rendered page with zero rows AND no
-        // next_token to chase — there's nothing to paginate through and
-        // nothing to show. This is the only "no next_token" case that
-        // counts as a clean completion; everywhere else a missing
-        // next_token is treated as `token_missing` (failure).
-        if (initial.rows.length === 0 && !initial.nextToken) {
+            abortedDueToTime = true;
+            stopReason = 'time_limit';
+        } else if (initialOutcome.kind === 'exhausted') {
+            // Every attempt (1 initial + retries) returned zero rows
+            // AND no next_token. This is now a legitimate empty_window
+            // exit — we've given BE every chance the operator
+            // configured and BookingExperts consistently renders
+            // nothing. Dump the final attempt's page body so the first
+            // few production occurrences can be eyeballed: genuinely
+            // empty subscription vs. persistent bot challenge vs. a
+            // subtle login-bounce the sign_in retry layer missed.
+            log.info('initial page exhausted all retries — completing with empty_window', {
+                jobId: job.id,
+                attempts: initialOutcome.attempts,
+            });
+            await dumpDebugArtifact(
+                job.id,
+                0,
+                initialOutcome.result.payload.bodyForDump,
+                'empty_window',
+                {
+                    subscription: job.subscription,
+                    pageCount: 0,
+                    previousToken: null,
+                    url: initialOutcome.result.payload.navUrl,
+                    attempts: initialOutcome.attempts,
+                },
+            );
             stopReason = 'empty_window';
+        } else {
+            // advanced — at least one attempt returned rows OR a
+            // forward-moving next_token. Proceed with the normal flow:
+            // flush whatever rows we got (may be 0 if only the token
+            // advanced), count the initial page, and let the
+            // load_more loop chase the token.
+            const { rows, nextToken: advancedToken } = initialOutcome.result;
+            if (rows.length === 0) {
+                log.warn('no rows on initial page but next_token present — selector may need update', {
+                    jobId: job.id,
+                    diagnostics: initialOutcome.result.payload.diagnostics,
+                });
+            }
+            const initialStats = await flushRows(job, rows, (n) => (rowCount += n), 1);
+            totalDuplicatesObserved += initialStats.duplicates;
+            pageCount++;
+            nextToken = advancedToken;
         }
-
-        // Subsequent pages: pure XHR via APIRequestContext (no clicks).
-        let nextToken = initial.nextToken;
         const apiCtx: APIRequestContext = context.request;
         const referer = page.url();
         // Runaway-safety counter: BE legitimately returns zero-row pages
@@ -759,6 +898,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             total_duplicates: totalDuplicatesObserved,
             stop_reason: stopReason,
             token_echo_retries: tokenEchoRetries,
+            initial_page_retries: initialPageRetries,
         };
         // Stop the liveness ticker before reporting completion so a
         // lingering tick can't land on a row that's about to flip to
@@ -1365,6 +1505,152 @@ export async function loadMoreWithTokenEchoRetry<T>(
 }
 
 /**
+ * One attempt's view of the initial page load, returned by the caller's
+ * `fetchAttempt` closure to `loadInitialPageWithRetry`. The helper
+ * inspects `rows.length` and `nextToken` to decide advance vs retry;
+ * `payload` is the opaque caller-defined blob (typically diagnostics /
+ * final page body) passed back once the helper settles.
+ */
+export interface InitialPageAttempt<T> {
+    rows: RawRow[];
+    nextToken: string | null;
+    payload: T;
+}
+
+/**
+ * Outcome of `loadInitialPageWithRetry`:
+ *
+ *   - `advanced`: the attempt returned `rows.length > 0` OR
+ *     `nextToken !== null`. Either is enough to treat the initial
+ *     page as non-transient; caller proceeds with the normal flow
+ *     (flush rows, walk `next_token` if present).
+ *   - `exhausted`: every attempt (1 initial + retries) returned
+ *     `rows.length === 0` AND `nextToken === null`. Caller completes
+ *     with `stop_reason: empty_window` (legitimate end of the log
+ *     window, after we've given BE every reasonable chance to render
+ *     real data).
+ *   - `budget_aborted`: the helper was about to sleep past the per-
+ *     job time budget (see `timeBudgetOk`). Caller falls through to
+ *     its existing `time_limit` exit.
+ *
+ * `result` always carries the final attempt's data so the caller can
+ * dump it for diagnostics regardless of outcome.
+ */
+export type InitialPageOutcome<T> =
+    | { kind: 'advanced'; attempts: number; result: InitialPageAttempt<T> }
+    | { kind: 'exhausted'; attempts: number; result: InitialPageAttempt<T> }
+    | { kind: 'budget_aborted'; attempts: number; result: InitialPageAttempt<T> };
+
+/**
+ * Retry the caller's `fetchAttempt` closure when the initial page comes
+ * back with zero rows AND no `next_token`. That combination used to
+ * exit the job instantly as `stop_reason: empty_window`, but empirically
+ * the first load can be transient — BE load spikes, a Cloudflare
+ * interstitial that needs a moment to resolve, a cookie-refresh race,
+ * delayed hydration after `domcontentloaded`, etc. "Actually empty"
+ * becomes indistinguishable from any of those on a single attempt, so
+ * we re-issue the whole initial fetch (navigate + extract) on the same
+ * flat schedule we already use for `token_echo`.
+ *
+ * Policy reuses the existing `TOKEN_ECHO_MAX_ATTEMPTS` /
+ * `TOKEN_ECHO_RETRY_DELAY_MS` knobs — same semantics, same operator
+ * mental model, no new env vars. The delay is floored at
+ * `TOKEN_ECHO_MIN_DELAY_MS` (500ms) regardless of caller input; the
+ * offline test harness passes `minDelayMs: 0` for fast
+ * wall-clock-bounded scenarios.
+ *
+ * Advance predicate: `attempt.rows.length > 0 || attempt.nextToken !== null`.
+ * Anything non-empty counts as real data (rows) or a forward cursor
+ * (nextToken) — either is enough to treat the page as genuine and
+ * stop retrying. The caller's normal flow handles both cases
+ * identically to the pre-retry code path.
+ *
+ * Budget: optional `timeBudgetOk(plannedDelayMs)` callback consulted
+ * BEFORE each sleep. Mirrors `loadMoreWithTokenEchoRetry` exactly so
+ * we never oversleep past the per-job budget; on `false` the helper
+ * bails with `budget_aborted` and the caller falls through to its
+ * existing `time_limit` exit. Heartbeat liveness is preserved across
+ * the sleeps because the dedicated ticker runs on its own interval.
+ *
+ * Errors thrown inside `fetchAttempt` (navigation failures, a
+ * SESSION_EXPIRED sentinel, a non-200 HTTP status, etc.) propagate
+ * straight out of this helper unchanged — the existing outer
+ * try/catch handles them exactly as it did before the retry layer
+ * existed. Transient-empty is the only condition we treat as worth
+ * re-issuing the same request for.
+ *
+ * Exported so the offline test harness in
+ * `scripts/initial-page-retry-test.ts` can drive it with a stub
+ * closure; production has no caller other than `runScrapeJob`.
+ */
+export async function loadInitialPageWithRetry<T>(
+    fetchAttempt: (attempt: number) => Promise<InitialPageAttempt<T>>,
+    opts: {
+        jobId: number;
+        maxAttempts: number;
+        delayMs: number;
+        minDelayMs?: number;
+        timeBudgetOk?: (plannedDelayMs: number) => boolean;
+    },
+): Promise<InitialPageOutcome<T>> {
+    const { jobId, maxAttempts } = opts;
+    const minDelayMs = opts.minDelayMs ?? TOKEN_ECHO_MIN_DELAY_MS;
+    const delayMs = Math.max(minDelayMs, opts.delayMs);
+    let last: InitialPageAttempt<T> | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (attempt === 1) {
+            log.info('initial-page retry policy active', {
+                jobId,
+                maxAttempts,
+                delayMs,
+            });
+        }
+
+        last = await fetchAttempt(attempt);
+
+        const hasContent = last.rows.length > 0 || last.nextToken !== null;
+        if (hasContent) {
+            if (attempt > 1) {
+                log.info('initial page recovered after retry', {
+                    jobId,
+                    attempts: attempt,
+                    rows: last.rows.length,
+                    hasNextToken: last.nextToken !== null,
+                });
+            }
+            return { kind: 'advanced', attempts: attempt, result: last };
+        }
+
+        if (attempt < maxAttempts) {
+            if (opts.timeBudgetOk && !opts.timeBudgetOk(delayMs)) {
+                log.warn('initial-page retry would exceed time budget — skipping further sleeps', {
+                    jobId,
+                    attempt,
+                    plannedDelayMs: delayMs,
+                });
+                return { kind: 'budget_aborted', attempts: attempt, result: last };
+            }
+            log.warn('initial page empty (zero rows, no next_token) — retrying after backoff', {
+                jobId,
+                attempt,
+                attemptsRemaining: maxAttempts - attempt,
+                delayMs,
+                reason: 'likely transient: BE load / Cloudflare challenge / cookie race / delayed hydration',
+            });
+            await sleep(delayMs);
+        }
+    }
+
+    log.info('initial-page retries exhausted — treating as empty window', {
+        jobId,
+        attempts: maxAttempts,
+    });
+    // last is non-null because the loop runs at least once (maxAttempts >= 1).
+    return { kind: 'exhausted', attempts: maxAttempts, result: last as InitialPageAttempt<T> };
+}
+
+/**
  * Re-navigate the initial logs page up to `SIGN_IN_RETRY_DELAYS_MS.length`
  * times if BookingExperts bounces us to /sign_in. Returns the final
  * response, whether we ended up bounced, and the rendered body of the
@@ -1548,13 +1834,29 @@ async function dumpLoadMoreResponse(jobId: number, page: number, body: string): 
  * (any unauthed browser sees it), and the directory is bounded by the
  * 14d / 200MB retention guard, so leaving this on is cheap.
  */
-type DumpReason = 'token_missing' | 'unparseable' | 'token_echo' | 'session_expired';
+type DumpReason =
+    | 'token_missing'
+    | 'unparseable'
+    | 'token_echo'
+    | 'session_expired'
+    | 'empty_window';
 
 interface DumpContext {
     subscription: ScrapeJob['subscription'];
     pageCount: number;
     previousToken: string | null;
     url: string;
+    /**
+     * Number of retry attempts the caller made before dumping. Currently
+     * set by the `loadInitialPageWithRetry` exhaustion path so operators
+     * can tell a single-attempt fast-exit apart from a full 100-attempt
+     * grind (the dumped body is the LAST attempt — still empty or a
+     * challenge page — regardless of count). Optional: the legacy
+     * `token_missing`, `unparseable`, `token_echo`, `session_expired`
+     * dump sites don't carry a meaningful retry count at their call
+     * point and pass nothing.
+     */
+    attempts?: number;
 }
 
 /**
@@ -1615,6 +1917,7 @@ async function dumpDebugArtifact(
             timestamp: new Date().toISOString(),
             url: context.url,
             previewBody: previewBody(body),
+            ...(context.attempts !== undefined ? { attempts: context.attempts } : {}),
         };
 
         await writeFile(htmlFile, body, 'utf8');

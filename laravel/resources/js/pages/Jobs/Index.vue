@@ -90,6 +90,18 @@ type ScrapeJobStats = {
      * exhausting?" tuning.
      */
     token_echo_retries?: number;
+    /**
+     * Diagnostic counter from `loadInitialPageWithRetry` (scraper).
+     * Mirrors `token_echo_retries` in spirit: non-zero means the initial
+     * page came back empty on attempt 1 and we had to re-issue the
+     * navigate + extract pipeline N times before real data showed up
+     * (transient BE load / Cloudflare challenge / cookie race).
+     * `TOKEN_ECHO_MAX_ATTEMPTS - 1` means the helper exhausted and the
+     * job legitimately completes as `empty_window` (rendered in the
+     * `empty_window` tooltip as "after N retries"). Visible in the
+     * Stats dialog as a dedicated line; not surfaced as a badge.
+     */
+    initial_page_retries?: number;
     stop_reason?: StopReason;
     [key: string]: unknown;
 };
@@ -232,7 +244,7 @@ const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
     empty_window: {
         label: 'No activity',
         variant: 'secondary',
-        description: 'Initial page had zero rows and no next_token to chase — nothing to scrape.',
+        description: 'Initial page had zero rows and no next_token to chase after every retry in the initial-page policy exhausted (see initial_page_retries in the stats dialog; at defaults, 100 attempts × 3s ≈ 5 min of sleep). Nothing to scrape in this log window.',
     },
     pagination_limit: {
         label: 'Pagination limit',
@@ -300,6 +312,35 @@ function jobStopReason(job: Job): StopReason | null {
     }
 
     return null;
+}
+
+// Dynamic badge tooltip: base `description` from STOP_REASON_META plus
+// any reason-specific diagnostic suffix. Currently only `empty_window`
+// opts in — the initial-page retry policy is the whole point of that
+// label now, so the operator should see at a glance whether the "No
+// activity" badge was a 1-attempt fast-exit or a full 100-attempt
+// grind. (Pre-retry-layer jobs had `initial_page_retries` absent; they
+// fall through to the plain description, which still reads correctly.)
+function stopReasonTooltip(job: Job): string {
+    const reason = jobStopReason(job);
+
+    if (!reason) {
+        return '';
+    }
+
+    const base = STOP_REASON_META[reason].description;
+
+    if (reason === 'empty_window') {
+        const retries = job.stats?.initial_page_retries;
+
+        if (typeof retries === 'number') {
+            const suffix = retries === 1 ? '1 retry' : `${retries} retries`;
+
+            return `No activity (after ${suffix}). ${base}`;
+        }
+    }
+
+    return base;
 }
 
 function refresh() {
@@ -755,7 +796,7 @@ const Field = defineComponent({
                                             v-if="jobStopReason(job)"
                                             :variant="STOP_REASON_META[jobStopReason(job)!].variant"
                                             class="font-normal"
-                                            :title="STOP_REASON_META[jobStopReason(job)!].description"
+                                            :title="stopReasonTooltip(job)"
                                         >
                                             {{ STOP_REASON_META[jobStopReason(job)!].label }}
                                         </Badge>
@@ -917,7 +958,7 @@ const Field = defineComponent({
                                 {{ STOP_REASON_META[jobStopReason(focused)!].label }}
                             </Badge>
                             <span class="text-muted-foreground text-xs">
-                                {{ STOP_REASON_META[jobStopReason(focused)!].description }}
+                                {{ stopReasonTooltip(focused) }}
                             </span>
                         </div>
                     </Field>
@@ -962,6 +1003,20 @@ const Field = defineComponent({
                             <span class="tabular-nums">{{ jobRowCounts(focused).inserted ?? 0 }}</span>
                             <span class="text-muted-foreground">Duplicates</span>
                             <span class="tabular-nums">{{ jobRowCounts(focused).duplicates }}</span>
+                            <template v-if="typeof focused.stats?.initial_page_retries === 'number'">
+                                <span
+                                    class="text-muted-foreground"
+                                    title="Number of extra initial-page attempts the scraper spent re-issuing navigate+extract because the first try came back empty. 0 = fast path; high values mean BE served a transient-empty / challenge page repeatedly."
+                                >Initial-page retries</span>
+                                <span class="tabular-nums">{{ focused.stats?.initial_page_retries ?? 0 }}</span>
+                            </template>
+                            <template v-if="typeof focused.stats?.token_echo_retries === 'number'">
+                                <span
+                                    class="text-muted-foreground"
+                                    title="Wasted echo attempts absorbed by loadMoreWithTokenEchoRetry. 0 = helper never fired; high values = BE held at the live tip across most of the scrape (consistent with Caught up (live tip))."
+                                >Token-echo retries</span>
+                                <span class="tabular-nums">{{ focused.stats?.token_echo_retries ?? 0 }}</span>
+                            </template>
                         </div>
                         <small class="text-muted-foreground block mb-2 text-[11px]">
                             Retrieved = rows POSTed to <code class="text-[11px]">…/batch</code> after in-batch dedup.

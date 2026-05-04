@@ -348,6 +348,19 @@ class WorkerController extends Controller
             // helper fired on a given run. Not surfaced in any badge —
             // pure observability.
             'token_echo_retries' => 'nullable|integer|min:0',
+            // Diagnostic counter for the initial-page retry helper (see
+            // `loadInitialPageWithRetry` in `scraper/src/scrape.ts`).
+            // Mirrors `token_echo_retries` in purpose: zero means the
+            // first attempt returned real data (fast path), a non-zero
+            // value means BE handed us an empty initial page N times
+            // before a real render arrived, `TOKEN_ECHO_MAX_ATTEMPTS - 1`
+            // means the helper exhausted and the job legitimately
+            // completes as `empty_window`. Not surfaced in any badge
+            // directly — the Jobs UI renders it as a line in the Stats
+            // dialog and mentions it in the `empty_window` badge
+            // tooltip so operators can tell a single-attempt fast-exit
+            // apart from a full 100-attempt grind.
+            'initial_page_retries' => 'nullable|integer|min:0',
             'stop_reason' => ['nullable', 'string', 'in:'.implode(',', self::STOP_REASONS)],
         ]);
 

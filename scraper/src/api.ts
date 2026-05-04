@@ -69,6 +69,15 @@ export async function completeJob(
         // given run vs. wasn't exercised. The Laravel /complete validator
         // accepts this key explicitly.
         token_echo_retries?: number;
+        // Diagnostic counter for the initial-page retry layer (mirrors
+        // `token_echo_retries`). Always sent, even when 0, so the
+        // operator can tell at a glance whether the helper fired on a
+        // given run — zero across many `empty_window` completions would
+        // flag that the retry loop somehow isn't arming; non-zero
+        // values confirm we walked the full policy before declaring the
+        // window empty. The Laravel /complete validator accepts this
+        // key explicitly.
+        initial_page_retries?: number;
     },
 ): Promise<void> {
     const res = await fetch(url(`/api/worker/jobs/${jobId}/complete`), {

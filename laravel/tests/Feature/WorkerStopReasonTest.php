@@ -119,6 +119,71 @@ class WorkerStopReasonTest extends TestCase
         $this->assertSame(2, (int) ($this->job->stats['token_echo_retries'] ?? -1));
     }
 
+    public function test_complete_accepts_empty_window_with_initial_page_retries_counter(): void
+    {
+        // Post-retry-layer `empty_window` completion: the scraper's
+        // `loadInitialPageWithRetry` exhausted `TOKEN_ECHO_MAX_ATTEMPTS`
+        // attempts (default 100) of `rows.length === 0 && nextToken === null`
+        // and gave up. The diagnostic counter `initial_page_retries`
+        // rides along on /complete so the operator can tell a 1-attempt
+        // fast-exit apart from a full 100-attempt grind by reading the
+        // Stats dialog (the `empty_window` tooltip also surfaces it).
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 0,
+                'duration_ms' => 297_500,
+                'aborted_due_to_time' => false,
+                'initial_page_retries' => 99,
+                'stop_reason' => 'empty_window',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
+        $this->assertSame('empty_window', $this->job->stats['stop_reason'] ?? null);
+        $this->assertSame(99, (int) ($this->job->stats['initial_page_retries'] ?? -1));
+    }
+
+    public function test_complete_accepts_zero_initial_page_retries_fast_path(): void
+    {
+        // Common path: the first attempt already surfaced real data,
+        // so `loadInitialPageWithRetry` exits on attempt 1 and the
+        // worker sends `initial_page_retries: 0`. Validator must
+        // accept 0 (not treat `>= 1` as required) so the counter is
+        // populated on every completion regardless of outcome.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 8,
+                'duration_ms' => 12_000,
+                'initial_page_retries' => 0,
+                'stop_reason' => 'caught_up',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
+        $this->assertSame(0, (int) ($this->job->stats['initial_page_retries'] ?? -1));
+    }
+
+    public function test_complete_rejects_negative_initial_page_retries(): void
+    {
+        // Defensive: the counter is `max(0, attempts - 1)` in the
+        // scraper, so the only way a negative value reaches Laravel
+        // is a crafted request or a future refactor bug. The `min:0`
+        // validator catches it before it lands in `stats`.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 1,
+                'duration_ms' => 100,
+                'initial_page_retries' => -1,
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['initial_page_retries']);
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_RUNNING, $this->job->status);
+    }
+
     public function test_complete_rejects_retired_token_echo_reason(): void
     {
         // `token_echo` was retired in favor of `caught_up`. The scraper
