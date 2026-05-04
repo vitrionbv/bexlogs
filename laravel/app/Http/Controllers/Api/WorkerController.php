@@ -231,18 +231,51 @@ class WorkerController extends Controller
         [$stored, $mergedStats] = DB::transaction(function () use ($job, $rows, $receivedInBatch, $pagesProcessed) {
             $locked = ScrapeJob::query()->whereKey($job->id)->lockForUpdate()->firstOrFail();
 
+            // Use the Query Builder's insertOrIgnore — NOT Eloquent's
+            // upsert(). Eloquent's `Builder::upsert` calls
+            // `addUpdatedAtToUpsertColumns()` which silently appends
+            // `updated_at` to the update list whenever the model uses
+            // timestamps. The Query Builder then sees a non-empty update
+            // list and compiles to `ON CONFLICT (...) DO UPDATE SET
+            // updated_at = excluded.updated_at` — Postgres reports
+            // `affected_rows = inserts + updates`, so the returned row
+            // count would equal `count($rows)` regardless of how many
+            // were genuinely new. That breaks the scraper's
+            // duplicate-detection early-stop (which fires only when
+            // `pageReceived > 0 && pageInserted === 0` per batch
+            // response) and inflates `rows_inserted` to match
+            // `rows_received` on every overlap scrape.
+            //
+            // `insertOrIgnore` compiles to `ON CONFLICT DO NOTHING` on
+            // Postgres (relies on the existing
+            // `log_messages_page_content_hash_idx` unique index) and to
+            // `INSERT OR IGNORE` on SQLite. PDO's `rowCount()` returns
+            // the genuinely-new insert count on both drivers — exactly
+            // the semantic the early-stop logic needs. The DB::raw
+            // bytea bind for `content_hash` survives because
+            // insertOrIgnore doesn't re-process row values; it just
+            // parameterizes them through the same Grammar path the
+            // upsert call used.
             $stored = empty($rows)
                 ? 0
-                : LogMessage::query()->upsert(
-                    $rows,
-                    ['page_id', 'content_hash'],
-                    [] // never overwrite existing — dedup only
-                );
+                : DB::table('log_messages')->insertOrIgnore($rows);
+
+            // Use the in-batch deduped count (count($rows) == $receivedInBatch),
+            // not the raw $data['messages'] count. The collection above
+            // already collapses identical-payload rows in this same batch
+            // via ->unique(page_id|hash) — those in-batch dups aren't
+            // cross-run duplicates and shouldn't be double-counted in
+            // total_duplicates. This counter measures only what the
+            // (page_id, content_hash) unique index rejected at insert
+            // time, which IS the cross-batch / cross-run dedup signal
+            // the scraper's early-stop and the Jobs UI care about.
+            $duplicates = max(0, $receivedInBatch - (int) $stored);
 
             $prev = $locked->stats ?? [];
             $merged = array_merge($prev, [
                 'rows_received' => (int) ($prev['rows_received'] ?? 0) + $receivedInBatch,
                 'rows_inserted' => (int) ($prev['rows_inserted'] ?? 0) + (int) $stored,
+                'total_duplicates' => (int) ($prev['total_duplicates'] ?? 0) + $duplicates,
                 'batches' => (int) ($prev['batches'] ?? 0) + 1,
                 'last_batch_at' => now()->toIso8601String(),
             ]);
