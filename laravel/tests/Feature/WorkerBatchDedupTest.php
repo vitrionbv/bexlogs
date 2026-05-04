@@ -305,5 +305,4 @@ class WorkerBatchDedupTest extends TestCase
             ->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/batch", $body);
     }
-
 }
