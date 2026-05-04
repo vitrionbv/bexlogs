@@ -10,6 +10,7 @@
         "dev": "tsx src/index.ts",
         "scrape:once": "tsx src/cli/scrapeOnce.ts",
         "lint": "eslint src --ext .ts",
+        "test": "tsx scripts/parse-fixtures.ts && tsx scripts/heartbeat-ticker-test.ts",
         "typecheck": "tsc --noEmit"
     },
     "dependencies": {

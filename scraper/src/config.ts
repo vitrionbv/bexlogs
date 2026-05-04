@@ -5,6 +5,14 @@ const envSchema = z.object({
     LARAVEL_BASE_URL: z.string().url(),
     WORKER_API_TOKEN: z.string().min(8),
     POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+    // Cadence for the per-job liveness ticker that POSTs to
+    // /api/worker/jobs/{id}/heartbeat independently of batch flushes. Must
+    // stay comfortably below Laravel's `scrape:reap-stale --minutes`
+    // threshold (default 3 minutes); the default 30s leaves ~6x slack so a
+    // single missed tick doesn't trigger a false reap. If an operator
+    // wants to reduce heartbeat load, raise the reaper threshold rather
+    // than this knob — that's the safer direction.
+    HEARTBEAT_INTERVAL_MS: z.coerce.number().int().positive().default(30000),
     MAX_CONCURRENT_SCRAPES: z.coerce.number().int().positive().default(8),
     MAX_PAGES_PER_JOB: z.coerce.number().int().positive().default(2000),
     BATCH_SIZE: z.coerce.number().int().positive().default(100),

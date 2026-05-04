@@ -1,15 +1,35 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium, type APIRequestContext, type Browser, type BrowserContext, type Page } from 'playwright';
+import {
+    chromium,
+    type APIRequestContext,
+    type APIResponse,
+    type Browser,
+    type BrowserContext,
+    type Page,
+} from 'playwright';
 import { config, BEX_BASE_URLS, type Environment } from './config.js';
 import { extractRowsFromMain, parseLoadMoreResponse, type RawRow } from './extractors.js';
 import { rowToMessage } from './rowParser.js';
 import { log } from './log.js';
 import { postBatch, completeJob, failJob, heartbeat, reportSessionExpired } from './api.js';
+import { startHeartbeatTicker } from './heartbeat.js';
 import type { ParsedLogMessage, ScrapeJob, StopReason } from './types.js';
 
 const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
+
+/**
+ * Backoff schedule (ms between attempts) for /load_more_logs.js when
+ * BookingExperts replies with 422. The user-facing semantics: 422 means
+ * we're hitting BE too hard (rate limit / concurrency cap), so a single
+ * 422 isn't a job-killer — but if it survives a 2s and a 5s pause we
+ * surrender and fail the job so the operator notices and lowers
+ * MAX_CONCURRENT_SCRAPES. Total wall-clock cost on full exhaustion:
+ * 7s + the three HTTP round-trips themselves (well within the 30s per-
+ * request timeout, well below the 3-min reaper threshold).
+ */
+const LOAD_MORE_422_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
 
 const DEBUG_DUMP_DIR = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -45,19 +65,26 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     const budgetMs = (job.params.max_duration_minutes ?? 10) * 60_000;
     const env = job.subscription.environment;
 
+    // Start the liveness ticker the moment the job is picked up, BEFORE
+    // chromium.launch(). Browser startup, slow page loads, and quiet
+    // pagination windows don't flush batches, so without a dedicated
+    // ticker the row's `last_heartbeat_at` would drift past the reaper's
+    // 3-minute threshold (see `app/Console/Commands/ScrapeReapStale.php`)
+    // and a perfectly alive job would be falsely failed.
+    const heartbeatTicker = startHeartbeatTicker(job.id);
+
     let browser: Browser | null = null;
     let context: BrowserContext | null = null;
     let pageCount = 0;
     let rowCount = 0;
     let abortedDueToTime = false;
-    // Track which break/return path the main loop exits through. Default
-    // to `natural_end` so a clean fall-through (nextToken === null with no
-    // earlier reason set) reports the boring "we ran out of pages" case.
-    // `stopReasonSet` distinguishes an explicit assignment from the default
-    // — needed to tell `natural_end` (token went null) from `pagination_limit`
-    // (loop condition exit while a token is still in hand).
-    let stopReason: StopReason = 'natural_end';
-    let stopReasonSet = false;
+    // Tracks which break/return path the main loop took. `undefined` until
+    // a branch sets it explicitly: the post-loop fall-through then decides
+    // between the two ambiguous cases (pagination_limit vs token_missing)
+    // by inspecting pageCount/maxPages. The catch block forwards whatever
+    // is set when the job fails so failJob can persist a typed reason
+    // alongside the freeform error message.
+    let stopReason: StopReason | undefined;
     // Early-stop tracking: count how many consecutive load_more pages came
     // back as 100% duplicates (received > 0 && inserted === 0), and the
     // running total of (received - inserted) across the whole job. The
@@ -111,14 +138,13 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         totalDuplicatesObserved += initialStats.duplicates;
         pageCount++;
 
-        // Job 72 pattern: server gave us a fully-rendered page with zero
-        // rows AND no next_token to chase. There's nothing to paginate
-        // through and nothing to show — distinct enough from "natural_end"
-        // (which implies we walked at least some real data) that it gets
-        // its own label so operators can spot quiet windows at a glance.
+        // Server gave us a fully-rendered page with zero rows AND no
+        // next_token to chase — there's nothing to paginate through and
+        // nothing to show. This is the only "no next_token" case that
+        // counts as a clean completion; everywhere else a missing
+        // next_token is treated as `token_missing` (failure).
         if (initial.rows.length === 0 && !initial.nextToken) {
             stopReason = 'empty_window';
-            stopReasonSet = true;
         }
 
         // Subsequent pages: pure XHR via APIRequestContext (no clicks).
@@ -144,7 +170,6 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 });
                 abortedDueToTime = true;
                 stopReason = 'time_limit';
-                stopReasonSet = true;
                 nextToken = null;
                 break;
             }
@@ -152,23 +177,27 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             const url = buildLoadMoreUrl(job, nextToken);
             log.debug('load_more', { jobId: job.id, page: pageCount, url });
 
-            const xhr = await apiCtx.get(url, {
-                headers: {
-                    Accept: 'text/javascript, application/javascript, */*; q=0.01',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    Referer: referer,
-                },
-                failOnStatusCode: false,
-                timeout: 30_000,
+            const xhrResult = await loadMoreWithRetry(apiCtx, url, referer, {
+                jobId: job.id,
+                page: pageCount + 1,
+                retryDelaysMs: LOAD_MORE_422_RETRY_DELAYS_MS,
             });
 
-            if (xhr.status() === 422) {
-                log.info('load_more returned 422 — pagination exhausted', { jobId: job.id });
-                stopReason = 'natural_end';
-                stopReasonSet = true;
-                nextToken = null;
-                break;
+            if (xhrResult === '422_exhausted') {
+                // We retried twice with backoffs and BookingExperts is
+                // still rate-limiting us. Surface this as a hard failure
+                // so the operator notices and can lower
+                // MAX_CONCURRENT_SCRAPES — silently completing here would
+                // hide a systemic concurrency problem.
+                stopReason = 'pagination_error';
+                throw new Error(
+                    `BookingExperts returned 422 after ${LOAD_MORE_422_RETRY_DELAYS_MS.length + 1} attempts `
+                        + `(1 initial + ${LOAD_MORE_422_RETRY_DELAYS_MS.length} retries). `
+                        + 'Consider lowering MAX_CONCURRENT_SCRAPES.',
+                );
             }
+
+            const xhr: APIResponse = xhrResult;
             if (xhr.status() === 401 || xhr.status() === 403) {
                 throw new Error(SESSION_EXPIRED_SENTINEL);
             }
@@ -264,13 +293,19 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                         });
                         nextToken = parsed.nextToken;
                     } else {
-                        log.warn('load_more response had no parseable HTML payload — stopping', {
+                        // Hard fail: the response shape is unrecognized and
+                        // pagination state is gone. Pretending this is a
+                        // clean completion would mask a real upstream change
+                        // (BookingExperts revising the load_more JS shape).
+                        log.error('load_more response had no parseable HTML payload — failing', {
                             jobId: job.id,
                             bodyPreview: previewBody(body, 240),
                         });
                         stopReason = 'unparseable';
-                        stopReasonSet = true;
-                        break;
+                        throw new Error(
+                            'load_more response had no parseable HTML payload and no next_token — '
+                                + 'BookingExperts response shape may have changed.',
+                        );
                     }
                 }
             }
@@ -357,6 +392,10 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 break;
             }
 
+            // Redundant with the dedicated ticker started at the top of
+            // runScrapeJob — kept as a cheap belt-and-suspenders for the
+            // exact moment a long batch flush completes. The ticker in
+            // `heartbeat.ts` is the authoritative source of liveness.
             await heartbeat(job.id).catch(() => undefined);
             await sleep(jitter(200, 800));
         }
@@ -381,10 +420,19 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             total_duplicates: totalDuplicatesObserved,
             stop_reason: stopReason,
         };
+        // Stop the liveness ticker before reporting completion so a
+        // lingering tick can't land on a row that's about to flip to
+        // `completed` (would be harmless — the reaper only touches
+        // `running` rows — but it keeps the contract clean).
+        heartbeatTicker.stop();
         await completeJob(job.id, stats);
         log.info('scrape complete', { jobId: job.id, ...stats });
         return stats;
     } catch (err) {
+        // Same logic as the success path: stop the ticker before reporting
+        // failure so we don't backstamp `last_heartbeat_at` after the row
+        // has been flipped to `failed`.
+        heartbeatTicker.stop();
         const message = err instanceof Error ? err.message : String(err);
         const isExpired = message === SESSION_EXPIRED_SENTINEL || /sign_in/.test(message);
         // Laravel's WorkerController::fail() detects this same sentinel on
@@ -406,6 +454,11 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         await failJob(job.id, { error: message, retryable: !isExpired }).catch(() => undefined);
         throw err;
     } finally {
+        // Idempotent — the success/failure paths above already called
+        // stop() before reporting completion. This is the safety net for
+        // any path that bypasses both (synchronous throws before we even
+        // reach the try/catch terminals, future refactors, etc.).
+        heartbeatTicker.stop();
         await context?.close().catch(() => undefined);
         await browser?.close().catch(() => undefined);
     }

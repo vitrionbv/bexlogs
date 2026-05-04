@@ -152,6 +152,33 @@ sudo ufw status verbose
 
 ---
 
+## Scrape job liveness — heartbeats and the reaper
+
+Two cooperating knobs keep the system honest about which `running` scrape
+jobs are actually alive:
+
+| knob                                                                | where                                  | default | why                                                                                          |
+|---------------------------------------------------------------------|----------------------------------------|---------|----------------------------------------------------------------------------------------------|
+| `HEARTBEAT_INTERVAL_MS` (Node scraper, per-job ticker)              | `scraper/.env` / `scraper/src/config.ts` | `30000` | The scraper POSTs to `/api/worker/jobs/{id}/heartbeat` at this cadence for every in-flight job. |
+| `--minutes` on `scrape:reap-stale` (Laravel scheduler, every minute) | `laravel/routes/console.php`           | `3`     | Any `running` row whose `last_heartbeat_at` is older than this is flipped to `failed`.       |
+
+The 6× ratio (180 s threshold ÷ 30 s tick) is deliberate: a single missed
+tick from a transient network blip or a Laravel restart doesn't trigger a
+false reap, and a hung worker still gets cleaned up within ~3 minutes so
+`scrape:enqueue` can put a fresh queued row in its place.
+
+If a long-running scrape ever gets falsely reaped, **raise the reaper
+threshold rather than lowering the scraper's tick rate**. The reaper is
+the safer knob — a slower reap is just delayed recovery; a stale liveness
+threshold can falsely fail a live job mid-pagination. The interval is
+plumbed through `Schedule::command('scrape:reap-stale')` in
+`routes/console.php` (passing `['--minutes' => 5]` is a one-line change).
+
+The 30 s tick × 8 concurrent jobs ceiling is ~16 req/min against
+`/api/worker/jobs/{id}/heartbeat` — negligible load, no rate-limit needed.
+
+---
+
 ## Updating
 
 **Just push to `main`.** The runner does the rest. If you need to redeploy

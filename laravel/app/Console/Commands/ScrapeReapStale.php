@@ -10,12 +10,25 @@ use Illuminate\Support\Facades\Log;
 /**
  * Reap `running` scrape_jobs whose worker died mid-flight.
  *
- * The Node Playwright worker heartbeats `last_heartbeat_at` on every
- * batch POST + dedicated /heartbeat hits. When the Docker stack
- * redeploys (or the worker container is OOM-killed) the row it was
- * processing stays `running` forever — and ScrapeEnqueue refuses to
- * queue a fresh job while one is still `running`, so the subscription
- * silently stops updating.
+ * Source of truth for `last_heartbeat_at` freshness is the Node
+ * scraper's per-job heartbeat ticker (see `scraper/src/heartbeat.ts`
+ * + `runScrapeJob()` in `scraper/src/scrape.ts`). It fires every
+ * `HEARTBEAT_INTERVAL_MS` (default 30 s) for the entire lifetime of
+ * an in-flight job — covering browser startup, slow page loads, and
+ * quiet pagination windows where no batch flush would otherwise
+ * refresh the column. The default 3-minute reaper threshold below
+ * leaves ~6× slack so a single missed tick (transient network blip)
+ * doesn't trigger a false reap.
+ *
+ * If you find yourself wanting to reduce heartbeat load, raise this
+ * threshold rather than lower the scraper's tick rate — the reaper
+ * is the safer knob (a slow reap is just delayed recovery; a stale
+ * threshold can falsely fail a live job).
+ *
+ * When the Docker stack redeploys (or the worker container is
+ * OOM-killed) the row it was processing stays `running` forever —
+ * and ScrapeEnqueue refuses to queue a fresh job while one is still
+ * `running`, so the subscription silently stops updating.
  *
  * Running this every minute via the scheduler unwedges those rows by
  * flipping them to `failed` so the next `scrape:enqueue` tick can put

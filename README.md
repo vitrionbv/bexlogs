@@ -132,4 +132,9 @@ Live updates flow over private channels:
 ```
 LARAVEL_BASE_URL=http://localhost:8000
 WORKER_API_TOKEN=  # must match laravel/.env
+
+# How often each in-flight job pings /api/worker/jobs/{id}/heartbeat (ms).
+# Must stay below the `scrape:reap-stale --minutes` threshold (default 3 min).
+# See deploy/README.md → "Scrape job liveness — heartbeats and the reaper".
+HEARTBEAT_INTERVAL_MS=30000
 ```
