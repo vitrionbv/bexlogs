@@ -10,6 +10,7 @@ use App\Services\BookingExpertsClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class BexSessionController extends Controller
 {
@@ -27,8 +28,22 @@ class BexSessionController extends Controller
      *     account_email) pair, we UPDATE that row in place: new cookies,
      *     clear expired_at, bump last_validated_at, and broadcast a
      *     BexSessionRelinked event. No new row is created.
-     *   - Otherwise (no match, or no extractable email) we INSERT a fresh
-     *     row — this is the first-time-link path and the "user switched
+     *   - **Empty-email back-fill** (added after the email extractor was
+     *     fixed): if no email match is found AND there's exactly one
+     *     expired row in (user_id, environment) whose `account_email`
+     *     is empty/null, treat that row as the relink target and
+     *     populate its email. This is what rescues the orphan rows
+     *     captured before the BookingExpertsClient extractor reliably
+     *     returned an email — without it, the operator's first
+     *     re-auth after the fix produces a duplicate row alongside
+     *     the email-less ghost.
+     *     Guard: if there are *multiple* email-less rows we refuse to
+     *     pick one (could be a real cross-account collision the
+     *     operator wants to triage by hand) and fall back to the
+     *     INSERT branch.
+     *   - Otherwise (no match, no email-less back-fill candidate, or
+     *     no extractable email at all) we INSERT a fresh row — this
+     *     is the first-time-link path and the "user switched
      *     BookingExperts accounts" path.
      *
      * This makes "re-authenticate an expired session" reuse the original
@@ -82,6 +97,37 @@ class BexSessionController extends Controller
                     ->where('account_email', $probe['email'])
                     ->orderByDesc('captured_at')
                     ->first();
+            }
+
+            // Empty-email back-fill: pre-extractor rows have
+            // account_email='' and would otherwise be orphaned by the
+            // strict (user_id, environment, account_email) match key.
+            // Only collapse when (a) the new probe has a real email,
+            // (b) the orphan candidate is expired, and (c) there's
+            // exactly one such candidate — multiple empty-email rows
+            // could be ambiguous identities the operator wants to
+            // triage by hand.
+            if (! $existing && ! empty($probe['email'])) {
+                $emptyEmailCandidates = BexSession::query()
+                    ->where('user_id', $token->user_id)
+                    ->where('environment', $token->environment)
+                    ->where(function ($q) {
+                        $q->whereNull('account_email')->orWhere('account_email', '');
+                    })
+                    ->whereNotNull('expired_at')
+                    ->orderByDesc('captured_at')
+                    ->get();
+
+                if ($emptyEmailCandidates->count() === 1) {
+                    $existing = $emptyEmailCandidates->first();
+                } elseif ($emptyEmailCandidates->count() > 1) {
+                    Log::warning('bex relink: multiple empty-email rows in bucket; refusing to merge identities, falling back to INSERT', [
+                        'user_id' => $token->user_id,
+                        'environment' => $token->environment,
+                        'candidate_ids' => $emptyEmailCandidates->pluck('id')->all(),
+                        'incoming_email' => $probe['email'],
+                    ]);
+                }
             }
 
             if ($existing) {

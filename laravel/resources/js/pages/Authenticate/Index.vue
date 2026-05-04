@@ -39,6 +39,13 @@ import {
 import { useExtension } from '@/composables/useExtension';
 import { useUserChannel } from '@/composables/useRealtime';
 
+interface CookieTtlSummary {
+    label: string;
+    tone: 'success' | 'warning' | 'destructive' | 'outline';
+    expires_at: string | null;
+    kind: 'absolute' | 'session' | 'expired' | 'unknown';
+}
+
 interface BexSessionRow {
     id: number;
     environment: 'production' | 'staging';
@@ -49,12 +56,13 @@ interface BexSessionRow {
     expired_at: string | null;
     is_active: boolean;
     cookie_count: number;
-    earliest_cookie_expiry: string | null;
+    cookie_ttl: CookieTtlSummary;
 }
 
 defineProps<{
     sessions: BexSessionRow[];
     environments: ('production' | 'staging')[];
+    prunable_count: number;
 }>();
 
 defineOptions({
@@ -299,9 +307,58 @@ async function validateNow(session: BexSessionRow) {
 
         const data = await res.json();
         toast[data.result?.is_active ? 'success' : 'warning'](data.result?.message ?? 'Validated');
-        router.reload({ only: ['sessions', 'jobSummary'] });
+        router.reload({ only: ['sessions', 'jobSummary', 'prunable_count'] });
     } finally {
         validating.value = { ...validating.value, [session.id]: false };
+    }
+}
+
+const pruning = ref(false);
+
+/**
+ * Trigger BexSessionPruner::pruneForUser. Only deletes orphan rows —
+ * sessions with a different account_email are left untouched (see
+ * the service's match rules). Confirmed because it's a destructive
+ * one-click action and the operator might mis-click on the way to
+ * "Re-authenticate".
+ */
+async function pruneStaleSessions() {
+    if (pruning.value) {
+        return;
+    }
+
+    if (!confirm('Delete every expired BexSession that the validator considers an orphan? Different-account sessions are kept.')) {
+        return;
+    }
+
+    pruning.value = true;
+
+    try {
+        const res = await fetch('/authenticate/stale-sessions', {
+            method: 'DELETE',
+            headers: {
+                Accept: 'application/json',
+                'X-CSRF-TOKEN': csrf(),
+            },
+        });
+
+        if (!res.ok) {
+            toast.error('Could not prune sessions');
+
+            return;
+        }
+
+        const data = (await res.json()) as { deleted_count: number };
+
+        if (data.deleted_count === 0) {
+            toast.info('No orphan sessions to prune.');
+        } else {
+            toast.success(`Pruned ${data.deleted_count} orphan session${data.deleted_count === 1 ? '' : 's'}.`);
+        }
+
+        router.reload({ only: ['sessions', 'jobSummary', 'prunable_count'] });
+    } finally {
+        pruning.value = false;
     }
 }
 
@@ -333,26 +390,20 @@ return `${hr}h ago`;
     return d.toLocaleDateString();
 }
 
-function expiryHint(iso: string | null): { label: string; tone: 'success' | 'warning' | 'destructive' } | null {
-    if (!iso) {
-return null;
-}
-
-    const ms = new Date(iso).getTime() - Date.now();
-
-    if (ms <= 0) {
-return { label: 'cookies expired', tone: 'destructive' };
-}
-
-    const day = ms / (1000 * 60 * 60 * 24);
-
-    if (day < 1) {
-        const hr = Math.max(1, Math.round(ms / (1000 * 60 * 60)));
-
-        return { label: `cookies expire in ${hr}h`, tone: 'warning' };
-    }
-
-    return { label: `cookies expire in ${Math.round(day)}d`, tone: day < 7 ? 'warning' : 'success' };
+/**
+ * Cookie TTL display is server-computed now (BexSession::cookieTtlSummary).
+ * The previous client-side `min(expirationDate)` heuristic over the
+ * whole cookie jar produced the "Active + cookies expired"
+ * contradiction operators reported: short-lived chaff cookies (CSRF,
+ * locale, A/B) drag the surfaced expiry hours below the actual auth
+ * cookie's lifetime, and session-only auth cookies fall through to a
+ * misleading "expired" label.
+ *
+ * The server narrows to BexSession::AUTH_COOKIE_PATTERNS and labels
+ * accordingly; we just render whatever it ships.
+ */
+function shouldRenderTtl(ttl: CookieTtlSummary): boolean {
+    return ttl.kind !== 'unknown';
 }
 
 const extensionStatus = computed(() => {
@@ -377,12 +428,15 @@ const extensionStatus = computed(() => {
     };
 });
 
-// Refresh the card list whenever the backend relinks an existing row
-// (BexSessionController::store → BexSessionRelinked). `user.{id}` is
-// the firehose the rest of the app already listens on, so no new
-// channel is needed.
+// Refresh the card list whenever the backend mutates a session row.
+// Two events flow over the same `user.{id}` firehose:
+//   - bex-session-relinked: BexSessionController::store on UPDATE
+//   - bex-session-deleted:  prune button + `bex:prune-stale-sessions`
+// Both collapse into a single `router.reload({ only: ['sessions', 'jobSummary'] })`
+// because the diff to apply is identical (re-fetch).
 useUserChannel({
-    'bex-session-relinked': () => router.reload({ only: ['sessions', 'jobSummary'] }),
+    'bex-session-relinked': () => router.reload({ only: ['sessions', 'jobSummary', 'prunable_count'] }),
+    'bex-session-deleted': () => router.reload({ only: ['sessions', 'jobSummary', 'prunable_count'] }),
 });
 
 /**
@@ -546,11 +600,25 @@ onMounted(() => {
 
             <!-- Sessions -->
             <section>
-                <header class="mb-2 flex items-center justify-between">
+                <header class="mb-2 flex items-center justify-between gap-3">
                     <h2 class="text-lg font-medium">Stored sessions</h2>
-                    <p class="text-muted-foreground text-xs">
-                        {{ sessions.filter((s) => s.is_active).length }} active · {{ sessions.length }} total
-                    </p>
+                    <div class="flex items-center gap-2">
+                        <p class="text-muted-foreground text-xs">
+                            {{ sessions.filter((s) => s.is_active).length }} active · {{ sessions.length }} total
+                        </p>
+                        <Button
+                            v-if="prunable_count > 0"
+                            variant="outline"
+                            size="sm"
+                            :disabled="pruning"
+                            title="Delete orphan rows: every expired session that shares (or has no) account email with a fresh one. Different-account sessions are kept."
+                            @click="pruneStaleSessions"
+                        >
+                            <Loader2 v-if="pruning" class="mr-1 size-4 animate-spin" />
+                            <Trash2 v-else class="mr-1 size-4" />
+                            Delete expired sessions
+                        </Button>
+                    </div>
                 </header>
 
                 <div
@@ -605,11 +673,11 @@ onMounted(() => {
                             <dd class="text-foreground text-right">{{ relativeOrAbsolute(session.last_validated_at) }}</dd>
                             <dt>Cookies</dt>
                             <dd class="text-foreground text-right tabular-nums">{{ session.cookie_count }}</dd>
-                            <template v-if="expiryHint(session.earliest_cookie_expiry)">
+                            <template v-if="shouldRenderTtl(session.cookie_ttl)">
                                 <dt>Cookie TTL</dt>
                                 <dd class="text-right">
-                                    <Badge :variant="expiryHint(session.earliest_cookie_expiry)!.tone">
-                                        {{ expiryHint(session.earliest_cookie_expiry)!.label }}
+                                    <Badge :variant="session.cookie_ttl.tone">
+                                        {{ session.cookie_ttl.label }}
                                     </Badge>
                                 </dd>
                             </template>

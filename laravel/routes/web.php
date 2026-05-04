@@ -52,6 +52,12 @@ Route::middleware(['auth', 'verified'])->group(function () {
         ->name('bex-sessions.validate');
     Route::delete('bex-sessions/{bexSession}', [AuthenticateController::class, 'destroy'])
         ->name('bex-sessions.destroy');
+    // One-click cleanup for the orphan rows created by pre-2a2d201
+    // INSERT-on-relink behaviour, plus any future stragglers the
+    // hardened relink path can't catch (see BexSessionPruner). DELETE
+    // is the right verb — we're removing rows, not creating anything.
+    Route::delete('authenticate/stale-sessions', [AuthenticateController::class, 'pruneStaleSessions'])
+        ->name('authenticate.prune-stale');
 
     // Background scrape jobs.
     Route::get('jobs', [JobsController::class, 'index'])->name('jobs.index');

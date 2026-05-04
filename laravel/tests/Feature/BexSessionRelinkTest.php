@@ -282,6 +282,190 @@ class BexSessionRelinkTest extends TestCase
         Event::assertNotDispatched(BexSessionRelinked::class);
     }
 
+    public function test_relink_adopts_empty_email_orphan_row_when_probe_resolves_email(): void
+    {
+        // Pre-extractor capture: the row's account_email is empty
+        // because BookingExpertsClient couldn't pull an email out of
+        // the home page at the time. The new probe DOES resolve an
+        // email — we must adopt the orphan row instead of creating a
+        // duplicate next to it.
+        Event::fake([BexSessionRelinked::class]);
+
+        $html = $this->bookingExpertsHomeHtml('sherin@verbleif.com', 'Sherin Bloemendaal');
+        Http::fake([
+            'https://app.bookingexperts.com/*' => Http::response($html, 200),
+            'https://app.bookingexperts.com' => Http::response($html, 200),
+        ]);
+
+        $user = User::factory()->create();
+
+        $orphan = BexSession::create([
+            'user_id' => $user->id,
+            'environment' => 'production',
+            'cookies_encrypted' => encrypt(json_encode([
+                ['name' => '_bex_session', 'value' => 'pre-extractor'],
+            ])),
+            'account_email' => '',
+            'account_name' => null,
+            'captured_at' => now()->subDays(5),
+            'expired_at' => now()->subHour(),
+        ]);
+
+        $token = PairingToken::generate(
+            userId: $user->id,
+            environment: 'production',
+            ttlMinutes: 5,
+        );
+
+        $response = $this->postJson('/api/bex-sessions', [
+            'token' => $token->token,
+            'cookies' => [[
+                'name' => '_bex_session',
+                'value' => 'fresh-cookie',
+                'domain' => '.app.bookingexperts.com',
+            ]],
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'id' => $orphan->id,
+            'relinked' => true,
+            'is_active' => true,
+            'account_email' => 'sherin@verbleif.com',
+        ]);
+
+        $this->assertSame(
+            1,
+            BexSession::query()->where('user_id', $user->id)->count(),
+            'Empty-email orphan should be adopted, not duplicated.',
+        );
+
+        $orphan->refresh();
+        $this->assertSame('sherin@verbleif.com', $orphan->account_email, 'Adoption must back-fill the email.');
+        $this->assertNull($orphan->expired_at);
+        $this->assertNotNull($orphan->last_validated_at);
+
+        Event::assertDispatched(
+            BexSessionRelinked::class,
+            fn (BexSessionRelinked $e) => $e->bexSessionId === $orphan->id
+                && $e->accountEmail === 'sherin@verbleif.com',
+        );
+    }
+
+    public function test_relink_does_not_adopt_when_multiple_empty_email_rows_exist(): void
+    {
+        // Guard: with two empty-email candidates we can't be sure
+        // which orphan belongs to the email the probe just resolved.
+        // Falling back to INSERT keeps the operator in control —
+        // they can clean up the duplicates by hand (or via the prune
+        // command) later.
+        Event::fake([BexSessionRelinked::class]);
+
+        $html = $this->bookingExpertsHomeHtml('sherin@verbleif.com', 'Sherin Bloemendaal');
+        Http::fake([
+            'https://app.bookingexperts.com/*' => Http::response($html, 200),
+            'https://app.bookingexperts.com' => Http::response($html, 200),
+        ]);
+
+        $user = User::factory()->create();
+
+        BexSession::create([
+            'user_id' => $user->id,
+            'environment' => 'production',
+            'cookies_encrypted' => encrypt(json_encode([
+                ['name' => '_bex_session', 'value' => 'orphan-A'],
+            ])),
+            'account_email' => '',
+            'captured_at' => now()->subDays(7),
+            'expired_at' => now()->subDays(2),
+        ]);
+        BexSession::create([
+            'user_id' => $user->id,
+            'environment' => 'production',
+            'cookies_encrypted' => encrypt(json_encode([
+                ['name' => '_bex_session', 'value' => 'orphan-B'],
+            ])),
+            'account_email' => '',
+            'captured_at' => now()->subDays(4),
+            'expired_at' => now()->subDay(),
+        ]);
+
+        $token = PairingToken::generate(
+            userId: $user->id,
+            environment: 'production',
+            ttlMinutes: 5,
+        );
+
+        $response = $this->postJson('/api/bex-sessions', [
+            'token' => $token->token,
+            'cookies' => [[
+                'name' => '_bex_session',
+                'value' => 'fresh-cookie',
+                'domain' => '.app.bookingexperts.com',
+            ]],
+        ]);
+
+        $response->assertStatus(201);
+        $response->assertJson(['relinked' => false]);
+        $this->assertSame(
+            3,
+            BexSession::query()->where('user_id', $user->id)->count(),
+            'With ambiguous empty-email candidates, INSERT a fresh row instead of guessing.',
+        );
+
+        Event::assertNotDispatched(BexSessionRelinked::class);
+    }
+
+    public function test_relink_does_not_adopt_active_empty_email_row(): void
+    {
+        // Even the empty-email back-fill should leave a still-active
+        // (expired_at IS NULL) row alone — re-binding cookies on a
+        // currently-valid session would surprise-overwrite working
+        // state. Only expired empty-email rows are eligible.
+        Event::fake([BexSessionRelinked::class]);
+
+        $html = $this->bookingExpertsHomeHtml('sherin@verbleif.com', 'Sherin Bloemendaal');
+        Http::fake([
+            'https://app.bookingexperts.com/*' => Http::response($html, 200),
+            'https://app.bookingexperts.com' => Http::response($html, 200),
+        ]);
+
+        $user = User::factory()->create();
+
+        BexSession::create([
+            'user_id' => $user->id,
+            'environment' => 'production',
+            'cookies_encrypted' => encrypt(json_encode([
+                ['name' => '_bex_session', 'value' => 'still-good'],
+            ])),
+            'account_email' => '',
+            'captured_at' => now()->subDays(2),
+            'expired_at' => null,
+            'last_validated_at' => now()->subMinutes(5),
+        ]);
+
+        $token = PairingToken::generate(
+            userId: $user->id,
+            environment: 'production',
+            ttlMinutes: 5,
+        );
+
+        $response = $this->postJson('/api/bex-sessions', [
+            'token' => $token->token,
+            'cookies' => [[
+                'name' => '_bex_session',
+                'value' => 'newly-captured',
+                'domain' => '.app.bookingexperts.com',
+            ]],
+        ]);
+
+        $response->assertStatus(201);
+        $response->assertJson(['relinked' => false]);
+        $this->assertSame(2, BexSession::query()->where('user_id', $user->id)->count());
+
+        Event::assertNotDispatched(BexSessionRelinked::class);
+    }
+
     public function test_authenticate_page_shows_reauthenticate_button_for_expired_sessions(): void
     {
         $user = User::factory()->create();
