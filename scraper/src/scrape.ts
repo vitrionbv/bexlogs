@@ -129,7 +129,26 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         const response = await page.goto(initialUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
         if (!response) throw new Error('no response from initial GET');
-        if (page.url().includes('/sign_in')) throw new Error(SESSION_EXPIRED_SENTINEL);
+        if (page.url().includes('/sign_in')) {
+            // Capture the rendered sign-in page (or whatever BE actually
+            // served) before throwing, so the operator can confirm this is
+            // a genuine expiry vs a transient anti-bot / concurrency
+            // rejection. page.content() is the full DOM after any JS-driven
+            // redirects, which is what determines our /sign_in match.
+            await dumpDebugArtifact(
+                job.id,
+                0,
+                await page.content().catch(() => '<page.content() failed>'),
+                'session_expired',
+                {
+                    subscription: job.subscription,
+                    pageCount: 0,
+                    previousToken: null,
+                    url: page.url(),
+                },
+            );
+            throw new Error(SESSION_EXPIRED_SENTINEL);
+        }
         if (response.status() >= 400) throw new Error(`initial page HTTP ${response.status()}`);
 
         // First batch: parse the rendered DOM.
@@ -218,6 +237,17 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
 
             const xhr: APIResponse = xhrResult;
             if (xhr.status() === 401 || xhr.status() === 403) {
+                // Capture the body BE returned with the 4xx so we can tell
+                // whether it's an actual sign-in redirect or some other
+                // refusal (permission, soft rate-limit, anti-bot challenge)
+                // currently being miscategorized as session_expired.
+                const body = await xhr.text().catch(() => '<xhr.text() failed>');
+                await dumpDebugArtifact(job.id, pageCount + 1, body, 'session_expired', {
+                    subscription: job.subscription,
+                    pageCount,
+                    previousToken: nextToken,
+                    url,
+                });
                 throw new Error(SESSION_EXPIRED_SENTINEL);
             }
             if (!xhr.ok()) {
@@ -922,10 +952,18 @@ async function dumpLoadMoreResponse(jobId: number, page: number, body: string): 
  *     useful body — dumping a 422 page wastes disk and operator attention.
  *   - `runaway_safety` is an operational anomaly across many pages, not a
  *     parse issue with one body.
- *   - `session_expired` bodies are sign-in redirects, not parser evidence.
  *   - Clean completions never trigger.
+ *
+ * `session_expired` IS dumped here even though the body is "just" a sign-in
+ * redirect. The user reports false positives (scraper says session expired
+ * but the cookies are still good in the browser); we need the actual body
+ * to disambiguate "BE redirected us to /sign_in" from "BE returned a 403
+ * for a non-auth reason that the current detection over-classifies as
+ * session_expired". The dump is small, the sign-in HTML is not secret
+ * (any unauthed browser sees it), and the directory is bounded by the
+ * 14d / 200MB retention guard, so leaving this on is cheap.
  */
-type DumpReason = 'token_missing' | 'unparseable' | 'token_echo';
+type DumpReason = 'token_missing' | 'unparseable' | 'token_echo' | 'session_expired';
 
 interface DumpContext {
     subscription: ScrapeJob['subscription'];
