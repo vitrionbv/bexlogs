@@ -68,10 +68,10 @@ class WorkerStopReasonTest extends TestCase
 
     public function test_complete_stamps_stop_reason_into_stats_blob(): void
     {
-        // duplicate_detection is the canonical "healthy completion" reason
-        // post-revamp — the only signal that survives the rule "natural =
-        // duplicates found". Picking it here also exercises the path the
-        // Jobs UI cares most about (the green "Caught up" badge).
+        // duplicate_detection is one of the two canonical "healthy
+        // completion" reasons — the legacy "we caught up to already-
+        // scraped territory" signal. Picking it here exercises the path
+        // the Jobs UI cares most about (the green "Caught up" badge).
         $this->withToken('test-worker-token')
             ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
                 'pages' => 5,
@@ -88,6 +88,54 @@ class WorkerStopReasonTest extends TestCase
         $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
         $this->assertSame('duplicate_detection', $this->job->stats['stop_reason'] ?? null);
         $this->assertSame(5, (int) ($this->job->stats['pages'] ?? 0));
+    }
+
+    public function test_complete_accepts_caught_up_stop_reason_and_token_echo_retries_counter(): void
+    {
+        // caught_up is the second canonical healthy completion: the
+        // scraper's `loadMoreWithTokenEchoRetry` exhausted its 3
+        // attempts at next_token == sentToken (BookingExperts'
+        // AWS-CloudWatch-Logs-style "you're at the live tip" signal).
+        // The diagnostic counter `token_echo_retries` rides along on
+        // /complete so the operator can see how many wasted echo
+        // attempts the helper absorbed across the whole scrape.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 12,
+                'rows' => 240,
+                'duration_ms' => 90_000,
+                'aborted_due_to_time' => false,
+                'token_echo_retries' => 2,
+                'stop_reason' => 'caught_up',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_COMPLETED, $this->job->status);
+        $this->assertSame('caught_up', $this->job->stats['stop_reason'] ?? null);
+        $this->assertSame(2, (int) ($this->job->stats['token_echo_retries'] ?? -1));
+    }
+
+    public function test_complete_rejects_retired_token_echo_reason(): void
+    {
+        // `token_echo` was retired in favor of `caught_up`. The scraper
+        // no longer emits this value (echoes go through the retry
+        // helper and resolve to `caught_up` or `advanced`); the
+        // validator must reject it so a stale older worker can't
+        // re-introduce a destructive badge for what is actually a
+        // healthy completion.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 1,
+                'rows' => 0,
+                'duration_ms' => 100,
+                'stop_reason' => 'token_echo',
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['stop_reason']);
+
+        $this->job->refresh();
+        $this->assertSame(ScrapeJob::STATUS_RUNNING, $this->job->status);
     }
 
     public function test_complete_rejects_retired_natural_end_reason(): void

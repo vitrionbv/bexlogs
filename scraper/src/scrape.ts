@@ -70,6 +70,34 @@ const LOAD_MORE_422_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
  */
 const SIGN_IN_RETRY_DELAYS_MS: readonly number[] = [3000, 7000];
 
+/**
+ * Backoff schedule (ms between attempts) for the "BookingExperts echoed
+ * the next_token back at us" path. The historical interpretation was a
+ * hard failure (`stop_reason: token_echo` → throw), but the AWS
+ * CloudWatch Logs `GetLogEvents` mental model fits the observed
+ * behaviour better: `nextForwardToken === inputToken` means "you're at
+ * the live tip of the stream — keep polling with the same token; new
+ * events + a fresh token will appear once data arrives." BE's logs
+ * page mirrors this because log events are continuously appended.
+ *
+ * Policy: retry up to twice with progressive waits to give BE a chance
+ * to either flush the pending batch or append new events. If all three
+ * attempts (1 initial + 2 retries) still echo, we accept that the
+ * subscription has truly caught up to the live tip and complete the
+ * job with `stop_reason: caught_up` — equivalent in spirit to
+ * `duplicate_detection` ("we have all the data currently available").
+ *
+ * Total wall-clock cost on full exhaustion: ~17s of sleep plus the
+ * three HTTP round-trips. This is a per-job budget cost that only
+ * fires at the tail of a scrape (it takes a real echo to trigger), so
+ * the overall throughput impact is negligible. The per-job
+ * `budgetMs` check is honored: if a sleep would take us past the time
+ * budget we bail to the existing `time_limit` exit instead. The
+ * dedicated heartbeat ticker (see `heartbeat.ts`) keeps `last_heartbeat_at`
+ * fresh during the sleep so the reaper doesn't false-fail us.
+ */
+const TOKEN_ECHO_RETRY_DELAYS_MS: readonly number[] = [5000, 12000];
+
 const DEBUG_DUMP_DIR = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     '..',
@@ -91,6 +119,16 @@ export interface ScrapeResult {
     early_stopped_due_to_duplicates: boolean;
     total_duplicates: number;
     stop_reason: StopReason;
+    /**
+     * Number of `next_token` echoes the retry helper had to absorb during
+     * the scrape. Diagnostic only: lets the operator tell whether the
+     * helper fired at all (zero across many runs would mean the helper
+     * is over-scoped and could be tightened) or always exhausts (means
+     * BE's cursor is strictly "at tip" and `caught_up` accurately
+     * reflects natural-end). NOT a `stop_reason` on its own — we never
+     * fail or label a job because of this value.
+     */
+    token_echo_retries: number;
 }
 
 /**
@@ -141,6 +179,12 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     let consecutiveAllDuplicatePages = 0;
     let totalDuplicatesObserved = 0;
     let earlyStoppedDueToDuplicates = false;
+    // Counts every wasted echo attempt across the scrape (across all
+    // pages). We compute as `attempts - 1` per retry-helper invocation
+    // so a clean run (no echoes) records zero and an exhausted tail
+    // contributes `TOKEN_ECHO_RETRY_DELAYS_MS.length` (currently 2).
+    // Surfaced via `stats.token_echo_retries` for diagnostic use only.
+    let tokenEchoRetries = 0;
     const earlyStopPages =
         job.params.early_stop_duplicate_pages ?? config.EARLY_STOP_DUPLICATE_PAGES;
     const earlyStopMinDups =
@@ -234,9 +278,10 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         // each loop iteration (after we receive the body). Tracked outside
         // the loop so the post-loop `token_missing` fall-through can dump
         // the body that produced the null next_token. The inline failure
-        // sites for `unparseable` and `token_echo` already have `body`,
-        // `url`, and `sentToken` in lexical scope so they don't read these
-        // — but they're cheap to maintain, so we keep them updated.
+        // sites for `unparseable` and the eval-fallback `caught_up` guard
+        // already have `body`, `url`, and `sentToken` in lexical scope so
+        // they don't read these — but they're cheap to maintain, so we
+        // keep them updated.
         let lastBody: string | null = null;
         let lastBodyPage = 0;
         let lastUrl: string | null = null;
@@ -256,75 +301,153 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 break;
             }
 
-            const url = buildLoadMoreUrl(job, nextToken);
-            log.debug('load_more', { jobId: job.id, page: pageCount, url });
+            // Capture the token before issuing the request so the retry
+            // layer (which may re-fetch on echo) and the post-loop
+            // `token_missing` dump have a stable reference even after
+            // `nextToken` is reassigned to whatever the response advanced
+            // to.
+            const sentToken = nextToken;
 
-            const xhrResult = await loadMoreWithSignInRetry(apiCtx, url, referer, {
-                jobId: job.id,
-                page: pageCount + 1,
-            });
+            const echoOutcome = await loadMoreWithTokenEchoRetry(
+                sentToken,
+                async (attempt) => {
+                    const url = buildLoadMoreUrl(job, sentToken);
+                    log.debug('load_more', { jobId: job.id, page: pageCount, url, attempt });
 
-            if (xhrResult === '422_exhausted') {
-                // We retried twice with backoffs and BookingExperts is
-                // still rate-limiting us. Surface this as a hard failure
-                // so the operator notices and can lower
-                // MAX_CONCURRENT_SCRAPES — silently completing here would
-                // hide a systemic concurrency problem.
-                stopReason = 'pagination_error';
-                throw new Error(
-                    `BookingExperts returned 422 after ${LOAD_MORE_422_RETRY_DELAYS_MS.length + 1} attempts `
-                        + `(1 initial + ${LOAD_MORE_422_RETRY_DELAYS_MS.length} retries). `
-                        + 'Consider lowering MAX_CONCURRENT_SCRAPES.',
-                );
-            }
+                    const xhrResult = await loadMoreWithSignInRetry(apiCtx, url, referer, {
+                        jobId: job.id,
+                        page: pageCount + 1,
+                    });
 
-            const xhr: APIResponse = xhrResult;
-            lastDiagnostic = {
-                phase: 'load_more',
-                requestUrl: url,
-                finalUrl: xhr.url(),
-                status: xhr.status(),
-                bodyPreview: null,
-            };
-            if (xhr.status() === 401 || xhr.status() === 403) {
-                // We've already exhausted the SIGN_IN_RETRY schedule inside
-                // loadMoreWithSignInRetry. The status here is final.
-                const body = await xhr.text().catch(() => '<xhr.text() failed>');
-                lastDiagnostic.bodyPreview = previewBody(body);
-                await dumpDebugArtifact(job.id, pageCount + 1, body, 'session_expired', {
-                    subscription: job.subscription,
-                    pageCount,
-                    previousToken: nextToken,
-                    url,
-                });
-                throw new Error(SESSION_EXPIRED_SENTINEL);
-            }
-            if (!xhr.ok()) {
-                throw new Error(`load_more HTTP ${xhr.status()}`);
-            }
+                    if (xhrResult === '422_exhausted') {
+                        // We retried twice with backoffs and BookingExperts is
+                        // still rate-limiting us. Surface this as a hard failure
+                        // so the operator notices and can lower
+                        // MAX_CONCURRENT_SCRAPES — silently completing here would
+                        // hide a systemic concurrency problem. Throwing inside
+                        // the retry-helper closure propagates straight up to
+                        // the outer try/catch with the typed reason set.
+                        stopReason = 'pagination_error';
+                        throw new Error(
+                            `BookingExperts returned 422 after ${LOAD_MORE_422_RETRY_DELAYS_MS.length + 1} attempts `
+                                + `(1 initial + ${LOAD_MORE_422_RETRY_DELAYS_MS.length} retries). `
+                                + 'Consider lowering MAX_CONCURRENT_SCRAPES.',
+                        );
+                    }
 
-            const body = await xhr.text();
+                    const xhr: APIResponse = xhrResult;
+                    lastDiagnostic = {
+                        phase: 'load_more',
+                        requestUrl: url,
+                        finalUrl: xhr.url(),
+                        status: xhr.status(),
+                        bodyPreview: null,
+                    };
+                    if (xhr.status() === 401 || xhr.status() === 403) {
+                        // We've already exhausted the SIGN_IN_RETRY schedule
+                        // inside loadMoreWithSignInRetry. The status here is
+                        // final.
+                        const failBody = await xhr.text().catch(() => '<xhr.text() failed>');
+                        lastDiagnostic.bodyPreview = previewBody(failBody);
+                        await dumpDebugArtifact(job.id, pageCount + 1, failBody, 'session_expired', {
+                            subscription: job.subscription,
+                            pageCount,
+                            previousToken: sentToken,
+                            url,
+                        });
+                        throw new Error(SESSION_EXPIRED_SENTINEL);
+                    }
+                    if (!xhr.ok()) {
+                        throw new Error(`load_more HTTP ${xhr.status()}`);
+                    }
 
-            if (config.DEBUG_DUMP_LOADMORE || config.LOG_LEVEL === 'debug') {
-                await dumpLoadMoreResponse(job.id, pageCount + 1, body);
-                log.info('load_more raw body', {
+                    const body = await xhr.text();
+
+                    if (config.DEBUG_DUMP_LOADMORE || config.LOG_LEVEL === 'debug') {
+                        await dumpLoadMoreResponse(job.id, pageCount + 1, body);
+                        log.info('load_more raw body', {
+                            jobId: job.id,
+                            page: pageCount + 1,
+                            preview: previewBody(body),
+                        });
+                    }
+
+                    const parsed = parseLoadMoreResponse(body);
+                    return {
+                        nextToken: parsed.nextToken,
+                        payload: { xhr, body, url, parsed },
+                    };
+                },
+                {
                     jobId: job.id,
                     page: pageCount + 1,
-                    preview: previewBody(body),
+                    // Bail before sleeping if the per-job time budget
+                    // would be exceeded; the loop's existing `time_limit`
+                    // handling then takes over below.
+                    timeBudgetOk: () => Date.now() - startedAt < budgetMs,
+                },
+            );
+
+            tokenEchoRetries += Math.max(0, echoOutcome.attempts - 1);
+
+            if (echoOutcome.kind === 'budget_aborted') {
+                log.warn('token-echo retry would exceed time budget — aborting cleanly', {
+                    jobId: job.id,
+                    page: pageCount,
+                    attempts: echoOutcome.attempts,
+                    tokenPrefix: sentToken.slice(0, 12),
                 });
+                abortedDueToTime = true;
+                stopReason = 'time_limit';
+                nextToken = null;
+                break;
             }
 
-            const sentToken = nextToken;
+            const { xhr, body, url, parsed } = echoOutcome.result.payload;
+
             // Snapshot the exchange so the post-loop `token_missing`
             // fall-through can dump the body that produced the null
-            // next_token. Captured BEFORE parseLoadMoreResponse mutates
-            // any of these so the dump reflects what the server actually
-            // sent us in this iteration.
+            // next_token. Captured BEFORE the rowsHtml-handling block
+            // mutates `nextToken`, so the dump reflects what the server
+            // actually sent us in this iteration (the final retry
+            // attempt, if the helper retried).
             lastBody = body;
             lastBodyPage = pageCount + 1;
             lastUrl = url;
             lastSentToken = sentToken;
-            const parsed = parseLoadMoreResponse(body);
+
+            if (echoOutcome.kind === 'exhausted') {
+                // Echo retries exhausted → BookingExperts has nothing new
+                // for us right now and is sitting at the live tip of the
+                // log stream (the AWS CloudWatch `nextForwardToken ===
+                // inputToken` semantic). This is the healthy "we have all
+                // currently-available data" completion, equivalent in
+                // spirit to `duplicate_detection`; the next scheduled
+                // scrape run will pick up new events as BE appends them.
+                // Dump the body for diagnostics — the first few production
+                // exhaustions confirm the pattern still holds.
+                log.info('caught up to BookingExperts log-tip after token-echo retries', {
+                    jobId: job.id,
+                    page: pageCount + 1,
+                    attempts: echoOutcome.attempts,
+                    tokenPrefix: sentToken.slice(0, 12),
+                });
+                await dumpDebugArtifact(job.id, pageCount + 1, body, 'token_echo', {
+                    subscription: job.subscription,
+                    pageCount,
+                    previousToken: sentToken,
+                    url,
+                });
+                stopReason = 'caught_up';
+                nextToken = null;
+                break;
+            }
+
+            // echoOutcome.kind === 'advanced' — proceed with rowsHtml
+            // handling using the final attempt's parse result. Same logic
+            // as before the retry layer existed; the only thing that
+            // changed is that the body in hand belongs to the attempt
+            // whose nextToken was no longer an echo.
             let rows: RawRow[] = [];
             let parsedViaEval = false;
 
@@ -371,13 +494,14 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                         parsedViaEval = true;
                         const live = await page.evaluate(extractRowsFromMain);
                         rows = live.rows.slice(beforeCount);
-                        // Pass the live page's next_token through unchanged —
-                        // the post-flush `token_echo` check at the bottom of
-                        // this loop is the single authority on echo detection.
-                        // Pre-emptively nulling an echoed live token here used
-                        // to misclassify it as `token_missing` once the loop
-                        // exited (same bug as the parser-side null-out we
-                        // removed in the recognized-shape path).
+                        // Pass the live page's next_token through unchanged.
+                        // Echoes from this code path are handled by the
+                        // defensive check at the bottom of this iteration
+                        // (the AWS-style `caught_up` outcome — equivalent
+                        // to the retry helper's exhaustion). Pre-emptively
+                        // nulling an echoed live token here used to
+                        // misclassify it as `token_missing` once the loop
+                        // exited.
                         nextToken = live.nextToken ?? null;
                         log.info('load_more batch via in-page eval', {
                             jobId: job.id,
@@ -504,30 +628,32 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 consecutiveZeroRowPages = 0;
             }
 
-            // Belt-and-suspenders: if the new token equals the one we
-            // just sent, the server is echoing it back. Treat as a hard
-            // failure so the operator notices BE pagination has wedged.
-            // This is the single authority on echo detection — both
-            // parseLoadMoreResponse and the eval fallback above pass the
-            // raw next_token through unchanged so this check sees it.
+            // Defensive belt-and-suspenders for the eval-fallback path.
+            // Echoes from the parse-extracted next_token are absorbed by
+            // `loadMoreWithTokenEchoRetry` above (it never returns
+            // `'advanced'` with `nextToken === sentToken`). The only way
+            // we can reach this point with `nextToken === sentToken` is
+            // the eval-fallback branch on an unparseable body that
+            // happened to surface an echoed token via `live.nextToken`.
+            // That's still "we're at the tip" semantically, so finish
+            // with `caught_up` instead of looping. Dump the body so we
+            // can confirm the pattern if it ever fires.
             if (nextToken !== null && nextToken === sentToken) {
-                log.error('pagination appears stuck (next_token did not advance) — failing', {
+                log.info('eval-fallback surfaced an echoed next_token — treating as caught up', {
                     jobId: job.id,
                     page: pageCount,
                     pageReceived,
                     tokenPrefix: sentToken.slice(0, 12),
                 });
-                stopReason = 'token_echo';
                 await dumpDebugArtifact(job.id, pageCount, body, 'token_echo', {
                     subscription: job.subscription,
                     pageCount,
                     previousToken: sentToken,
                     url,
                 });
-                throw new Error(
-                    `BookingExperts handed back the same next_token on page ${pageCount}; `
-                        + 'pagination is stuck.',
-                );
+                stopReason = 'caught_up';
+                nextToken = null;
+                break;
             }
 
             // Redundant with the dedicated ticker started at the top of
@@ -586,6 +712,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             early_stopped_due_to_duplicates: earlyStoppedDueToDuplicates,
             total_duplicates: totalDuplicatesObserved,
             stop_reason: stopReason,
+            token_echo_retries: tokenEchoRetries,
         };
         // Stop the liveness ticker before reporting completion so a
         // lingering tick can't land on a row that's about to flip to
@@ -1021,6 +1148,145 @@ export async function loadMoreWithSignInRetry(
 }
 
 /**
+ * One attempt's view of the load_more exchange, returned by the caller's
+ * `fetchAttempt` closure to `loadMoreWithTokenEchoRetry`. The retry layer
+ * inspects only `nextToken`; `payload` is the opaque caller-defined blob
+ * (typically `{ xhr, body, url, parsed }`) returned back to the caller
+ * once the helper settles on a final attempt.
+ */
+export interface TokenEchoAttempt<T> {
+    nextToken: string | null;
+    payload: T;
+}
+
+/**
+ * Outcome of `loadMoreWithTokenEchoRetry`:
+ *
+ *   - `advanced`: at least one attempt returned `nextToken !== sentToken`
+ *     (including `nextToken === null`). Caller proceeds with the
+ *     normal `rowsHtml` handling using `result.payload`.
+ *   - `exhausted`: every attempt (1 initial + retries) returned
+ *     `nextToken === sentToken`. Per the new semantics this is the
+ *     healthy "we caught up to BookingExperts' live log tip" completion
+ *     — caller sets `stop_reason = 'caught_up'` and exits the loop.
+ *   - `budget_aborted`: the helper was about to sleep past the per-job
+ *     time budget (see `timeBudgetOk`). Caller falls through to its
+ *     existing `time_limit` handling.
+ *
+ * `result` always carries the final attempt's data so the caller can
+ * snapshot it for diagnostics regardless of outcome.
+ */
+export type TokenEchoOutcome<T> =
+    | { kind: 'advanced'; attempts: number; result: TokenEchoAttempt<T> }
+    | { kind: 'exhausted'; attempts: number; result: TokenEchoAttempt<T> }
+    | { kind: 'budget_aborted'; attempts: number; result: TokenEchoAttempt<T> };
+
+/**
+ * Retry the caller's `fetchAttempt` closure when BookingExperts echoes
+ * the same `next_token` back at us. The historical interpretation was a
+ * hard failure (`stop_reason: token_echo` → throw); the AWS CloudWatch
+ * Logs `GetLogEvents` mental model fits the observed behaviour better:
+ * `nextForwardToken === inputToken` means "no new events yet — keep
+ * polling with this same token; new events + a new token appear once
+ * data arrives." BookingExperts' `/load_more_logs.js` mirrors this
+ * because log events are continuously appended.
+ *
+ * Policy: up to 3 attempts (1 initial + 2 retries), with progressive
+ * waits from `TOKEN_ECHO_RETRY_DELAYS_MS` between successive attempts.
+ *
+ * Detection: `attempt.nextToken === sentToken` (strict equality). The
+ * caller's closure performs the entire HTTP fetch (including 422 /
+ * sign-in retry layers) plus body parsing, and returns the
+ * `parseLoadMoreResponse` next_token. A null nextToken counts as
+ * "advanced" — the caller's existing `token_missing` fall-through
+ * handles that case differently.
+ *
+ * Budget: optional `timeBudgetOk` callback is consulted before EACH
+ * sleep. If it returns false the helper bails with `budget_aborted`
+ * instead of waiting further; the caller then falls through to its
+ * existing `time_limit` exit. Heartbeat liveness is preserved across
+ * the sleeps because the dedicated ticker (see `heartbeat.ts`) runs on
+ * its own interval.
+ *
+ * Errors thrown inside `fetchAttempt` (network failures, the
+ * `pagination_error` / SESSION_EXPIRED / generic-HTTP throws the
+ * caller stamps before throwing) propagate straight out of this
+ * helper unchanged — the existing outer try/catch handles them, no
+ * different from the pre-retry-layer flow.
+ *
+ * Out of scope: this helper does NOT retry on closure errors. Echo is
+ * the only condition we treat as worth re-issuing the same request for.
+ *
+ * Exported so the offline test harness in
+ * `scripts/token-echo-retry-test.ts` can drive it with a stub closure;
+ * production has no caller other than `runScrapeJob`.
+ */
+export async function loadMoreWithTokenEchoRetry<T>(
+    sentToken: string,
+    fetchAttempt: (attempt: number) => Promise<TokenEchoAttempt<T>>,
+    opts: {
+        jobId: number;
+        page: number;
+        retryDelaysMs?: readonly number[];
+        timeBudgetOk?: () => boolean;
+    },
+): Promise<TokenEchoOutcome<T>> {
+    const { jobId, page } = opts;
+    const delays = opts.retryDelaysMs ?? TOKEN_ECHO_RETRY_DELAYS_MS;
+    const maxAttempts = delays.length + 1;
+    let last: TokenEchoAttempt<T> | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        last = await fetchAttempt(attempt);
+
+        if (last.nextToken !== sentToken) {
+            if (attempt > 1) {
+                log.info('load_more recovered after token-echo retry', {
+                    jobId,
+                    page,
+                    attempts: attempt,
+                    advanced: last.nextToken !== null,
+                });
+            }
+            return { kind: 'advanced', attempts: attempt, result: last };
+        }
+
+        if (attempt < maxAttempts) {
+            const delayMs = delays[attempt - 1] ?? 0;
+            if (opts.timeBudgetOk && !opts.timeBudgetOk()) {
+                log.warn('token-echo retry would exceed time budget — skipping further sleeps', {
+                    jobId,
+                    page,
+                    attempt,
+                    plannedDelayMs: delayMs,
+                    tokenPrefix: sentToken.slice(0, 12),
+                });
+                return { kind: 'budget_aborted', attempts: attempt, result: last };
+            }
+            log.warn('load_more next_token echoed — retrying after backoff (BookingExperts log-tail signal)', {
+                jobId,
+                page,
+                attempt,
+                attemptsRemaining: maxAttempts - attempt,
+                delayMs,
+                reason: 'next_token === sentToken (likely "at live tip" per AWS CW Logs convention)',
+                tokenPrefix: sentToken.slice(0, 12),
+            });
+            await sleep(delayMs);
+        }
+    }
+
+    log.info('token-echo retries exhausted — treating as caught up to BookingExperts log tip', {
+        jobId,
+        page,
+        attempts: maxAttempts,
+        tokenPrefix: sentToken.slice(0, 12),
+    });
+    // last is non-null because the loop runs at least once (maxAttempts >= 1).
+    return { kind: 'exhausted', attempts: maxAttempts, result: last as TokenEchoAttempt<T> };
+}
+
+/**
  * Re-navigate the initial logs page up to `SIGN_IN_RETRY_DELAYS_MS.length`
  * times if BookingExperts bounces us to /sign_in. Returns the final
  * response, whether we ended up bounced, and the rendered body of the
@@ -1178,12 +1444,22 @@ async function dumpLoadMoreResponse(jobId: number, page: number, body: string): 
 
 /**
  * Reasons that warrant a forensic dump of the BookingExperts response body.
- * Deliberately narrower than `StopReason`:
+ * Deliberately decoupled from `StopReason`:
  *   - `pagination_error` (422 exhausted) is a known protocol error with no
  *     useful body — dumping a 422 page wastes disk and operator attention.
  *   - `runaway_safety` is an operational anomaly across many pages, not a
  *     parse issue with one body.
+ *   - `caught_up` reuses the legacy `token_echo` filename label below
+ *     (see next bullet) so historical dumps are grep-comparable.
  *   - Clean completions never trigger.
+ *
+ * `token_echo` is no longer a `StopReason` (the scraper retries echoes
+ * via `loadMoreWithTokenEchoRetry` and completes with `caught_up` on
+ * exhaustion), but it survives here as the on-disk filename label for
+ * the body that triggered an exhausted retry cluster. Keeping the same
+ * filename means an operator can grep `token_echo-*` across both legacy
+ * (failure-path) and post-change (caught_up-path) artifacts without
+ * remembering when the relabel happened.
  *
  * `session_expired` IS dumped here even though the body is "just" a sign-in
  * redirect. The user reports false positives (scraper says session expired
@@ -1207,10 +1483,12 @@ interface DumpContext {
  * Persist the offending /load_more_logs.js response (and a small JSON
  * sidecar) to `scraper/debug/` so an operator can SSH in and triage why
  * BookingExperts confused the parser. Fires on every parse-class failure
- * (`token_missing`, `unparseable`, `token_echo`) regardless of LOG_LEVEL or
- * DEBUG_DUMP_LOADMORE — by the time we reach this code path the job is
- * already failing, so the cost of the I/O is irrelevant compared to the
- * value of having the body to inspect.
+ * (`token_missing`, `unparseable`) AND on `caught_up`-via-token-echo
+ * exhaustion (filename labeled `token_echo` for legacy comparability),
+ * regardless of LOG_LEVEL or DEBUG_DUMP_LOADMORE — by the time we reach
+ * this code path the job is either already failing or about to complete
+ * with a non-trivial diagnostic, so the cost of the I/O is irrelevant
+ * compared to the value of having the body to inspect.
  *
  * Writes two files per failure (sharing a base name):
  *   - `{reason}-{jobId}-p{page}-{timestamp}.html` — raw response body. The

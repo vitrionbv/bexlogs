@@ -64,6 +64,12 @@ export async function completeJob(
         early_stopped_due_to_duplicates?: boolean;
         total_duplicates?: number;
         stop_reason?: StopReason;
+        // Diagnostic counter for the token_echo → caught_up retry layer
+        // (see `scraper/src/scrape.ts`). Always sent, even when 0, so the
+        // operator can tell at a glance whether the helper fired on a
+        // given run vs. wasn't exercised. The Laravel /complete validator
+        // accepts this key explicitly.
+        token_echo_retries?: number;
     },
 ): Promise<void> {
     const res = await fetch(url(`/api/worker/jobs/${jobId}/complete`), {

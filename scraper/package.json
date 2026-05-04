@@ -10,7 +10,7 @@
         "dev": "tsx src/index.ts",
         "scrape:once": "tsx src/cli/scrapeOnce.ts",
         "lint": "eslint src --ext .ts",
-        "test": "tsx scripts/parse-fixtures.ts && tsx scripts/heartbeat-ticker-test.ts",
+        "test": "tsx scripts/parse-fixtures.ts && tsx scripts/heartbeat-ticker-test.ts && tsx scripts/load-more-retry-test.ts && tsx scripts/load-more-signin-retry-test.ts && tsx scripts/token-echo-retry-test.ts",
         "typecheck": "tsc --noEmit"
     },
     "dependencies": {

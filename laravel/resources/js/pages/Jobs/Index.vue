@@ -49,6 +49,7 @@ import { useUserChannel } from '@/composables/useRealtime';
 
 type StopReason =
     | 'duplicate_detection'
+    | 'caught_up'
     | 'pagination_limit'
     | 'time_limit'
     | 'pagination_error'
@@ -72,6 +73,13 @@ type ScrapeJobStats = {
     aborted_due_to_time?: boolean;
     early_stopped_due_to_duplicates?: boolean;
     total_duplicates?: number;
+    /**
+     * Diagnostic counter from `loadMoreWithTokenEchoRetry` (scraper).
+     * Visible in the Stats JSON dialog; not surfaced as a badge — pure
+     * observability for "is the helper firing / always exhausting / never
+     * exhausting?" tuning.
+     */
+    token_echo_retries?: number;
     stop_reason?: StopReason;
     [key: string]: unknown;
 };
@@ -181,22 +189,35 @@ type StopReasonMeta = {
 // Each entry maps the scraper-emitted enum value (`StopReason` in
 // scraper/src/types.ts + `worker_reaped` from `ScrapeReapStale`) to the
 // human-readable badge surface and a tooltip blurb. Variant choice:
-//   - secondary  → expected, healthy terminations. Only `duplicate_detection`
-//                  ("Caught up") and `empty_window` ("No activity") qualify.
+//   - secondary  → expected, healthy terminations. `duplicate_detection`
+//                  ("Caught up"), `caught_up` ("Caught up (live tip)"),
+//                  and `empty_window` ("No activity") qualify.
 //   - warning    → operator-visible caps that may need revisiting
 //                  (pagination_limit, time_limit). The job completed; the
 //                  cap just got in the way.
 //   - destructive → hard failure paths. Anything in this bucket should be
 //                   investigated: BE rate-limited us (pagination_error),
-//                   pagination broke (token_missing / token_echo /
-//                   runaway_safety), the response shape changed
-//                   (unparseable), our session died (session_expired), or
-//                   the worker died (worker_reaped).
+//                   pagination broke (token_missing / runaway_safety),
+//                   the response shape changed (unparseable), our session
+//                   died (session_expired), or the worker died
+//                   (worker_reaped).
+//
+// `token_echo` lives here as a *legacy* fallback — the scraper retired
+// the value when `loadMoreWithTokenEchoRetry` started absorbing echoes
+// into the `caught_up` outcome. New jobs never emit it; old rows in the
+// database still carry it and we don't backfill, so a labeled fallback
+// keeps the page rendering. The "(legacy)" tag in the label tells the
+// operator the row predates the retry layer.
 const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
     duplicate_detection: {
         label: 'Caught up',
         variant: 'secondary',
         description: 'Pagination reached already-scraped rows — the healthy "we are done" signal.',
+    },
+    caught_up: {
+        label: 'Caught up (live tip)',
+        variant: 'secondary',
+        description: 'BookingExperts handed back the same next_token after our retry budget — we are at the live tip of the log stream (AWS CloudWatch Logs convention). New events arrive on the next scheduled scrape.',
     },
     empty_window: {
         label: 'No activity',
@@ -221,7 +242,7 @@ const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
     token_missing: {
         label: 'Missing pagination token',
         variant: 'destructive',
-        description: 'BookingExperts stopped returning a next_token mid-scrape. This should never happen — investigate.',
+        description: 'BookingExperts stopped returning a next_token mid-scrape (next_token went null). Distinct from caught_up (where the same token came back). Investigate.',
     },
     unparseable: {
         label: 'Unparseable response',
@@ -229,9 +250,9 @@ const STOP_REASON_META: Record<StopReason, StopReasonMeta> = {
         description: 'load_more body could not be parsed and no fallback succeeded. BE response shape may have changed.',
     },
     token_echo: {
-        label: 'Token echo',
-        variant: 'destructive',
-        description: 'BookingExperts handed back the same next_token — pagination is stuck.',
+        label: 'Token echo (legacy)',
+        variant: 'secondary',
+        description: 'Legacy badge for jobs that ran before the token-echo retry helper landed. Equivalent to "Caught up (live tip)" — pagination handed back the same next_token. Newer runs no longer emit this value; this row is preserved for history.',
     },
     runaway_safety: {
         label: 'Runaway safety',

@@ -35,26 +35,35 @@ class WorkerController extends Controller
      * human-readable labels in `pages/Jobs/Index.vue`.
      *
      * Two-tier semantics:
-     *   - completions: `duplicate_detection` (the only "we caught up
-     *     naturally" signal), `empty_window`, `pagination_limit`,
-     *     `time_limit`.
+     *   - completions: `duplicate_detection` (caught up to already-scraped
+     *     territory), `caught_up` (caught up to BookingExperts' live log
+     *     tip — the AWS CloudWatch `nextForwardToken === inputToken`
+     *     analogue, surfaced via the scraper's token-echo retry helper),
+     *     `empty_window`, `pagination_limit`, `time_limit`.
      *   - failures: `pagination_error` (422 exhausted retries),
-     *     `token_missing` (next_token went null mid-scrape),
-     *     `unparseable`, `token_echo`, `runaway_safety`,
-     *     `session_expired`, `worker_reaped`.
+     *     `token_missing` (next_token went null mid-scrape — distinct
+     *     from `caught_up`, which is "same token came back"),
+     *     `unparseable`, `runaway_safety`, `session_expired`,
+     *     `worker_reaped`.
      *
-     * `natural_end` was retired in favor of the two new keys —
-     * historical rows may still carry it in `stats`; the Jobs UI
-     * falls back to a label-less "Completed" badge for unknown reasons.
+     * Retired keys (historical rows may still carry them; the Jobs UI
+     * falls back to a labeled legacy badge or hides the badge entirely):
+     *   - `natural_end` — split into `duplicate_detection` /
+     *     `caught_up` / `token_missing` / `pagination_error`.
+     *   - `token_echo` — replaced by `caught_up`. The scraper now
+     *     retries echoes (interpreted as the AWS-style log-tail signal)
+     *     and either advances or completes with `caught_up` on
+     *     exhaustion. Legacy rows still render via the Jobs UI's
+     *     "Token echo (legacy)" fallback badge.
      */
     public const STOP_REASONS = [
         'duplicate_detection',
+        'caught_up',
         'pagination_limit',
         'time_limit',
         'pagination_error',
         'token_missing',
         'unparseable',
-        'token_echo',
         'runaway_safety',
         'empty_window',
         'session_expired',
@@ -290,6 +299,12 @@ class WorkerController extends Controller
             'aborted_due_to_time' => 'nullable|boolean',
             'early_stopped_due_to_duplicates' => 'nullable|boolean',
             'total_duplicates' => 'nullable|integer',
+            // Diagnostic counter for the token-echo retry helper (see
+            // `scraper/src/scrape.ts`). Always sent by the worker, even
+            // when 0, so the Jobs detail dialog can surface whether the
+            // helper fired on a given run. Not surfaced in any badge —
+            // pure observability.
+            'token_echo_retries' => 'nullable|integer|min:0',
             'stop_reason' => ['nullable', 'string', 'in:'.implode(',', self::STOP_REASONS)],
         ]);
 
@@ -334,7 +349,7 @@ class WorkerController extends Controller
         // Resolve stop_reason in priority order:
         //   1. Whatever the worker explicitly sent (the new path —
         //      scraper sets pagination_error, token_missing, unparseable,
-        //      token_echo, runaway_safety inline before calling /fail).
+        //      runaway_safety inline before calling /fail).
         //   2. SESSION_EXPIRED sentinel detection (legacy fallback for
         //      older worker builds and the catch-block path that doesn't
         //      know to label session expiry as anything other than the
