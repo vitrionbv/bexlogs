@@ -12,6 +12,7 @@ use App\Services\BookingExpertsBrowser;
 use App\Services\MayEnqueueResult;
 use App\Services\ScrapeEnqueueGuard;
 use App\Services\ScrapeWindowPlanner;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -239,7 +240,7 @@ class ManageController extends Controller
      * dataset so the chip stays stable while the user types in the
      * search box.
      *
-     * @param  \Illuminate\Database\Eloquent\Collection<int, Organization>  $orgs
+     * @param  Collection<int, Organization>  $orgs
      * @return array{organizations:int, applications:int, subscriptions:int, auto_scrape_on:int}
      */
     private function buildTotals($orgs): array
