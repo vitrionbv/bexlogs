@@ -4,6 +4,8 @@ namespace App\Providers;
 
 use ApiPlatform\Laravel\Eloquent\Extension\QueryExtensionInterface;
 use App\Api\QueryExtension\OrganizationScopeExtension;
+use App\Events\LogBatchInserted;
+use App\Listeners\AlertOnLogBatchListener;
 use App\Models\BexSession;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
@@ -14,6 +16,7 @@ use App\Services\AuditLogger;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Validation\Rules\Password;
 
@@ -50,6 +53,7 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->configureDefaults();
         $this->registerAuditObservers();
+        $this->wireAlertListeners();
     }
 
     /**
@@ -65,6 +69,21 @@ class AppServiceProvider extends ServiceProvider
         Subscription::observe(AuditSubscriptionObserver::class);
         BexSession::observe(AuditBexSessionObserver::class);
         ScrapeJob::observe(AuditScrapeJobObserver::class);
+    }
+
+    /**
+     * Subscribe the alerting layer (B4) to LogBatchInserted. Registered
+     * here instead of via Laravel's auto-discovery because the Laravel
+     * 11 default opt-out leaves ->withEvents() unset, and the listener's
+     * one-line registration is cheaper than wiring a full
+     * EventServiceProvider just for a single binding. The listener
+     * itself implements ShouldQueue so the inline broadcast event
+     * (LogBatchInserted is ShouldBroadcastNow for ordering reasons)
+     * doesn't pay the alert-evaluation latency on the worker request.
+     */
+    protected function wireAlertListeners(): void
+    {
+        Event::listen(LogBatchInserted::class, AlertOnLogBatchListener::class);
     }
 
     /**

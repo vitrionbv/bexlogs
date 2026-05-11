@@ -75,3 +75,27 @@ Schedule::command('bex:archive-cold')
     ->dailyAt('04:00')
     ->withoutOverlapping(60)
     ->runInBackground();
+
+// B5: page operators about BookingExperts sessions whose auth cookies
+// expire within 48h. Runs every 6h — the detector only inspects local
+// state (no BE round-trips), so the cron itself is cheap; spacing is
+// driven by SystemAlertEmitter's 24h dedupe window which collapses
+// re-pages between two cron ticks anyway. Aligning to a 6h cadence
+// gives operators 8 chances per cycle to be online when an alert
+// fires (compared to once-a-day).
+Schedule::command('bex:check-sessions')
+    ->cron('0 */6 * * *')
+    ->withoutOverlapping(30)
+    ->runInBackground();
+
+// B5: detect consecutive scrape failures (3 of the same stop_reason)
+// and quiet auto-scraped subscriptions (no successful scrape in 24h).
+// Tighter cadence (every 15 min) than the session checker because the
+// failure-run signal is more time-sensitive — we want to page within a
+// scheduling cycle of the third consecutive failure, not a full 6h
+// later. SystemAlertEmitter's 1h dedupe window absorbs the per-tick
+// re-fires once an alert has been delivered.
+Schedule::command('bex:check-failure-runs')
+    ->everyFifteenMinutes()
+    ->withoutOverlapping()
+    ->runInBackground();

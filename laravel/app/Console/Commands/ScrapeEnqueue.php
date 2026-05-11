@@ -2,11 +2,11 @@
 
 namespace App\Console\Commands;
 
-use App\Models\BexSession;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use App\Services\ScrapeEnqueueGuard;
 use App\Services\ScrapeWindowPlanner;
+use App\Services\SessionRotator;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -18,9 +18,12 @@ class ScrapeEnqueue extends Command
 
     protected $description = 'Queue scrape jobs for any subscriptions whose interval has elapsed.';
 
-    public function handle(ScrapeEnqueueGuard $guard, ScrapeWindowPlanner $planner): int
-    {
-        $query = Subscription::query();
+    public function handle(
+        ScrapeEnqueueGuard $guard,
+        ScrapeWindowPlanner $planner,
+        SessionRotator $rotator,
+    ): int {
+        $query = Subscription::query()->with('application.organization.user');
         if ($id = $this->option('subscription')) {
             $query->where('id', $id);
         } elseif (! $this->option('force')) {
@@ -47,24 +50,28 @@ class ScrapeEnqueue extends Command
                 continue;
             }
 
-            $session = BexSession::query()
-                ->whereHas(
-                    'user',
-                    fn ($q) => $q->whereHas(
-                        'organizations',
-                        fn ($q) => $q->whereHas(
-                            'applications',
-                            fn ($q) => $q->where('id', $sub->application_id),
-                        ),
-                    ),
-                )
-                ->where('environment', $sub->environment)
-                ->whereNull('expired_at')
-                ->latest('captured_at')
-                ->first();
+            $owner = $sub->application?->organization?->user;
+            if ($owner === null) {
+                $this->warn("subscription {$sub->id}: orphan (no owning user), skipping");
+                $skipped++;
+
+                continue;
+            }
+
+            // Round-robin across all healthy/expiring sessions for this
+            // (user, environment) pair via SessionRotator. Replaces the
+            // pre-B6 implicit "single session per env" lookup
+            // (`->latest('captured_at')->first()`), which funneled every
+            // queued job onto a single bex_session_id and meant one
+            // cookie expiry took out the whole subscription. The
+            // rotator's counter is shared across scheduler workers via
+            // the cache (Redis in production) so two ticks back-to-back
+            // land on different sessions instead of clobbering each
+            // other.
+            $session = $rotator->pickSession($owner, $sub->environment);
 
             if (! $session) {
-                $this->warn("subscription {$sub->id}: no active session for {$sub->environment}, skipping");
+                $this->warn("subscription {$sub->id}: no usable session for {$sub->environment}, skipping");
                 $skipped++;
 
                 continue;

@@ -46,6 +46,8 @@ interface CookieTtlSummary {
     kind: 'absolute' | 'session' | 'expired' | 'unknown';
 }
 
+type HealthStatus = 'healthy' | 'expiring_soon' | 'expired' | 'disabled';
+
 interface BexSessionRow {
     id: number;
     environment: 'production' | 'staging';
@@ -57,6 +59,17 @@ interface BexSessionRow {
     is_active: boolean;
     cookie_count: number;
     cookie_ttl: CookieTtlSummary;
+    /**
+     * B6 multi-session fields. The scheduler picks the lowest-priority
+     * `healthy` session first, falls back to `expiring_soon`, and
+     * skips `expired` / `disabled` rows entirely. `priority` is
+     * editable in the row footer; the operator drops a session to
+     * priority 200 to keep it as a fallback while a fresh row at
+     * the default 100 absorbs the bulk of traffic.
+     */
+    priority: number;
+    health_status: HealthStatus;
+    expires_at: string | null;
 }
 
 defineProps<{
@@ -312,6 +325,71 @@ async function validateNow(session: BexSessionRow) {
         validating.value = { ...validating.value, [session.id]: false };
     }
 }
+
+// ─── B6: rotation knobs (priority + disable) ────────────────────────────────
+//
+// Both editors round-trip through PATCH /bex-sessions/{id} and reload
+// the `sessions` partial. Optimistic local mutation isn't worth the
+// complication: the controller may bump health_status as a side
+// effect (e.g. re-enabling a session promotes it from `disabled` to
+// whatever `recomputeHealth` lands on), so a fresh fetch is the only
+// way to keep the UI honest.
+
+const rotationSubmitting = ref<Record<number, boolean>>({});
+const localPriority = ref<Record<number, number>>({});
+
+function getPriorityDraft(session: BexSessionRow): number {
+    return localPriority.value[session.id] ?? session.priority;
+}
+
+function setPriorityDraft(session: BexSessionRow, value: number) {
+    localPriority.value = { ...localPriority.value, [session.id]: value };
+}
+
+async function patchSession(session: BexSessionRow, body: { priority?: number; disabled?: boolean }) {
+    rotationSubmitting.value = { ...rotationSubmitting.value, [session.id]: true };
+    try {
+        const res = await fetch(`/bex-sessions/${session.id}`, {
+            method: 'PATCH',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': csrf(),
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+            toast.error('Could not update session');
+            return;
+        }
+
+        toast.success('Session updated');
+        router.reload({ only: ['sessions', 'prunable_count'] });
+    } finally {
+        rotationSubmitting.value = { ...rotationSubmitting.value, [session.id]: false };
+    }
+}
+
+function commitPriority(session: BexSessionRow) {
+    const next = Math.max(0, Math.min(65535, Math.round(getPriorityDraft(session) || 0)));
+    if (next === session.priority) {
+        return;
+    }
+    void patchSession(session, { priority: next });
+}
+
+function toggleDisabled(session: BexSessionRow) {
+    const next = session.health_status !== 'disabled';
+    void patchSession(session, { disabled: next });
+}
+
+const HEALTH_LABELS: Record<HealthStatus, { label: string; tone: 'success' | 'warning' | 'destructive' | 'outline' }> = {
+    healthy: { label: 'Healthy', tone: 'success' },
+    expiring_soon: { label: 'Expiring soon', tone: 'warning' },
+    expired: { label: 'Expired', tone: 'destructive' },
+    disabled: { label: 'Disabled', tone: 'outline' },
+};
 
 const pruning = ref(false);
 
@@ -601,10 +679,18 @@ onMounted(() => {
             <!-- Sessions -->
             <section>
                 <header class="mb-2 flex items-center justify-between gap-3">
-                    <h2 class="text-lg font-medium">Stored sessions</h2>
+                    <div>
+                        <h2 class="text-lg font-medium">Stored sessions</h2>
+                        <p class="text-muted-foreground text-xs">
+                            Multiple sessions per environment are rotated by the scheduler — lower priority wins,
+                            disabled rows are skipped without losing their cookies.
+                        </p>
+                    </div>
                     <div class="flex items-center gap-2">
                         <p class="text-muted-foreground text-xs">
-                            {{ sessions.filter((s) => s.is_active).length }} active · {{ sessions.length }} total
+                            {{ sessions.filter((s) => s.health_status === 'healthy').length }} healthy ·
+                            {{ sessions.filter((s) => s.health_status === 'expiring_soon').length }} expiring ·
+                            {{ sessions.length }} total
                         </p>
                         <Button
                             v-if="prunable_count > 0"
@@ -660,8 +746,8 @@ onMounted(() => {
                                 <Badge :variant="session.environment === 'production' ? 'default' : 'secondary'" class="capitalize">
                                     {{ session.environment }}
                                 </Badge>
-                                <Badge :variant="session.is_active ? 'success' : 'destructive'">
-                                    {{ session.is_active ? 'active' : 'expired' }}
+                                <Badge :variant="HEALTH_LABELS[session.health_status].tone">
+                                    {{ HEALTH_LABELS[session.health_status].label }}
                                 </Badge>
                             </div>
                         </header>
@@ -682,6 +768,62 @@ onMounted(() => {
                                 </dd>
                             </template>
                         </dl>
+
+                        <!--
+                            B6: per-session rotation controls. Lower
+                            priority wins; the scheduler picks the
+                            lowest-priority HEALTHY session first and
+                            falls back through EXPIRING_SOON. The
+                            disable toggle parks a row out of the
+                            rotation entirely without losing the
+                            cookies — useful when an operator wants
+                            to keep a backup paired but route all
+                            current traffic through a single primary.
+                        -->
+                        <div
+                            class="border-border bg-muted/30 mt-3 flex flex-wrap items-center justify-between gap-3 rounded-md border p-3 text-xs"
+                        >
+                            <div class="flex items-center gap-2">
+                                <label :for="`priority-${session.id}`" class="text-muted-foreground">
+                                    Priority
+                                </label>
+                                <input
+                                    :id="`priority-${session.id}`"
+                                    type="number"
+                                    min="0"
+                                    max="65535"
+                                    class="border-input bg-background h-8 w-20 rounded-md border px-2 text-sm tabular-nums"
+                                    :value="getPriorityDraft(session)"
+                                    :disabled="!!rotationSubmitting[session.id]"
+                                    @input="(e) => setPriorityDraft(session, Number((e.target as HTMLInputElement).value))"
+                                    @blur="commitPriority(session)"
+                                    @keydown.enter.prevent="commitPriority(session)"
+                                    title="Lower number wins. Default 100."
+                                />
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-muted-foreground">Disabled</span>
+                                <button
+                                    type="button"
+                                    class="border-input inline-flex h-6 w-11 items-center rounded-full border transition-colors"
+                                    :class="
+                                        session.health_status === 'disabled'
+                                            ? 'bg-destructive/80 justify-end'
+                                            : 'bg-muted justify-start'
+                                    "
+                                    :disabled="!!rotationSubmitting[session.id]"
+                                    @click="toggleDisabled(session)"
+                                    :aria-pressed="session.health_status === 'disabled'"
+                                    :title="
+                                        session.health_status === 'disabled'
+                                            ? 'Enable session — re-enters the rotation on the next scheduler tick.'
+                                            : 'Disable session — keeps cookies on file but stops the scheduler picking it.'
+                                    "
+                                >
+                                    <span class="bg-background m-0.5 size-5 rounded-full shadow" />
+                                </button>
+                            </div>
+                        </div>
 
                         <!--
                             Expired sessions get a prominent

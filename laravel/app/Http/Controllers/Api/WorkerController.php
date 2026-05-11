@@ -486,6 +486,29 @@ class WorkerController extends Controller
 
         $job->update($update);
 
+        // Per-session expiry handling (B6). Pre-multi-session, the worker
+        // would call /sessions/{id}/expired separately and the
+        // scheduler's "single session per env" picker would skip it on
+        // the next tick because there was nothing else to fall back to.
+        // With multi-session rotation, marking ONLY this specific row
+        // as expired (and leaving the user's other sessions in their
+        // existing rotation slots) is the contract: a worker pod that
+        // hit a 401 with cookies from session #7 reports failure on
+        // JOB X, we mark session #7 expired, and jobs Y/Z dispatched
+        // against sessions #8/#9 keep flowing without operator
+        // intervention. Folding the bookkeeping into /fail's
+        // session_expired branch removes a round-trip the scraper used
+        // to make and guarantees the rotation skips the bad row
+        // without waiting for the validator's hourly cron.
+        if ($effectiveReason === 'session_expired' && $job->bex_session_id) {
+            BexSession::query()
+                ->whereKey($job->bex_session_id)
+                ->update([
+                    'expired_at' => now(),
+                    'health_status' => BexSession::HEALTH_EXPIRED,
+                ]);
+        }
+
         broadcast(ScrapeJobUpdated::fromJob($job->fresh()));
 
         return response()->noContent();
@@ -493,7 +516,17 @@ class WorkerController extends Controller
 
     public function sessionExpired(BexSession $session): SymfonyResponse
     {
-        $session->update(['expired_at' => now()]);
+        // Pinpointed per-session expiry. With multi-session rotation in
+        // place (B6), this endpoint NEVER touches the user's other
+        // sessions — only the row identified by the URL parameter.
+        // Sets both `expired_at` (validator-style flag, the historical
+        // contract) AND `health_status = expired` so the scheduler's
+        // rotation picker skips this row on the very next tick without
+        // having to wait for the booted() saving hook to recompute it.
+        $session->update([
+            'expired_at' => now(),
+            'health_status' => BexSession::HEALTH_EXPIRED,
+        ]);
 
         return response()->noContent();
     }

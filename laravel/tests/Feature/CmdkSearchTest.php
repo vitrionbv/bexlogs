@@ -127,15 +127,15 @@ class CmdkSearchTest extends TestCase
         $this->assertSame((string) $job->id, $payload['scrape_jobs'][0]['id']);
     }
 
-    public function test_saved_queries_group_omitted_when_model_missing(): void
+    public function test_saved_queries_group_returns_empty_when_no_matches(): void
     {
-        // Guarantee the conditional class_exists branch takes the
-        // fallback path: the SavedQuery class lives on Agent 2's
-        // branch and isn't merged into this branch's history.
-        $this->assertFalse(class_exists(SavedQuery::class));
+        // SavedQuery now exists (merged from feat/alerting-and-sessions);
+        // when the user has no matching saved queries the group is an
+        // empty array rather than being omitted.
+        $this->assertTrue(class_exists(SavedQuery::class));
 
         $response = $this->actingAs($this->user)
-            ->getJson(route('api.search', ['q' => 'anything']));
+            ->getJson(route('api.search', ['q' => 'no-match-zzz']));
 
         $response->assertOk();
         $this->assertSame([], $response->json('saved_queries'));

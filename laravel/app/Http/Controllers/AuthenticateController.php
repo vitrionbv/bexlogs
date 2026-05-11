@@ -19,8 +19,17 @@ class AuthenticateController extends Controller
     public function index(Request $request): Response
     {
         $user = $request->user();
+        // Order by environment → priority → captured_at so the
+        // multi-session UI renders sessions grouped by env, with the
+        // operator's preferred (lowest-priority) row at the top of
+        // each group. Captured_at acts as the tiebreaker for two
+        // freshly-paired sessions sharing the default priority of
+        // 100 — newer wins, matching the pre-B6 ordering operators
+        // were used to.
         $sessions = $user->bexSessions()
-            ->latest('captured_at')
+            ->orderBy('environment')
+            ->orderBy('priority')
+            ->orderByDesc('captured_at')
             ->get();
 
         return Inertia::render('Authenticate/Index', [
@@ -72,7 +81,66 @@ class AuthenticateController extends Controller
             'is_active' => $s->expired_at === null,
             'cookie_count' => count($cookies),
             'cookie_ttl' => $ttl,
+            // B6: multi-session rotation surface. The Authenticate
+            // page renders these alongside the existing fields so
+            // the operator can see (and adjust) which session the
+            // scheduler will pick first when several are healthy.
+            'priority' => (int) ($s->priority ?? 100),
+            'health_status' => $s->health_status ?? BexSession::HEALTH_HEALTHY,
+            'expires_at' => $s->expires_at?->toIso8601String(),
         ];
+    }
+
+    /**
+     * B6: per-session priority + disable controls. Both knobs feed
+     * the rotation picker — `priority` shifts a session up or down
+     * within the healthy/expiring tier, and the `disabled` health
+     * status takes a session out of the rotation entirely without
+     * deleting the row (so the cookies are still around when the
+     * operator wants to flip it back on).
+     */
+    public function updateSession(Request $request, BexSession $bexSession): JsonResponse
+    {
+        abort_unless($bexSession->user_id === $request->user()->id, 403);
+
+        $data = $request->validate([
+            'priority' => 'nullable|integer|min:0|max:65535',
+            // `disabled` is a boolean knob exposed to the operator —
+            // we translate it to the `health_status` value below.
+            // Using the boolean (rather than letting the operator
+            // pick from the full enum) keeps the UI simple: the
+            // other states (healthy / expiring_soon / expired) are
+            // computed by the saving hook and shouldn't be set
+            // manually.
+            'disabled' => 'nullable|boolean',
+        ]);
+
+        if (array_key_exists('priority', $data) && $data['priority'] !== null) {
+            $bexSession->priority = (int) $data['priority'];
+        }
+
+        if (array_key_exists('disabled', $data) && $data['disabled'] !== null) {
+            if ($data['disabled']) {
+                $bexSession->health_status = BexSession::HEALTH_DISABLED;
+            } else {
+                // Re-enabling clears the sticky DISABLED tag and lets
+                // the saving hook recompute health from the cookies.
+                // Mark the row dirty on `expired_at` so the hook
+                // takes the recompute branch — without that nudge
+                // the hook bails out (no cookie change → no
+                // recompute) and the row stays DISABLED in memory
+                // even after the column is rewritten.
+                $bexSession->health_status = BexSession::HEALTH_HEALTHY;
+                $bexSession->touch();
+                $bexSession->recomputeHealth();
+            }
+        }
+
+        $bexSession->save();
+
+        return response()->json([
+            'session' => self::sessionPayload($bexSession->fresh()),
+        ]);
     }
 
     /**

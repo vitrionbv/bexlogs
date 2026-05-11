@@ -23,6 +23,9 @@ use Illuminate\Support\Facades\Crypt;
     'captured_at',
     'last_validated_at',
     'expired_at',
+    'priority',
+    'expires_at',
+    'health_status',
 ])]
 /*
  * REST API exposure.
@@ -48,6 +51,37 @@ class BexSession extends Model
 {
     /** @use HasFactory<BexSessionFactory> */
     use HasFactory;
+
+    /**
+     * Health status values stored verbatim in the `health_status` column.
+     * Mirrors the CHECK constraint set up in the
+     * 2026_05_11_190000_add_multi_session_fields migration. The
+     * scheduler picks `HEALTHY` first, falls back to `EXPIRING_SOON`,
+     * and skips `EXPIRED` / `DISABLED` outright.
+     */
+    public const HEALTH_HEALTHY = 'healthy';
+
+    public const HEALTH_EXPIRING_SOON = 'expiring_soon';
+
+    public const HEALTH_EXPIRED = 'expired';
+
+    public const HEALTH_DISABLED = 'disabled';
+
+    public const HEALTH_STATUSES = [
+        self::HEALTH_HEALTHY,
+        self::HEALTH_EXPIRING_SOON,
+        self::HEALTH_EXPIRED,
+        self::HEALTH_DISABLED,
+    ];
+
+    /**
+     * Threshold for "expiring soon" — anything within this window of
+     * `now` is bumped from `healthy` to `expiring_soon`. Operators
+     * still get to use the session (see User::activeBexSession), but
+     * the alerting layer (B5: bex:check-sessions) treats the same
+     * window as the "warn the operator" trigger.
+     */
+    public const EXPIRING_SOON_WINDOW_HOURS = 48;
 
     /**
      * Cookie names that actually carry auth for BookingExperts. Used to
@@ -94,12 +128,56 @@ class BexSession extends Model
         'expired_at',
     ];
 
+    /**
+     * Auto-derive `expires_at` and `health_status` whenever the row is
+     * saved with new cookies or the validator just flipped
+     * `expired_at`. Mutates in-memory attributes so the original write
+     * carries them — cleaner than calling save() recursively.
+     *
+     * The hook intentionally bails out when only unrelated columns
+     * changed (e.g. last_validated_at on a healthy refresh) — recomputing
+     * is cheap but avoids spurious health-status updates that would
+     * trigger downstream alert evaluations.
+     *
+     * Operator-set DISABLED is sticky: once an operator clicks
+     * "Disable" on a session row in the UI, no automatic flow will
+     * promote it back. They must explicitly toggle it back on.
+     */
+    protected static function booted(): void
+    {
+        static::saving(function (self $session): void {
+            if ($session->health_status === self::HEALTH_DISABLED) {
+                return;
+            }
+
+            $touchesCookies = $session->isDirty('cookies_encrypted')
+                || $session->isDirty('expired_at')
+                || ! $session->exists;
+
+            if (! $touchesCookies) {
+                return;
+            }
+
+            $now = CarbonImmutable::now();
+            $derivedExpires = $session->deriveExpiresAt();
+
+            $session->expires_at = $derivedExpires;
+            $session->health_status = self::resolveHealth(
+                expiredAt: $session->expired_at,
+                expiresAt: $derivedExpires,
+                now: $now,
+            );
+        });
+    }
+
     protected function casts(): array
     {
         return [
             'captured_at' => 'datetime',
             'last_validated_at' => 'datetime',
             'expired_at' => 'datetime',
+            'expires_at' => 'datetime',
+            'priority' => 'integer',
         ];
     }
 
@@ -260,6 +338,98 @@ class BexSession extends Model
             'expires_at' => $expires->toIso8601String(),
             'kind' => 'absolute',
         ];
+    }
+
+    /**
+     * Compute the "longest-lived auth cookie" timestamp the same way
+     * {@see cookieTtlSummary} does, but as a raw Carbon (or null). This
+     * is what gets persisted into the `expires_at` column whenever
+     * cookies change so the rotation picker doesn't have to JSON-decode
+     * the cookie jar on every scheduler tick.
+     *
+     * Returns null when the auth cookie is session-only or absent —
+     * the caller decides what to do with that (we treat null as
+     * "expiring soon" because session cookies die with the next browser
+     * quit).
+     */
+    public function deriveExpiresAt(): ?CarbonImmutable
+    {
+        $authCookies = $this->authCookies();
+        if ($authCookies === []) {
+            return null;
+        }
+
+        $maxExpires = null;
+        foreach ($authCookies as $cookie) {
+            if (! array_key_exists('expirationDate', $cookie)) {
+                continue;
+            }
+            $value = $cookie['expirationDate'];
+            if ($value === null || $value === '' || $value === false || ! is_numeric($value)) {
+                continue;
+            }
+
+            $ts = (int) $value;
+            if ($maxExpires === null || $ts > $maxExpires) {
+                $maxExpires = $ts;
+            }
+        }
+
+        return $maxExpires === null ? null : CarbonImmutable::createFromTimestamp($maxExpires);
+    }
+
+    /**
+     * Re-derive `expires_at` and `health_status` from the current
+     * cookies + validator state and persist them. Idempotent — calling
+     * this twice in a row is a no-op the second time.
+     *
+     * This is the explicit-rebuild entry point used by `bex:check-sessions`
+     * (B5) when it's promoting a session across the 48h boundary; the
+     * implicit `booted()` `saving` hook only fires on an actual write.
+     *
+     * @param  ?CarbonImmutable  $now  Override for tests; defaults to
+     *                                 `CarbonImmutable::now()`.
+     */
+    public function recomputeHealth(?CarbonImmutable $now = null): self
+    {
+        if ($this->health_status === self::HEALTH_DISABLED) {
+            return $this;
+        }
+
+        $now = $now ?? CarbonImmutable::now();
+        $derivedExpires = $this->deriveExpiresAt();
+        $health = self::resolveHealth($this->expired_at, $derivedExpires, $now);
+
+        $this->forceFill([
+            'expires_at' => $derivedExpires,
+            'health_status' => $health,
+        ])->save();
+
+        return $this;
+    }
+
+    /**
+     * Pure decision function shared by the saving hook and the
+     * explicit recompute path. Health resolution priority:
+     *
+     *   1. validator-rejected (`expired_at IS NOT NULL`) → expired.
+     *   2. cookies past their Expires → expired.
+     *   3. cookies < EXPIRING_SOON_WINDOW_HOURS to expiry, OR
+     *      session-only auth cookies → expiring_soon.
+     *   4. otherwise → healthy.
+     */
+    private static function resolveHealth(
+        $expiredAt,
+        ?CarbonImmutable $expiresAt,
+        CarbonImmutable $now,
+    ): string {
+        return match (true) {
+            $expiredAt !== null => self::HEALTH_EXPIRED,
+            $expiresAt !== null && $expiresAt->lessThanOrEqualTo($now) => self::HEALTH_EXPIRED,
+            $expiresAt === null => self::HEALTH_EXPIRING_SOON,
+            $expiresAt->diffInHours($now, true) <= self::EXPIRING_SOON_WINDOW_HOURS => self::HEALTH_EXPIRING_SOON,
+            default => self::HEALTH_HEALTHY,
+        };
     }
 
     /**

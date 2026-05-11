@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Admin\UserController;
+use App\Http\Controllers\AlertsController;
 use App\Http\Controllers\Api\SearchController;
 use App\Http\Controllers\AuthenticateController;
 use App\Http\Controllers\DashboardController;
@@ -56,6 +57,11 @@ Route::middleware(['auth', 'verified'])->group(function () {
         ->name('authenticate.status');
     Route::post('bex-sessions/{bexSession}/validate', [AuthenticateController::class, 'validateNow'])
         ->name('bex-sessions.validate');
+    // B6: per-session priority + disable knobs powering the
+    // rotation picker. PATCH (not POST) because both knobs
+    // mutate existing rows; no new resources are created.
+    Route::patch('bex-sessions/{bexSession}', [AuthenticateController::class, 'updateSession'])
+        ->name('bex-sessions.update');
     Route::delete('bex-sessions/{bexSession}', [AuthenticateController::class, 'destroy'])
         ->name('bex-sessions.destroy');
     // One-click cleanup for the orphan rows created by pre-2a2d201
@@ -106,6 +112,18 @@ Route::middleware(['auth', 'verified'])->group(function () {
     // each Manage row.
     Route::get('subscriptions/{subscription}/insights', [InsightsController::class, 'show'])
         ->name('subscriptions.insights');
+
+    // Alerting (B4) + system alert routing (B5). The /alerts page is a
+    // single-controller surface with three tabs (Saved Queries,
+    // Channels, System Alerts); each section's CRUD lives below.
+    Route::get('alerts', [AlertsController::class, 'index'])->name('alerts.index');
+    Route::post('alerts/queries', [AlertsController::class, 'storeQuery'])->name('alerts.queries.store');
+    Route::patch('alerts/queries/{savedQuery}', [AlertsController::class, 'updateQuery'])->name('alerts.queries.update');
+    Route::delete('alerts/queries/{savedQuery}', [AlertsController::class, 'destroyQuery'])->name('alerts.queries.destroy');
+    Route::post('alerts/channels', [AlertsController::class, 'storeChannel'])->name('alerts.channels.store');
+    Route::patch('alerts/channels/{channel}', [AlertsController::class, 'updateChannel'])->name('alerts.channels.update');
+    Route::delete('alerts/channels/{channel}', [AlertsController::class, 'destroyChannel'])->name('alerts.channels.destroy');
+    Route::post('alerts/system-channels', [AlertsController::class, 'syncSystemChannels'])->name('alerts.system-channels.sync');
 
     // Manage organizations / applications / subscriptions.
     Route::get('manage', [ManageController::class, 'index'])->name('manage.index');
