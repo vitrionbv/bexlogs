@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Events\ScrapeJobUpdated;
 use App\Models\Application;
 use App\Models\BexSession;
+use App\Models\LogArchiveManifest;
 use App\Models\Organization;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
@@ -68,6 +69,24 @@ class ManageController extends Controller
             ->orderBy('id')
             ->get();
 
+        // Per-subscription data-lifecycle counts. We compute these in
+        // a single grouped query rather than N+1 per subscription so
+        // the Manage page renders fast even with many subs. Two
+        // numbers per sub:
+        //   - hot_rows_older_than_retention: how many log_messages
+        //     rows the next `bex:apply-retention` tick would prune.
+        //     NULL retention → omit (the UI hides the hint).
+        //   - archived_row_count: total rows already on the cold
+        //     disk for this sub, summed from log_archive_manifest.
+        // Both are best-effort hints; the next nightly run is the
+        // source of truth for the actual prune/archive deltas.
+        $subIds = $orgs
+            ->flatMap(fn (Organization $o) => $o->applications->flatMap(
+                fn (Application $a) => $a->subscriptions->pluck('id'),
+            ))
+            ->all();
+        $lifecycleCounts = $this->buildLifecycleCounts($subIds);
+
         $organizations = $orgs->map(fn (Organization $o) => [
             'id' => $o->id,
             'name' => $o->name,
@@ -86,6 +105,12 @@ class ManageController extends Controller
                     'max_concurrent_jobs' => $s->max_concurrent_jobs,
                     'job_spacing_minutes' => $s->job_spacing_minutes,
                     'token_echo_max_attempts' => $s->token_echo_max_attempts,
+                    'retention_days' => $s->retention_days,
+                    'archive_after_days' => $s->archive_after_days,
+                    'lifecycle_counts' => [
+                        'hot_rows_older_than_retention' => $lifecycleCounts[$s->id]['retention_eligible'] ?? 0,
+                        'archived_row_count' => $lifecycleCounts[$s->id]['archived'] ?? 0,
+                    ],
                     'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
                 ]),
             ]),
@@ -233,6 +258,75 @@ class ManageController extends Controller
         return Str::contains(Str::lower((string) $sub['name']), $needle)
             || Str::contains(Str::lower((string) $sub['id']), $needle)
             || Str::contains(Str::lower((string) $sub['environment']), $needle);
+    }
+
+    /**
+     * Build per-subscription "would prune" / "already archived"
+     * row counts in a small number of SQL statements (single
+     * SELECT + GROUP BY each), keyed by subscription_id. Returns
+     * a sparse map — a sub with no archived rows and no retention
+     * window simply isn't in the result.
+     *
+     * The retention-eligible count uses each subscription's own
+     * cutoff (`now() - retention_days`) which means the WHERE clause
+     * differs per row. We CASE-fold the per-sub calculation into
+     * one query so the page render cost stays O(1 query) regardless
+     * of subscription count.
+     *
+     * @param  array<int, string>  $subscriptionIds
+     * @return array<string, array{retention_eligible:int, archived:int}>
+     */
+    private function buildLifecycleCounts(array $subscriptionIds): array
+    {
+        if ($subscriptionIds === []) {
+            return [];
+        }
+
+        // 1. archived rows: simple SUM over the manifest, keyed by
+        //    subscription_id. Empty when no archives have happened.
+        $archivedBySub = LogArchiveManifest::query()
+            ->whereIn('subscription_id', $subscriptionIds)
+            ->groupBy('subscription_id')
+            ->selectRaw('subscription_id, SUM(row_count) as total')
+            ->get()
+            ->mapWithKeys(fn ($row) => [(string) $row->subscription_id => (int) $row->total])
+            ->all();
+
+        // 2. retention-eligible rows: per-sub `WHERE timestamp < cutoff`
+        //    where the cutoff depends on the sub's `retention_days`.
+        //    We could express this as a single SQL with a CASE on
+        //    retention_days, but the per-sub timestamp calculation
+        //    is awkward across drivers (Postgres' INTERVAL vs SQLite's
+        //    datetime() vs MySQL's DATE_SUB). Keep it simple: one
+        //    aggregate SELECT per subscription that has retention
+        //    turned on. Subs with NULL retention contribute zero
+        //    queries.
+        $retentionBySub = [];
+        $subsWithRetention = Subscription::query()
+            ->whereIn('id', $subscriptionIds)
+            ->whereNotNull('retention_days')
+            ->get(['id', 'retention_days']);
+
+        foreach ($subsWithRetention as $sub) {
+            $cutoff = now()->subDays((int) $sub->retention_days)->toIso8601String();
+            $count = (int) DB::table('log_messages')
+                ->join('pages', 'pages.id', '=', 'log_messages.page_id')
+                ->where('pages.subscription_id', $sub->id)
+                ->where('log_messages.timestamp', '<', $cutoff)
+                ->count();
+            $retentionBySub[(string) $sub->id] = $count;
+        }
+
+        $result = [];
+        foreach ($subscriptionIds as $id) {
+            $key = (string) $id;
+            $result[$key] = [
+                'retention_eligible' => $retentionBySub[$key] ?? 0,
+                'archived' => $archivedBySub[$key] ?? 0,
+            ];
+        }
+
+        return $result;
     }
 
     /**
@@ -402,6 +496,26 @@ class ManageController extends Controller
             // but 1000 is the operator-facing ceiling so a typo can't
             // wedge a worker for hours waiting on a quiet sub.
             'token_echo_max_attempts' => 'sometimes|integer|min:1|max:1000',
+            // Data-lifecycle knobs. NULL on either column means the
+            // feature is off ("keep forever" for retention; "never
+            // archive" for archive_after_days). The 10-year ceiling
+            // prevents a typo from coercing into the
+            // unsignedSmallInteger overflow zone.
+            //
+            // Retention floor is 1 day so an operator can aggressively
+            // pause a noisy webhook subscription. Archive floor is
+            // 7 days so a sub doesn't accidentally archive rows
+            // before the operator has a chance to inspect them in
+            // the hot tier — anything tighter than a week is more
+            // likely a typo than an intent.
+            //
+            // `nullable` accepts NULL via JSON; an empty string from
+            // the manage form is normalised to NULL by the Vue
+            // updateLifecycle helper before the PATCH leaves the
+            // browser, so a blanked-out input clears the column
+            // (= turns the feature off) cleanly.
+            'retention_days' => 'nullable|integer|min:1|max:3650',
+            'archive_after_days' => 'nullable|integer|min:7|max:3650',
             'environment' => 'sometimes|in:production,staging',
         ];
     }

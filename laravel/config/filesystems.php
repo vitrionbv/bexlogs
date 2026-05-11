@@ -60,6 +60,37 @@ return [
             'report' => false,
         ],
 
+        // Cold-tier storage for archived log_messages rows. Hetzner
+        // Object Storage is S3-compatible, so we reuse Laravel's
+        // built-in `s3` driver with a custom `endpoint` override.
+        // The endpoint shape is `https://<region>.your-objectstorage.com`
+        // (e.g. `https://nbg1.your-objectstorage.com` for Nuremberg).
+        // Path-style URLs are required because Hetzner doesn't issue
+        // per-bucket DNS names — virtual-hosted style requests would
+        // 404 at the load balancer.
+        //
+        // The `bex:archive-cold` command writes here; the
+        // {@see App\Services\ColdLogReader} reads from here when the
+        // Logs UI queries a date range that extends into archived
+        // territory. Tests fake this disk via `Storage::fake('cold-logs')`.
+        'cold-logs' => [
+            'driver' => 's3',
+            'key' => env('HETZNER_S3_KEY'),
+            'secret' => env('HETZNER_S3_SECRET'),
+            'region' => env('HETZNER_S3_REGION', 'nbg1'),
+            'bucket' => env('HETZNER_S3_BUCKET'),
+            'endpoint' => env('HETZNER_S3_ENDPOINT'),
+            'use_path_style_endpoint' => env('HETZNER_S3_USE_PATH_STYLE_ENDPOINT', true),
+            // We write `.jsonl.gz` blobs that the cold reader pulls
+            // via a single GetObject per (sub, day). `throw => true`
+            // so a failed PutObject during `bex:archive-cold` raises
+            // and aborts the transaction BEFORE we delete the source
+            // rows from log_messages — silent failures here would
+            // mean data loss.
+            'throw' => true,
+            'report' => false,
+        ],
+
     ],
 
     /*

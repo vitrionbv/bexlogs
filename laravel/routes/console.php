@@ -37,3 +37,29 @@ Schedule::command('bex:refresh-sessions')
 Schedule::command('server-stats:broadcast')
     ->everyFiveSeconds()
     ->withoutOverlapping();
+
+// Per-subscription log_messages retention. Runs nightly at 03:00 UTC
+// because it's a chunked DELETE that we don't want competing with
+// the scrape worker's INSERT path during business hours. NULL
+// `retention_days` means "keep forever" so the command is a fast
+// no-op when no operator has opted into a window. The hard
+// MAX_PER_SUB ceiling inside the command means an enormous backlog
+// drains over multiple ticks rather than locking the table for
+// hours on first enable.
+Schedule::command('bex:apply-retention')
+    ->dailyAt('03:00')
+    ->withoutOverlapping(60)
+    ->runInBackground();
+
+// Per-subscription cold-tier archival to Hetzner Object Storage.
+// Runs nightly at 04:00 UTC, an hour after the retention pass, so
+// the two cron jobs never compete for log_messages locks. NULL
+// `archive_after_days` means "never archive" so the command is a
+// fast no-op for subs that haven't opted in. Each archived day
+// becomes one .jsonl.gz object on the cold-logs disk; the
+// log_archive_manifest table records which days exist so the
+// ColdLogReader can fall through to S3 without a LIST call.
+Schedule::command('bex:archive-cold')
+    ->dailyAt('04:00')
+    ->withoutOverlapping(60)
+    ->runInBackground();

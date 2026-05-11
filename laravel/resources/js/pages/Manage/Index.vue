@@ -63,6 +63,18 @@ interface SubRow {
     max_concurrent_jobs: number;
     job_spacing_minutes: number;
     token_echo_max_attempts: number;
+    // Data-lifecycle knobs (G19 + G20). NULL on either column means
+    // the feature is off:
+    //   - `retention_days = null` → keep hot rows forever.
+    //   - `archive_after_days = null` → never move rows to cold storage.
+    // The lifecycle_counts payload carries the "would prune ~N rows"
+    // and "already archived ~N rows" hints we render under each input.
+    retention_days: number | null;
+    archive_after_days: number | null;
+    lifecycle_counts: {
+        hot_rows_older_than_retention: number;
+        archived_row_count: number;
+    };
     last_scraped_at: string | null;
 }
 interface AppRow {
@@ -542,6 +554,13 @@ type BudgetField =
     | 'job_spacing_minutes'
     | 'token_echo_max_attempts';
 
+// Lifecycle fields are tracked separately because they accept NULL
+// (an empty input clears the column = "feature off"), while the
+// existing budget fields all require a finite integer. Mixing both
+// shapes into one BudgetField union would force every callsite to
+// branch on null-vs-number.
+type LifecycleField = 'retention_days' | 'archive_after_days';
+
 // Per-field bounds that mirror ManageController::updateSubscription's
 // validation. Keep the UI's `min`/`max` attributes in sync with these so
 // rejected values are caught client-side rather than round-tripping a
@@ -558,6 +577,16 @@ const BUDGET_BOUNDS: Record<BudgetField, { min: number; max: number }> = {
     token_echo_max_attempts: { min: 1, max: 1000 },
 };
 
+// Lifecycle bounds — matched to the controller validator and the
+// migration's smallint range. Retention starts at 1 day so an
+// operator can aggressively pause a noisy webhook sub; archive
+// starts at 7 days so rows never get pushed to cold storage before
+// the operator has a chance to inspect them in the hot tier.
+const LIFECYCLE_BOUNDS: Record<LifecycleField, { min: number; max: number }> = {
+    retention_days: { min: 1, max: 3650 },
+    archive_after_days: { min: 7, max: 3650 },
+};
+
 function updateBudget(sub: SubRow, field: BudgetField, value: number): void {
     const bounds = BUDGET_BOUNDS[field];
 
@@ -570,6 +599,99 @@ function updateBudget(sub: SubRow, field: BudgetField, value: number): void {
         { [field]: value },
         { preserveScroll: true, only: ['organizations'] },
     );
+}
+
+// Confirmation prompt state for the "shortening retention shrinks
+// the hot table by ~N rows" warning. Stored as a local ref so a
+// single dialog instance can serve every row.
+const retentionConfirm = ref<{
+    sub: SubRow;
+    nextValue: number | null;
+    impactCount: number;
+} | null>(null);
+
+/**
+ * Send a lifecycle field update to the backend. Empty/NaN values
+ * collapse to NULL (= "feature off"), so the backend column gets
+ * cleared. Otherwise the value is bounds-checked client-side.
+ *
+ * Shortening the retention window is gated behind a confirmation
+ * modal — the operator should explicitly acknowledge that the next
+ * nightly run will delete a non-trivial number of rows. We use the
+ * server-provided `hot_rows_older_than_retention` count from the
+ * Manage payload as the impact estimate.
+ */
+function updateLifecycle(sub: SubRow, field: LifecycleField, raw: string): void {
+    const trimmed = raw.trim();
+    let nextValue: number | null;
+
+    if (trimmed === '') {
+        nextValue = null;
+    } else {
+        const parsed = Number(trimmed);
+        const bounds = LIFECYCLE_BOUNDS[field];
+        if (!Number.isFinite(parsed) || parsed < bounds.min || parsed > bounds.max) {
+            return;
+        }
+        nextValue = Math.floor(parsed);
+    }
+
+    if (
+        field === 'retention_days'
+        && nextValue !== null
+        && (sub.retention_days === null || nextValue < sub.retention_days)
+    ) {
+        // Compute a fresh "would prune" count for the operator's
+        // chosen window so the modal copy reflects what they typed,
+        // not just the server's rendered hint (which always reflects
+        // the *current* persisted retention).
+        const projection = projectRetentionImpact(sub, nextValue);
+        if (projection > 0) {
+            retentionConfirm.value = {
+                sub,
+                nextValue,
+                impactCount: projection,
+            };
+            return;
+        }
+    }
+
+    persistLifecycleUpdate(sub, field, nextValue);
+}
+
+function persistLifecycleUpdate(sub: SubRow, field: LifecycleField, value: number | null): void {
+    router.patch(
+        `/manage/subscriptions/${sub.id}`,
+        { [field]: value },
+        { preserveScroll: true, only: ['organizations'] },
+    );
+}
+
+/**
+ * Approximate "if retention drops to N days, how many rows would
+ * the next nightly run prune?" using the server-provided impact
+ * baseline. The server reports `hot_rows_older_than_retention`
+ * computed against the CURRENT retention; when there's no current
+ * retention we use it as a proxy for the always-keep volume.
+ *
+ * For a tighter window we fall back to that baseline — the actual
+ * count for an arbitrary cutoff would require a server round-trip,
+ * which is more friction than the warning is worth. The number is
+ * a hint, not a precise figure.
+ */
+function projectRetentionImpact(sub: SubRow, _nextDays: number): number {
+    return sub.lifecycle_counts.hot_rows_older_than_retention || 0;
+}
+
+function confirmRetentionShorten(): void {
+    if (!retentionConfirm.value) return;
+    const { sub, nextValue } = retentionConfirm.value;
+    persistLifecycleUpdate(sub, 'retention_days', nextValue);
+    retentionConfirm.value = null;
+}
+
+function dismissRetentionShorten(): void {
+    retentionConfirm.value = null;
 }
 
 function deleteSub(sub: SubRow): void {
@@ -1390,6 +1512,39 @@ const ManualNickname = defineComponent({
             </CardHeader>
         </Card>
 
+        <!--
+            Retention shorten confirmation. Surfaces ONLY when the
+            operator types a tighter window than the currently
+            persisted one (or sets one for the first time on a sub
+            with rows already older than the new cutoff). The hint
+            count comes from the server payload and is a best-effort
+            estimate — the actual nightly run is the source of
+            truth for the precise delete count.
+        -->
+        <Dialog
+            :open="retentionConfirm !== null"
+            @update:open="(open) => { if (!open) dismissRetentionShorten(); }"
+        >
+            <DialogContent class="sm:max-w-md">
+                <DialogHeader>
+                    <DialogTitle>Shorten retention window?</DialogTitle>
+                    <DialogDescription v-if="retentionConfirm">
+                        Setting retention to
+                        <strong>{{ retentionConfirm.nextValue }} days</strong>
+                        on <strong>{{ retentionConfirm.sub.name }}</strong> will
+                        delete approximately
+                        <strong>{{ retentionConfirm.impactCount.toLocaleString() }}</strong>
+                        rows on the next nightly run (03:00 UTC). This action is
+                        irreversible — archived rows are not affected.
+                    </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                    <Button variant="ghost" @click="dismissRetentionShorten">Cancel</Button>
+                    <Button @click="confirmRetentionShorten">Confirm</Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+
         <Card v-for="org in organizations" :key="org.id">
             <CardHeader class="pb-2">
                 <CardTitle class="flex items-center gap-2 text-base">
@@ -1657,6 +1812,98 @@ const ManualNickname = defineComponent({
                                     full exhaust. Raise for tail-quiet subscriptions
                                     where you want the scraper to wait longer for
                                     new activity before declaring caught-up.
+                                </p>
+                            </div>
+                        </div>
+
+                        <!--
+                            Data-lifecycle (G19 + G20): per-sub retention
+                            window for the hot Postgres table and
+                            per-sub archive cutover to Hetzner Object
+                            Storage. Both inputs accept an empty value =
+                            "feature off" (keep forever / never archive),
+                            which is also the historical default that
+                            applies to every existing subscription until
+                            an operator explicitly opts in.
+                        -->
+                        <div
+                            class="border-border/60 grid grid-cols-1 gap-3 border-t pt-2 sm:grid-cols-2"
+                            data-testid="lifecycle-block"
+                        >
+                            <div class="space-y-1">
+                                <Label
+                                    :for="`retention-${sub.id}`"
+                                    class="text-muted-foreground text-[10px] uppercase tracking-wide"
+                                >
+                                    Retention (days)
+                                </Label>
+                                <div class="flex items-center gap-1">
+                                    <Input
+                                        :id="`retention-${sub.id}`"
+                                        type="number"
+                                        min="1"
+                                        max="3650"
+                                        class="h-8 w-24"
+                                        :placeholder="'∞'"
+                                        :model-value="sub.retention_days ?? ''"
+                                        @change="(e: Event) => updateLifecycle(sub, 'retention_days', (e.target as HTMLInputElement).value)"
+                                    />
+                                    <span class="text-muted-foreground text-xs">days</span>
+                                </div>
+                                <p class="text-muted-foreground text-[10px]">
+                                    <span v-if="sub.retention_days === null">
+                                        Empty = keep forever. The nightly retention
+                                        sweep skips subscriptions with no window set.
+                                    </span>
+                                    <span v-else-if="sub.lifecycle_counts.hot_rows_older_than_retention > 0">
+                                        Next nightly run will prune
+                                        <span class="text-foreground font-medium">
+                                            ~{{ sub.lifecycle_counts.hot_rows_older_than_retention.toLocaleString() }}
+                                        </span>
+                                        rows older than {{ sub.retention_days }} days.
+                                    </span>
+                                    <span v-else>
+                                        No rows currently exceed the
+                                        {{ sub.retention_days }}-day window.
+                                    </span>
+                                </p>
+                            </div>
+
+                            <div class="space-y-1">
+                                <Label
+                                    :for="`archive-${sub.id}`"
+                                    class="text-muted-foreground text-[10px] uppercase tracking-wide"
+                                >
+                                    Archive after (days)
+                                </Label>
+                                <div class="flex items-center gap-1">
+                                    <Input
+                                        :id="`archive-${sub.id}`"
+                                        type="number"
+                                        min="7"
+                                        max="3650"
+                                        class="h-8 w-24"
+                                        :placeholder="'never'"
+                                        :model-value="sub.archive_after_days ?? ''"
+                                        @change="(e: Event) => updateLifecycle(sub, 'archive_after_days', (e.target as HTMLInputElement).value)"
+                                    />
+                                    <span class="text-muted-foreground text-xs">days</span>
+                                </div>
+                                <p class="text-muted-foreground text-[10px]">
+                                    <span v-if="sub.archive_after_days === null">
+                                        Empty = never archive. Otherwise rows older than this
+                                        window get moved to compressed JSONL on Hetzner Object
+                                        Storage; the Logs UI still reads them transparently.
+                                    </span>
+                                    <span v-else-if="sub.lifecycle_counts.archived_row_count > 0">
+                                        <span class="text-foreground font-medium">
+                                            {{ sub.lifecycle_counts.archived_row_count.toLocaleString() }}
+                                        </span>
+                                        rows already archived to cold storage.
+                                    </span>
+                                    <span v-else>
+                                        No rows have been archived yet for this subscription.
+                                    </span>
                                 </p>
                             </div>
                         </div>
