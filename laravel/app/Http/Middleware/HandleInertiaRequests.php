@@ -74,6 +74,15 @@ class HandleInertiaRequests extends Middleware
                 'minVersion' => config('bex.extension_min_version', config('bex.extension_version')),
                 'downloadUrl' => route('extension.download'),
             ],
+
+            // Per-subscription "ask your logs" chat agent. We surface a
+            // single boolean here so any page (Logs/Show, the dedicated
+            // Logs/Chat surface, etc.) can hide / disable the entry points
+            // when OPENROUTER_API_KEY is unset — without having to plumb the
+            // flag through every controller manually.
+            'ai' => [
+                'enabled' => (string) config('ai.api_key') !== '',
+            ],
         ];
     }
 }
