@@ -5,7 +5,6 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Application;
 use App\Models\Organization;
-use App\Models\SavedQuery;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use Illuminate\Http\JsonResponse;
@@ -114,14 +113,18 @@ class SearchController extends Controller
             ]);
 
         // Saved-query group is conditional on Agent 2's model
-        // landing. The class_exists guard means a fresh checkout of
-        // this branch (without Agent 2's merge) gets an empty group
-        // — never an undefined-class fatal.
+        // landing. We check the file's existence directly rather than
+        // calling `class_exists()` — the latter triggers Composer's
+        // PSR-4 autoloader which `include`s the would-be file, and
+        // Laravel's error handler then promotes the `include` warning
+        // to an `ErrorException`. Falling back to a filesystem probe
+        // keeps the conditional zero-cost when the model is absent.
         $savedQueries = [];
-        if (class_exists(SavedQuery::class)) {
+        $savedQueryClass = 'App\\Models\\SavedQuery';
+        $savedQueryFile = app_path('Models/SavedQuery.php');
+        if (is_file($savedQueryFile) && class_exists($savedQueryClass)) {
             try {
-                $modelClass = SavedQuery::class;
-                $rows = $modelClass::query()
+                $rows = $savedQueryClass::query()
                     ->where('user_id', $user->id)
                     ->where(function ($q) use ($like) {
                         $q->whereRaw('LOWER(name) LIKE ?', [$like]);

@@ -71,7 +71,14 @@ class AuditLogger
             return null;
         }
 
-        $row = AuditLog::create([
+        // The model's `$timestamps = false` plus the column-level
+        // `useCurrent()` default mean Eloquent never sends `created_at`
+        // and Postgres/SQLite fall back to the DB clock — which IGNORES
+        // `Carbon::setTestNow()`. Setting it here explicitly keeps the
+        // row's timestamp aligned with the application's view of
+        // "now", which matters for tests that pin the clock to verify
+        // date-range filtering.
+        $row = new AuditLog([
             'user_id' => Auth::id(),
             'action' => $action,
             'subject_type' => $subject->getMorphClass(),
@@ -80,6 +87,8 @@ class AuditLogger
             'ip_address' => $this->resolveIp(),
             'user_agent' => $this->resolveUserAgent(),
         ]);
+        $row->created_at = now();
+        $row->save();
 
         if ($deduplicate) {
             $this->seen[$key] = true;

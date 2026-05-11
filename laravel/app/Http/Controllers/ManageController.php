@@ -326,19 +326,28 @@ class ManageController extends Controller
         $data = $request->validate(self::updateValidationRules());
 
         $diff = AuditLogger::diff($subscription, $data);
-        $subscription->update($data);
 
         // Choose the action name based on the columns that actually
         // changed — `auto_scrape` flips and budget-only edits are
         // first-class on the Activity page; mixed edits fall back to
         // `subscription.updated`. Empty diff (nothing changed) emits
         // nothing.
+        //
+        // suppressNext MUST run before `update()` — the observer's
+        // `updated` hook fires inside the lifecycle event of the
+        // update call. If we suppressed afterwards the observer would
+        // already have persisted its own row and the controller's
+        // explicit `record(..., deduplicate: false)` below would add
+        // a second duplicate.
         if ($diff['new'] !== []) {
             $action = self::actionFor(array_keys($diff['new']));
-            // Observer fires alongside us on the same request; mark
-            // the (action, subject) pair as already-recorded so its
-            // write becomes a no-op.
             $audit->suppressNext($action, $subscription);
+        }
+
+        $subscription->update($data);
+
+        if ($diff['new'] !== []) {
+            $action = self::actionFor(array_keys($diff['new']));
             $audit->record($action, $subscription, $diff, deduplicate: false);
         }
 
@@ -562,9 +571,15 @@ class ManageController extends Controller
                     continue;
                 }
 
-                $sub->update($payload);
+                // Suppress the observer's matching write BEFORE the
+                // update — the model lifecycle event fires inside
+                // `$sub->update($payload)` and would otherwise persist
+                // its own audit row first, leaving the explicit
+                // controller `record(..., deduplicate: false)` below
+                // to add a second one. Ordering matters.
                 $action = self::actionFor(array_keys($diff['new']));
                 $audit->suppressNext($action, $sub);
+                $sub->update($payload);
                 $audit->record($action, $sub, $diff, deduplicate: false);
                 $updated++;
             }
