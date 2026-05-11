@@ -4,7 +4,9 @@ use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\AuthenticateController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\ExtensionController;
+use App\Http\Controllers\InsightsController;
 use App\Http\Controllers\JobsController;
+use App\Http\Controllers\LiveLogsController;
 use App\Http\Controllers\LogExportController;
 use App\Http\Controllers\ManageController;
 use App\Http\Controllers\PageController;
@@ -76,6 +78,13 @@ Route::middleware(['auth', 'verified'])->group(function () {
     // The underlying model is still `Page` (table `pages`, channel `private-page.{id}`);
     // only the user-facing surface is named "Logs".
     Route::get('logs', [PageController::class, 'index'])->name('logs.index');
+    // Live tail across every subscription the user owns, wired to the
+    // existing LogBatchInserted Reverb broadcast. Must be declared
+    // BEFORE `logs/{page}` or route-model-binding would try to resolve
+    // a Page for the literal id "live" and 404.
+    Route::get('logs/live', [LiveLogsController::class, 'index'])->name('logs.live');
+    Route::get('logs/live/since/{page}', [LiveLogsController::class, 'since'])
+        ->name('logs.live.since');
     Route::get('logs/{page}', [PageController::class, 'show'])->name('logs.show');
     // The destroy-all-entries endpoint is `messages` (not `logs`) so the URL
     // doesn't read as `/logs/{id}/logs`, which is confusing.
@@ -90,6 +99,12 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::redirect('pages/{page}/logs', 'logs/{page}/messages', 301);
     Route::redirect('pages/{page}/export', 'logs/{page}/export', 301);
     Route::redirect('pages/{page}/import', 'logs/{page}/import', 301);
+
+    // Per-subscription insights surface (health score, time-series
+    // charts, recent jobs, embedded compact live tail). Linked from
+    // each Manage row.
+    Route::get('subscriptions/{subscription}/insights', [InsightsController::class, 'show'])
+        ->name('subscriptions.insights');
 
     // Manage organizations / applications / subscriptions.
     Route::get('manage', [ManageController::class, 'index'])->name('manage.index');

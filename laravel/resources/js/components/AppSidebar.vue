@@ -4,6 +4,7 @@ import {
     Activity,
     KeyRound,
     LayoutDashboard,
+    Radio,
     ScrollText,
     Settings2,
     Users,
@@ -28,6 +29,7 @@ import type { NavItem } from '@/types';
 const mainNavItems: NavItem[] = [
     { title: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
     { title: 'Logs', href: '/logs', icon: ScrollText },
+    { title: 'Live tail', href: '/logs/live', icon: Radio },
     { title: 'Jobs', href: '/jobs', icon: Activity },
     { title: 'Sessions', href: '/authenticate', icon: KeyRound },
     { title: 'Manage', href: '/manage', icon: Settings2 },
