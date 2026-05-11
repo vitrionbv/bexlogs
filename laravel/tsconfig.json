@@ -119,7 +119,19 @@
     "include": [
         "resources/js/**/*.ts",
         "resources/js/**/*.d.ts",
-        "resources/js/**/*.tsx", 
+        "resources/js/**/*.tsx",
         "resources/js/**/*.vue"
+    ],
+    "exclude": [
+        // Wayfinder regenerates `resources/js/routes/_api_/**` from
+        // api-platform's route names on every build, but those route
+        // names embed `{._format}` URI templates which Wayfinder
+        // splits on `.` and `{` into broken folder names and
+        // un-parseable identifiers. The generated files are never
+        // imported (the frontend doesn't call the data API via
+        // Wayfinder — integrators use curl/their own SDK), so we
+        // skip them at type-check time instead of fighting the
+        // upstream generator.
+        "resources/js/routes/_api_/**/*"
     ]
 }
