@@ -20,6 +20,12 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'max_concurrent_jobs',
     'job_spacing_minutes',
     'token_echo_max_attempts',
+    // NULL on both means "feature off" (keep forever / never archive).
+    // We deliberately do NOT seed defaults via `$attributes` for these:
+    // a non-null default would silently opt every existing subscription
+    // into a retention/archive window without operator consent.
+    'retention_days',
+    'archive_after_days',
     'last_scraped_at',
 ])]
 class Subscription extends Model
@@ -71,6 +77,8 @@ class Subscription extends Model
             'max_concurrent_jobs' => 'integer',
             'job_spacing_minutes' => 'integer',
             'token_echo_max_attempts' => 'integer',
+            'retention_days' => 'integer',
+            'archive_after_days' => 'integer',
             'last_scraped_at' => 'datetime',
         ];
     }
