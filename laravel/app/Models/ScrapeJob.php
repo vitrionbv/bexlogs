@@ -2,7 +2,12 @@
 
 namespace App\Models;
 
+use ApiPlatform\Metadata\ApiResource;
+use ApiPlatform\Metadata\Get;
+use ApiPlatform\Metadata\GetCollection;
+use Database\Factories\ScrapeJobFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
@@ -18,8 +23,18 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
     'error',
     'stats',
 ])]
+#[ApiResource(
+    shortName: 'ScrapeJob',
+    operations: [
+        new GetCollection(uriTemplate: '/scrape-jobs{._format}'),
+        new Get(uriTemplate: '/scrape-jobs/{id}{._format}'),
+    ],
+)]
 class ScrapeJob extends Model
 {
+    /** @use HasFactory<ScrapeJobFactory> */
+    use HasFactory;
+
     public const STATUS_QUEUED = 'queued';
 
     public const STATUS_RUNNING = 'running';

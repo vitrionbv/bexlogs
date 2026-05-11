@@ -2,7 +2,12 @@
 
 namespace App\Models;
 
+use ApiPlatform\Metadata\ApiResource;
+use ApiPlatform\Metadata\Get;
+use ApiPlatform\Metadata\GetCollection;
+use Database\Factories\SubscriptionFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
@@ -22,8 +27,18 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'token_echo_max_attempts',
     'last_scraped_at',
 ])]
+#[ApiResource(
+    shortName: 'Subscription',
+    operations: [
+        new GetCollection(uriTemplate: '/subscriptions{._format}'),
+        new Get(uriTemplate: '/subscriptions/{id}{._format}'),
+    ],
+)]
 class Subscription extends Model
 {
+    /** @use HasFactory<SubscriptionFactory> */
+    use HasFactory;
+
     protected $keyType = 'string';
 
     public $incrementing = false;

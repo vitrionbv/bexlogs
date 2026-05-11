@@ -2,9 +2,14 @@
 
 namespace App\Models;
 
+use ApiPlatform\Metadata\ApiResource;
+use ApiPlatform\Metadata\Get;
+use ApiPlatform\Metadata\GetCollection;
 use Carbon\CarbonImmutable;
+use Database\Factories\BexSessionFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Crypt;
@@ -19,8 +24,31 @@ use Illuminate\Support\Facades\Crypt;
     'last_validated_at',
     'expired_at',
 ])]
+/*
+ * REST API exposure.
+ *
+ * Cookies (raw and encrypted blob) are NEVER serialised over the API. We
+ * intentionally use an allow-list (`$visible`) rather than a deny-list so
+ * a future column addition can't accidentally leak a sensitive field. The
+ * narrow surface mirrors what an integrator actually needs to know about
+ * a captured session: which org/email/environment, when it was captured,
+ * and whether it's still alive (`expired_at`).
+ *
+ * The API only ever emits whatever is in `$visible` — `cookies` and
+ * `cookies_encrypted` are deliberately omitted.
+ */
+#[ApiResource(
+    shortName: 'BexSession',
+    operations: [
+        new GetCollection(uriTemplate: '/bex-sessions{._format}'),
+        new Get(uriTemplate: '/bex-sessions/{id}{._format}'),
+    ],
+)]
 class BexSession extends Model
 {
+    /** @use HasFactory<BexSessionFactory> */
+    use HasFactory;
+
     /**
      * Cookie names that actually carry auth for BookingExperts. Used to
      * compute a sensible Cookie TTL label on the Authenticate page —
@@ -45,6 +73,26 @@ class BexSession extends Model
     ];
 
     protected $hidden = ['cookies_encrypted'];
+
+    /**
+     * Allow-list for REST API serialisation.
+     *
+     * Used by api-platform's Eloquent normaliser AND by stock
+     * Eloquent → array conversion. Cookies (and the encrypted blob) are
+     * left out by design — see the #[ApiResource] block above for the
+     * full rationale.
+     *
+     * @var list<string>
+     */
+    protected $visible = [
+        'id',
+        'environment',
+        'account_email',
+        'account_name',
+        'captured_at',
+        'last_validated_at',
+        'expired_at',
+    ];
 
     protected function casts(): array
     {
