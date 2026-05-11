@@ -89,6 +89,14 @@ class ScrapeWindowPlanner
             'end_time' => now()->toIso8601String(),
             'max_pages' => (int) ($subscription->max_pages_per_scrape ?? 200),
             'max_duration_minutes' => (int) ($subscription->max_duration_minutes ?? 10),
+            // Per-subscription ceiling for the worker's token-echo retry
+            // helpers (`loadMoreWithTokenEchoRetry` +
+            // `loadInitialPageWithRetry`). Falls back to the env-wide
+            // default in `scraper/src/config.ts::TOKEN_ECHO_MAX_ATTEMPTS`
+            // when the subscription column is null (legacy rows
+            // pre-migration). 100 matches the env default so unchanged
+            // operator config keeps producing identical behavior.
+            'token_echo_max_attempts' => (int) ($subscription->token_echo_max_attempts ?? 100),
         ];
     }
 

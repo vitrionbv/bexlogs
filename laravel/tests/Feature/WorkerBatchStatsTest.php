@@ -144,6 +144,103 @@ class WorkerBatchStatsTest extends TestCase
         $this->assertSame(1, (int) ($this->job->stats['batches'] ?? 0));
     }
 
+    public function test_batch_persists_per_page_echo_attempts_into_stats(): void
+    {
+        // The scraper re-sends the FULL list on every /batch (sender-
+        // is-source-of-truth). Laravel overwrites rather than merges,
+        // so a stale entry from an earlier batch can never linger
+        // after the worker prunes one. This test locks in that
+        // contract.
+        $this->postBatch(
+            messages: [$this->message('2026-05-01T13:00:00Z', 1)],
+            echoAttempts: [
+                ['page' => 0, 'attempts' => 3],   // initial-page helper fired 3 times
+                ['page' => 90, 'attempts' => 7],  // load_more page 90 needed 7 attempts
+            ],
+        )->assertOk();
+
+        $this->job->refresh();
+        $persisted = $this->job->stats['echo_attempts_by_page'] ?? null;
+
+        $this->assertSame(
+            [
+                ['page' => 0, 'attempts' => 3],
+                ['page' => 90, 'attempts' => 7],
+            ],
+            $persisted,
+            'batch endpoint must persist echo_attempts_by_page verbatim into scrape_jobs.stats',
+        );
+
+        // A second /batch with a different (shorter) list overwrites
+        // the first — sender-of-truth, not append. Without the
+        // overwrite-semantics, a pruned/recomputed entry from the
+        // worker side would silently coexist with a stale value here.
+        $this->postBatch(
+            messages: [$this->message('2026-05-01T13:00:01Z', 2)],
+            echoAttempts: [
+                ['page' => 90, 'attempts' => 9],
+            ],
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertSame(
+            [['page' => 90, 'attempts' => 9]],
+            $this->job->stats['echo_attempts_by_page'] ?? null,
+        );
+    }
+
+    public function test_batch_rejects_invalid_echo_attempts_shape(): void
+    {
+        // Validator must reject malformed entries (negative page,
+        // zero attempts, missing keys) so a buggy worker can't write
+        // garbage into the JSON blob and break the UI's `.map()`.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/batch", [
+                'messages' => [$this->message('2026-05-01T14:00:00Z', 1)],
+                'echo_attempts_by_page' => [
+                    ['page' => -1, 'attempts' => 5],
+                ],
+            ])
+            ->assertStatus(422);
+
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/batch", [
+                'messages' => [$this->message('2026-05-01T14:00:00Z', 1)],
+                'echo_attempts_by_page' => [
+                    ['page' => 1, 'attempts' => 0],
+                ],
+            ])
+            ->assertStatus(422);
+    }
+
+    public function test_complete_persists_per_page_echo_attempts(): void
+    {
+        // The "last page exhausted with no row flush" case: when a
+        // tail page hits the echo cap and produces zero rows, no
+        // trailing /batch fires for that page. /complete is the
+        // belt-and-suspenders that still gets the final retry count
+        // into stats so the Jobs UI's per-page table renders the
+        // exhausted-tail entry.
+        $this->withToken('test-worker-token')
+            ->postJson("/api/worker/jobs/{$this->job->id}/complete", [
+                'pages' => 5,
+                'duration_ms' => 12000,
+                'token_echo_retries' => 6,
+                'echo_attempts_by_page' => [
+                    ['page' => 5, 'attempts' => 100],
+                ],
+                'stop_reason' => 'caught_up',
+            ])
+            ->assertNoContent();
+
+        $this->job->refresh();
+
+        $this->assertSame(
+            [['page' => 5, 'attempts' => 100]],
+            $this->job->stats['echo_attempts_by_page'] ?? null,
+        );
+    }
+
     public function test_complete_persists_stop_reason_alongside_prior_batch_counters(): void
     {
         $this->postBatch([$this->message('2026-05-01T12:00:00Z', 1)])->assertOk();
@@ -171,12 +268,21 @@ class WorkerBatchStatsTest extends TestCase
         $this->assertSame(1, (int) ($stats['batches'] ?? 0));
     }
 
-    /** @param array<int, array<string, mixed>> $messages */
-    private function postBatch(array $messages, ?int $pagesProcessed = null): TestResponse
-    {
+    /**
+     * @param  array<int, array<string, mixed>>  $messages
+     * @param  array<int, array{page:int, attempts:int}>|null  $echoAttempts
+     */
+    private function postBatch(
+        array $messages,
+        ?int $pagesProcessed = null,
+        ?array $echoAttempts = null,
+    ): TestResponse {
         $body = ['messages' => $messages];
         if ($pagesProcessed !== null) {
             $body['pages_processed'] = $pagesProcessed;
+        }
+        if ($echoAttempts !== null) {
+            $body['echo_attempts_by_page'] = $echoAttempts;
         }
 
         return $this

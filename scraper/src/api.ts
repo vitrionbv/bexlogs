@@ -34,14 +34,37 @@ export async function heartbeat(jobId: number): Promise<void> {
     });
 }
 
+/**
+ * Per-page entry in the token-echo retry attempts list — see
+ * `scrape.ts::echoAttemptsByPage`. Page numbers are 1-based to match
+ * the worker's `pageCount + 1` semantics; `page: 0` is a sentinel for
+ * the initial-page retry helper (`loadInitialPageWithRetry`), which
+ * runs before the load_more loop starts. Only pages where the helper
+ * actually retried (`attempts > 1`) are included — clean pages stay
+ * out of the array to keep the payload small.
+ */
+export interface PageEchoAttempts {
+    page: number;
+    attempts: number;
+}
+
 export async function postBatch(
     jobId: number,
     messages: ParsedLogMessage[],
     pagesProcessed?: number,
+    echoAttemptsByPage?: readonly PageEchoAttempts[],
 ): Promise<{ received: number; inserted: number }> {
     const body: Record<string, unknown> = { messages };
     if (pagesProcessed != null) {
         body.pages_processed = pagesProcessed;
+    }
+    // Always re-send the full list on every batch — sender-of-truth
+    // semantics. Laravel overwrites rather than merges, so we don't
+    // have to track diffs. Skipped entirely when the array is empty
+    // to avoid sending `[]` on every clean batch (no signal, just
+    // noise in the merged stats blob).
+    if (echoAttemptsByPage && echoAttemptsByPage.length > 0) {
+        body.echo_attempts_by_page = echoAttemptsByPage;
     }
     const res = await fetch(url(`/api/worker/jobs/${jobId}/batch`), {
         method: 'POST',
@@ -78,6 +101,16 @@ export async function completeJob(
         // window empty. The Laravel /complete validator accepts this
         // key explicitly.
         initial_page_retries?: number;
+        /**
+         * Per-page token-echo attempt list — see
+         * `scrape.ts::echoAttemptsByPage`. Always sent on /complete,
+         * even when empty (`[]`), so a job whose last page exhausted
+         * with no row flush still gets the final retry count
+         * persisted (the trailing /batch never fires in that case).
+         * Pages with `attempts <= 1` are intentionally omitted; only
+         * the helper-fired-and-retried entries make the list.
+         */
+        echo_attempts_by_page?: readonly PageEchoAttempts[];
     },
 ): Promise<void> {
     const res = await fetch(url(`/api/worker/jobs/${jobId}/complete`), {

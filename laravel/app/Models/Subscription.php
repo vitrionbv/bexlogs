@@ -19,6 +19,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'max_duration_minutes',
     'max_concurrent_jobs',
     'job_spacing_minutes',
+    'token_echo_max_attempts',
     'last_scraped_at',
 ])]
 class Subscription extends Model
@@ -49,6 +50,14 @@ class Subscription extends Model
         'max_duration_minutes' => 30,
         'max_concurrent_jobs' => 1,
         'job_spacing_minutes' => 10,
+        // Mirrors the env-wide TOKEN_ECHO_MAX_ATTEMPTS default in
+        // `scraper/src/config.ts`. Used by the worker as the
+        // `maxAttempts` ceiling for both `loadMoreWithTokenEchoRetry`
+        // and `loadInitialPageWithRetry` (the latter reuses the same
+        // knob because the retry-on-empty mental model is identical
+        // to "keep hitting the button until real data arrives or the
+        // budget runs out").
+        'token_echo_max_attempts' => 100,
     ];
 
     protected function casts(): array
@@ -61,6 +70,7 @@ class Subscription extends Model
             'max_duration_minutes' => 'integer',
             'max_concurrent_jobs' => 'integer',
             'job_spacing_minutes' => 'integer',
+            'token_echo_max_attempts' => 'integer',
             'last_scraped_at' => 'datetime',
         ];
     }

@@ -197,6 +197,25 @@ export interface ScrapeResult {
      * treatment as `token_echo_retries`.
      */
     initial_page_retries: number;
+    /**
+     * Per-page detail for the retry helpers. Each entry is the total
+     * attempts the helper made on a single page (1 = no retry, >1 =
+     * N-1 echo retries). Only pages where the helper actually retried
+     * land here; clean fast-path pages are intentionally omitted so
+     * the array stays small.
+     *
+     *   - `page: 0`     → sentinel for the initial-page helper
+     *                     (`loadInitialPageWithRetry`).
+     *   - `page: 1..N`  → 1-based page number being LOADED by the
+     *                     load_more loop (matches the helper's
+     *                     `page: pageCount + 1` argument, so reads
+     *                     naturally as "we made N attempts for page X").
+     *
+     * Persisted to `scrape_jobs.stats.echo_attempts_by_page` via /batch
+     * (sender-of-truth, Laravel overwrites) and again via /complete
+     * for the tail-page-exhausted case where no trailing /batch fires.
+     */
+    echo_attempts_by_page: ReadonlyArray<{ page: number; attempts: number }>;
 }
 
 /**
@@ -284,6 +303,32 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     // Surfaced via `stats.initial_page_retries` for diagnostic use
     // only; same treatment as `token_echo_retries`.
     let initialPageRetries = 0;
+
+    // Per-page detail for the retry helpers: each entry is the total
+    // attempts the helper made on one page (1 = no retry, >1 = N-1
+    // echo retries). Only pages where the helper *retried* land here
+    // — clean fast-path pages are intentionally omitted so the array
+    // stays small (typical scrape has 0–3 entries; an exhausted tail
+    // adds one trailing entry). `page: 0` is the sentinel for the
+    // initial-page helper (`loadInitialPageWithRetry`), which runs
+    // before load_more pagination starts. load_more entries use the
+    // 1-based page number being LOADED — matching the helper's
+    // `page: pageCount + 1` argument so the operator-visible
+    // "we made 7 attempts for page 90" reads naturally.
+    //
+    // Sent on every /batch (sender-of-truth — Laravel overwrites,
+    // never merges) and again on /complete (belt-and-suspenders for
+    // the "last page exhausted with no row flush" path, where no
+    // trailing /batch fires).
+    const echoAttemptsByPage: { page: number; attempts: number }[] = [];
+
+    // Per-subscription override for the retry helpers' `maxAttempts`
+    // ceiling. The Laravel side always sends a value
+    // (`ScrapeWindowPlanner::baseWindow`); the env fallback only
+    // fires for jobs enqueued before the 2026-05-11 migration that
+    // added `subscriptions.token_echo_max_attempts`.
+    const tokenEchoMaxAttempts =
+        job.params.token_echo_max_attempts ?? config.TOKEN_ECHO_MAX_ATTEMPTS;
     const earlyStopPages =
         job.params.early_stop_duplicate_pages ?? config.EARLY_STOP_DUPLICATE_PAGES;
     const earlyStopMinDups =
@@ -396,7 +441,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             },
             {
                 jobId: job.id,
-                maxAttempts: config.TOKEN_ECHO_MAX_ATTEMPTS,
+                maxAttempts: tokenEchoMaxAttempts,
                 delayMs: config.TOKEN_ECHO_RETRY_DELAY_MS,
                 // Same pre-sleep budget check `loadMoreWithTokenEchoRetry`
                 // uses — never oversleep past the per-job boundary.
@@ -406,6 +451,18 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
         );
 
         initialPageRetries = Math.max(0, initialOutcome.attempts - 1);
+
+        // Record the initial-page retry count under page sentinel `0`
+        // so the Jobs UI can show "initial page: 7 attempts" with the
+        // same per-page treatment as load_more pages. Skip clean
+        // fast-path runs (attempts === 1, the common case) to keep
+        // the array small.
+        if (initialOutcome.attempts > 1) {
+            echoAttemptsByPage.push({
+                page: 0,
+                attempts: initialOutcome.attempts,
+            });
+        }
 
         // `nextToken` feeds the load_more loop below. It carries the
         // advanced token only for the `advanced` outcome; `exhausted`
@@ -461,7 +518,13 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     diagnostics: initialOutcome.result.payload.diagnostics,
                 });
             }
-            const initialStats = await flushRows(job, rows, (n) => (rowCount += n), 1);
+            const initialStats = await flushRows(
+                job,
+                rows,
+                (n) => (rowCount += n),
+                1,
+                echoAttemptsByPage,
+            );
             totalDuplicatesObserved += initialStats.duplicates;
             pageCount++;
             nextToken = advancedToken;
@@ -584,7 +647,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                 {
                     jobId: job.id,
                     page: pageCount + 1,
-                    maxAttempts: config.TOKEN_ECHO_MAX_ATTEMPTS,
+                    maxAttempts: tokenEchoMaxAttempts,
                     delayMs: config.TOKEN_ECHO_RETRY_DELAY_MS,
                     // Bail before sleeping if the per-job time budget
                     // would be exceeded by the time we'd wake up. The
@@ -597,6 +660,18 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             );
 
             tokenEchoRetries += Math.max(0, echoOutcome.attempts - 1);
+
+            // Per-page record under the 1-based page number that was
+            // being LOADED (matches the helper's `page: pageCount + 1`
+            // argument and reads naturally as "we made N attempts for
+            // page X"). Skipped for clean fast-path pages so the
+            // array stays sparse (typical scrape ends with 0 entries).
+            if (echoOutcome.attempts > 1) {
+                echoAttemptsByPage.push({
+                    page: pageCount + 1,
+                    attempts: echoOutcome.attempts,
+                });
+            }
 
             if (echoOutcome.kind === 'budget_aborted') {
                 log.warn('token-echo retry would exceed time budget — aborting cleanly', {
@@ -767,7 +842,13 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
                     rows: rows.length,
                 });
             }
-            const pageStats = await flushRows(job, rows, (n) => (rowCount += n), pageCount + 1);
+            const pageStats = await flushRows(
+                job,
+                rows,
+                (n) => (rowCount += n),
+                pageCount + 1,
+                echoAttemptsByPage,
+            );
             pageCount++;
 
             // Track duplicate-density to detect re-walking already-scraped
@@ -921,6 +1002,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
             stop_reason: stopReason,
             token_echo_retries: tokenEchoRetries,
             initial_page_retries: initialPageRetries,
+            echo_attempts_by_page: echoAttemptsByPage,
         };
         // Stop the liveness ticker before reporting completion so a
         // lingering tick can't land on a row that's about to flip to
@@ -994,6 +1076,7 @@ async function flushRows(
     rows: RawRow[],
     track: (n: number) => void,
     pagesProcessed?: number,
+    echoAttemptsByPage?: readonly { page: number; attempts: number }[],
 ): Promise<FlushStats> {
     if (rows.length === 0) return { received: 0, inserted: 0, duplicates: 0 };
     // Drop rows missing a timestamp or type before posting — Laravel's batch
@@ -1016,7 +1099,11 @@ async function flushRows(
     let inserted = 0;
     for (let i = 0; i < messages.length; i += config.BATCH_SIZE) {
         const chunk = messages.slice(i, i + config.BATCH_SIZE);
-        const result = await postBatch(job.id, chunk, pagesProcessed);
+        // Per-page echo list is piggybacked on every chunk. Cheap on
+        // wire (typical scrape has 0–3 entries) and removes the need
+        // for a separate progress endpoint. Laravel overwrites rather
+        // than merges so sending it N times per flush is harmless.
+        const result = await postBatch(job.id, chunk, pagesProcessed, echoAttemptsByPage);
         track(chunk.length);
         received += result.received;
         inserted += result.inserted;

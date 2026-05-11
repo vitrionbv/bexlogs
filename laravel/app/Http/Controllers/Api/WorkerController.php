@@ -147,6 +147,21 @@ class WorkerController extends Controller
         $data = $request->validate([
             'messages' => 'required|array',
             'pages_processed' => 'nullable|integer|min:0',
+            // Per-page token-echo attempt list. Each entry is the
+            // *total* attempts the retry helper spent on a single
+            // page (1 = no retry, >1 = N-1 echo retries). The worker
+            // re-sends the full list on every /batch so the Laravel
+            // side just overwrites — sender-is-the-source-of-truth.
+            // `page: 0` is a sentinel for the initial-page retry
+            // helper; pages 1..N are load_more pages (1-based, matches
+            // the worker's `pageCount + 1` semantics).
+            //
+            // Capped at 5000 entries (the same ceiling as
+            // max_pages_per_scrape) so a runaway worker can't OOM
+            // Postgres by streaming gigantic per-page lists.
+            'echo_attempts_by_page' => 'nullable|array|max:5000',
+            'echo_attempts_by_page.*.page' => 'required|integer|min:0',
+            'echo_attempts_by_page.*.attempts' => 'required|integer|min:1',
             'messages.*.timestamp' => 'required|string',
             'messages.*.type' => 'required|string',
             'messages.*.action' => 'required|string',
@@ -227,8 +242,9 @@ class WorkerController extends Controller
 
         $receivedInBatch = count($rows);
         $pagesProcessed = isset($data['pages_processed']) ? (int) $data['pages_processed'] : null;
+        $echoAttemptsByPage = $data['echo_attempts_by_page'] ?? null;
 
-        [$stored, $mergedStats] = DB::transaction(function () use ($job, $rows, $receivedInBatch, $pagesProcessed) {
+        [$stored, $mergedStats] = DB::transaction(function () use ($job, $rows, $receivedInBatch, $pagesProcessed, $echoAttemptsByPage) {
             $locked = ScrapeJob::query()->whereKey($job->id)->lockForUpdate()->firstOrFail();
 
             // Use the Query Builder's insertOrIgnore — NOT Eloquent's
@@ -285,6 +301,21 @@ class WorkerController extends Controller
                     (int) ($prev['pages_processed'] ?? 0),
                     $pagesProcessed,
                 );
+            }
+
+            // Worker is the source of truth for the per-page attempt
+            // list — we overwrite rather than merge so a stale entry
+            // can never linger after the worker prunes it (today the
+            // worker only ever appends, but locking in
+            // overwrite-semantics here keeps the contract simple).
+            if ($echoAttemptsByPage !== null) {
+                $merged['echo_attempts_by_page'] = array_values(array_map(
+                    fn (array $entry) => [
+                        'page' => (int) $entry['page'],
+                        'attempts' => (int) $entry['attempts'],
+                    ],
+                    $echoAttemptsByPage,
+                ));
             }
 
             $locked->update([
@@ -361,6 +392,15 @@ class WorkerController extends Controller
             // tooltip so operators can tell a single-attempt fast-exit
             // apart from a full 100-attempt grind.
             'initial_page_retries' => 'nullable|integer|min:0',
+            // Same per-page echo attempt list shape as /batch. Sent
+            // on /complete primarily as a belt-and-suspenders for the
+            // "last page exhausted with no row flush" path: when a
+            // tail page hits the echo cap, no /batch fires for that
+            // page (no rows to flush), so without this field the
+            // Jobs UI would miss the final retry count entirely.
+            'echo_attempts_by_page' => 'nullable|array|max:5000',
+            'echo_attempts_by_page.*.page' => 'required|integer|min:0',
+            'echo_attempts_by_page.*.attempts' => 'required|integer|min:1',
             'stop_reason' => ['nullable', 'string', 'in:'.implode(',', self::STOP_REASONS)],
         ]);
 
@@ -377,6 +417,21 @@ class WorkerController extends Controller
         // simply stops surfacing it.
         $incoming = array_filter($stats, fn ($v) => $v !== null);
         unset($incoming['rows']);
+
+        // Normalize the per-page attempts list to a clean integer
+        // shape before persisting — the validator only guarantees
+        // shape, not the exact PHP types of the array entries
+        // (e.g. JSON ints can decode as floats when very large).
+        if (isset($incoming['echo_attempts_by_page'])) {
+            $incoming['echo_attempts_by_page'] = array_values(array_map(
+                fn (array $entry) => [
+                    'page' => (int) $entry['page'],
+                    'attempts' => (int) $entry['attempts'],
+                ],
+                $incoming['echo_attempts_by_page'],
+            ));
+        }
+
         $current = $job->fresh();
         $mergedStats = array_merge($current->stats ?? [], $incoming);
 

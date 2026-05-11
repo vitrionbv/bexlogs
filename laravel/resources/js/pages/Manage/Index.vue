@@ -58,6 +58,7 @@ interface SubRow {
     max_duration_minutes: number;
     max_concurrent_jobs: number;
     job_spacing_minutes: number;
+    token_echo_max_attempts: number;
     last_scraped_at: string | null;
 }
 interface AppRow {
@@ -270,7 +271,8 @@ type BudgetField =
     | 'lookback_days_first_scrape'
     | 'max_duration_minutes'
     | 'max_concurrent_jobs'
-    | 'job_spacing_minutes';
+    | 'job_spacing_minutes'
+    | 'token_echo_max_attempts';
 
 // Per-field bounds that mirror ManageController::updateSubscription's
 // validation. Keep the UI's `min`/`max` attributes in sync with these so
@@ -282,6 +284,10 @@ const BUDGET_BOUNDS: Record<BudgetField, { min: number; max: number }> = {
     max_duration_minutes: { min: 1, max: 120 },
     max_concurrent_jobs: { min: 1, max: 10 },
     job_spacing_minutes: { min: 1, max: 120 },
+    // 1000 ceiling matches the controller validator. Default 100
+    // matches the env-wide TOKEN_ECHO_MAX_ATTEMPTS, so untouched rows
+    // keep behaving identically.
+    token_echo_max_attempts: { min: 1, max: 1000 },
 };
 
 function updateBudget(sub: SubRow, field: BudgetField, value: number): void {
@@ -1258,6 +1264,40 @@ const ManualNickname = defineComponent({
                                     Minimum wait before a new concurrent job can be
                                     dispatched. A freshly-started job reserves the slot
                                     for this long. 10 minutes is a reasonable default.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div
+                            class="border-border/60 grid grid-cols-1 gap-3 border-t pt-2 sm:grid-cols-2"
+                            data-testid="retry-block"
+                        >
+                            <div class="space-y-1">
+                                <Label
+                                    :for="`token-echo-${sub.id}`"
+                                    class="text-muted-foreground text-[10px] uppercase tracking-wide"
+                                >
+                                    Token-echo retry limit
+                                </Label>
+                                <div class="flex items-center gap-1">
+                                    <Input
+                                        :id="`token-echo-${sub.id}`"
+                                        type="number"
+                                        min="1"
+                                        max="1000"
+                                        class="h-8 w-24"
+                                        :model-value="sub.token_echo_max_attempts"
+                                        @change="(e: Event) => updateBudget(sub, 'token_echo_max_attempts', Number((e.target as HTMLInputElement).value))"
+                                    />
+                                    <span class="text-muted-foreground text-xs">attempts</span>
+                                </div>
+                                <p class="text-muted-foreground text-[10px]">
+                                    Cap on retries when BookingExperts keeps returning
+                                    the same next-token (the "live tip" signal). 100
+                                    = 1 initial + 99 retries at 3 s each ≈ 5 min on
+                                    full exhaust. Raise for tail-quiet subscriptions
+                                    where you want the scraper to wait longer for
+                                    new activity before declaring caught-up.
                                 </p>
                             </div>
                         </div>

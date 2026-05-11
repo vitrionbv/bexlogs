@@ -84,6 +84,7 @@ class ManageController extends Controller
                     'max_duration_minutes' => $s->max_duration_minutes,
                     'max_concurrent_jobs' => $s->max_concurrent_jobs,
                     'job_spacing_minutes' => $s->job_spacing_minutes,
+                    'token_echo_max_attempts' => $s->token_echo_max_attempts,
                     'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
                 ]),
             ]),
@@ -311,6 +312,13 @@ class ManageController extends Controller
             'max_duration_minutes' => 'sometimes|integer|min:1|max:120',
             'max_concurrent_jobs' => 'sometimes|integer|min:1|max:10',
             'job_spacing_minutes' => 'sometimes|integer|min:1|max:120',
+            // 1000 ceiling = 10× the default, which at the 3s flat
+            // schedule already costs ~50 min of sleep on full
+            // exhaust — well past any sensible per-job budget. The
+            // unsignedSmallInteger column type also caps at 65535,
+            // but 1000 is the operator-facing ceiling so a typo can't
+            // wedge a worker for hours waiting on a quiet sub.
+            'token_echo_max_attempts' => 'sometimes|integer|min:1|max:1000',
             'environment' => 'sometimes|in:production,staging',
         ]);
         $subscription->update($data);

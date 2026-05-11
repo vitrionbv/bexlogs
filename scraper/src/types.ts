@@ -71,6 +71,20 @@ export interface ScrapeJob {
         max_duration_minutes?: number;
         early_stop_duplicate_pages?: number;
         early_stop_min_duplicates?: number;
+        /**
+         * Per-subscription override for the token-echo retry helper's
+         * `maxAttempts` ceiling. When set, the worker uses this value
+         * for BOTH `loadInitialPageWithRetry` and
+         * `loadMoreWithTokenEchoRetry`. When omitted (or 0), the
+         * worker falls back to `config.TOKEN_ECHO_MAX_ATTEMPTS` (env
+         * default 100). The Laravel side (see
+         * `ScrapeWindowPlanner::baseWindow`) always sends a value, so
+         * the `?? config.TOKEN_ECHO_MAX_ATTEMPTS` fallback in
+         * `scrape.ts` only triggers for jobs enqueued before the
+         * 2026-05-11 migration that added the
+         * `subscriptions.token_echo_max_attempts` column.
+         */
+        token_echo_max_attempts?: number;
     };
 }
 

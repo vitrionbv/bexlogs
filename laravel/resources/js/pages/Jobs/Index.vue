@@ -102,6 +102,25 @@ type ScrapeJobStats = {
      * Stats dialog as a dedicated line; not surfaced as a badge.
      */
     initial_page_retries?: number;
+    /**
+     * Per-page detail from the retry helpers. Each entry is the
+     * total attempts the helper made on a single page (1 = no retry,
+     * >1 = N-1 echo retries). Only pages where the helper actually
+     * retried land here.
+     *
+     *   - `page: 0`    → sentinel for the initial-page helper.
+     *   - `page: 1..N` → 1-based load_more page number being LOADED
+     *                    (so an entry `{page: 90, attempts: 7}` reads
+     *                    as "the helper made 7 attempts to fetch page
+     *                    90 before either advancing or exhausting").
+     *
+     * Updates land via /batch (sender-of-truth, every flush) and once
+     * more on /complete to catch the tail-page-exhausted case where
+     * the last page never flushed. Used to render the per-page
+     * "retried N×" badges in the Stats dialog and the live "echoing"
+     * hint on the running job's row.
+     */
+    echo_attempts_by_page?: { page: number; attempts: number }[];
     stop_reason?: StopReason;
     [key: string]: unknown;
 };
@@ -638,6 +657,51 @@ function jobRowCounts(job: Job): RowCounts {
     return { received: rec, inserted: ins, duplicates: dup };
 }
 
+/**
+ * Format the per-page echo-attempts list for the detail dialog's
+ * "Pages with echo retries" table. Each row gets a human label
+ * (page sentinel `0` → "initial", everything else → "page N") so an
+ * operator doesn't have to mentally translate the magic value, plus
+ * the raw page number as a stable Vue `:key`.
+ *
+ * Returns an empty array when the stats object lacks the field
+ * (legacy jobs from before the 2026-05-11 feature) or the worker
+ * sent an empty list (clean scrape, no retries — the common case).
+ * The dialog template's `v-if="… .length > 0"` then hides the
+ * entire section, so legacy and clean jobs read identically.
+ */
+function echoAttemptsRows(job: Job): { page: number; label: string; attempts: number }[] {
+    const raw = job.stats?.echo_attempts_by_page;
+
+    if (!Array.isArray(raw)) {
+        return [];
+    }
+
+    return raw
+        .filter(
+            (e): e is { page: number; attempts: number } =>
+                typeof e?.page === 'number' && typeof e?.attempts === 'number',
+        )
+        .map((e) => ({
+            page: e.page,
+            label: e.page === 0 ? 'initial' : `page ${e.page}`,
+            attempts: e.attempts,
+        }));
+}
+
+/**
+ * Compact "currently retrying" hint for the running-jobs table row.
+ * Returns the latest entry of `echo_attempts_by_page` when present,
+ * otherwise null. Used to render a small inline badge like
+ * "page 90 · 7×" so the operator can see at a glance that the
+ * helper is firing on this job without opening the detail dialog.
+ */
+function latestEchoAttempt(job: Job): { label: string; attempts: number } | null {
+    const rows = echoAttemptsRows(job);
+
+    return rows.length > 0 ? rows[rows.length - 1] : null;
+}
+
 const filterChips = computed(() =>
     (['all', 'queued', 'running', 'completed', 'failed', 'cancelled'] as const).map((status) => ({
         status,
@@ -827,6 +891,27 @@ const Field = defineComponent({
                                     <template v-else>
                                         <span class="text-muted-foreground">—</span>
                                     </template>
+                                    <!--
+                                        Small "echoing" hint when the
+                                        retry helper has actually fired
+                                        on this job. Shown for both
+                                        running and completed jobs; on
+                                        running jobs it surfaces "we
+                                        spent N attempts on page X" in
+                                        real time (the worker re-sends
+                                        the full list on every /batch).
+                                        Click-through to the detail
+                                        dialog (via the parent row's
+                                        click handler) shows the full
+                                        per-page table.
+                                    -->
+                                    <div
+                                        v-if="latestEchoAttempt(job)"
+                                        class="text-amber-700 dark:text-amber-300 mt-0.5 font-mono text-[10px] leading-tight"
+                                        :title="`Token-echo retry helper most recently fired on ${latestEchoAttempt(job)!.label} with ${latestEchoAttempt(job)!.attempts} attempts. Open the detail dialog for the full per-page list.`"
+                                    >
+                                        ↻ {{ latestEchoAttempt(job)!.label }} · {{ latestEchoAttempt(job)!.attempts }}×
+                                    </div>
                                 </TableCell>
                                 <TableCell class="text-right" @click.stop>
                                     <div class="flex justify-end gap-1">
@@ -1018,6 +1103,59 @@ const Field = defineComponent({
                                 <span class="tabular-nums">{{ focused.stats?.token_echo_retries ?? 0 }}</span>
                             </template>
                         </div>
+
+                        <!--
+                            Per-page echo-attempts table — populated from
+                            `stats.echo_attempts_by_page`. Only renders
+                            when at least one page retried; clean
+                            fast-path scrapes (the common case) stay
+                            collapsed since there's nothing operator-
+                            actionable to show.
+
+                            Entries are kept in arrival order (the
+                            scraper appends as it walks pages). Page
+                            sentinel `0` is the initial-page helper —
+                            relabel it so the operator doesn't have to
+                            mentally decode the magic value.
+                        -->
+                        <div v-if="echoAttemptsRows(focused).length > 0" class="mb-3">
+                            <p class="text-muted-foreground mb-1 text-[11px] uppercase tracking-wide">
+                                Pages with echo retries
+                            </p>
+                            <div
+                                class="border-border bg-muted/20 max-h-40 overflow-auto rounded border"
+                                data-testid="echo-attempts-list"
+                            >
+                                <table class="w-full text-xs">
+                                    <thead class="bg-muted/40 sticky top-0">
+                                        <tr>
+                                            <th class="text-muted-foreground px-2 py-1 text-left font-medium">Page</th>
+                                            <th class="text-muted-foreground px-2 py-1 text-right font-medium">Attempts</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr
+                                            v-for="row in echoAttemptsRows(focused)"
+                                            :key="row.page"
+                                            class="border-border/40 border-t"
+                                        >
+                                            <td class="px-2 py-1 font-mono">{{ row.label }}</td>
+                                            <td class="px-2 py-1 text-right tabular-nums">
+                                                {{ row.attempts }}<span class="text-muted-foreground">×</span>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <p class="text-muted-foreground mt-1 text-[10px]">
+                                Each row is the total attempts the
+                                <code class="text-[10px]">loadMoreWithTokenEchoRetry</code>
+                                helper made for that page before either advancing or
+                                hitting the retry ceiling. Clean fast-path pages
+                                (1 attempt) are omitted.
+                            </p>
+                        </div>
+
                         <small class="text-muted-foreground block mb-2 text-[11px]">
                             Retrieved = rows POSTed to <code class="text-[11px]">…/batch</code> after in-batch dedup.
                             Inserted = rows that survived the <code class="text-[11px]">(page_id, content_hash)</code> unique index.
