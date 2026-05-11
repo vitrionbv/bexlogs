@@ -2,13 +2,14 @@
 
 namespace App\Models;
 
+use App\Jobs\DeliverAlertJob;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 /**
  * Audit row for a single attempted delivery to an AlertChannel. Persisted
- * by {@see \App\Jobs\DeliverAlertJob} both before the HTTP/SMTP call
+ * by {@see DeliverAlertJob} both before the HTTP/SMTP call
  * (status=queued) and after (status=sent or failed). Surfaced as a
  * "recent deliveries" list per query and per channel in the /alerts
  * UI so an operator can answer "did Slack get the alert?" without

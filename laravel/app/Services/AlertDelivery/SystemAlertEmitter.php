@@ -67,20 +67,20 @@ class SystemAlertEmitter
     /**
      * Emit one system alert to every enabled system channel for `user`.
      *
-     * @param  string  $kind         One of the KIND_* constants. Used for
-     *                               dedupe-key segmentation and for the
-     *                               cron-side "what fired" log line.
-     * @param  string  $title        Operator-facing headline (one line).
-     * @param  string  $body         Markdown-friendly description of
-     *                               what happened.
+     * @param  string  $kind  One of the KIND_* constants. Used for
+     *                        dedupe-key segmentation and for the
+     *                        cron-side "what fired" log line.
+     * @param  string  $title  Operator-facing headline (one line).
+     * @param  string  $body  Markdown-friendly description of
+     *                        what happened.
      * @param  array<string,mixed>  $context  Structured metadata —
-     *                               renders as a Slack context block,
-     *                               webhook JSON property, or email
-     *                               key/value table. Should always
-     *                               include the resource id (session_id,
-     *                               subscription_id, …) so the
-     *                               fingerprint stays stable across
-     *                               cron runs.
+     *                                        renders as a Slack context block,
+     *                                        webhook JSON property, or email
+     *                                        key/value table. Should always
+     *                                        include the resource id (session_id,
+     *                                        subscription_id, …) so the
+     *                                        fingerprint stays stable across
+     *                                        cron runs.
      * @param  string  $fingerprint  Stable string identifying the
      *                               alert subject. The dedupe key is
      *                               built from (kind, fingerprint) so
@@ -88,11 +88,11 @@ class SystemAlertEmitter
      *                               once per dedupe window even if
      *                               the body text changes between
      *                               cron ticks.
-     * @return int                   Number of channels the alert was
-     *                               dispatched to (0 means the user
-     *                               has no system channels configured
-     *                               or every channel collapsed under
-     *                               the dedupe window).
+     * @return int Number of channels the alert was
+     *             dispatched to (0 means the user
+     *             has no system channels configured
+     *             or every channel collapsed under
+     *             the dedupe window).
      */
     public function emit(
         User $user,

@@ -2,6 +2,7 @@
 
 namespace App\Services\AlertDelivery;
 
+use App\Listeners\AlertOnLogBatchListener;
 use App\Models\LogMessage;
 use App\Models\SavedQuery;
 use Illuminate\Support\Carbon;
@@ -10,7 +11,7 @@ use Illuminate\Support\Carbon;
  * Pure decision function: given a SavedQuery's filter spec and a
  * LogMessage row, does the row match?
  *
- * Kept deliberately framework-agnostic so {@see \App\Listeners\AlertOnLogBatchListener}
+ * Kept deliberately framework-agnostic so {@see AlertOnLogBatchListener}
  * can call it from inside a tight per-row loop without any of the
  * Eloquent overhead of `whereJsonContains` matching. Filter keys
  * unknown to this evaluator are ignored, NOT treated as
@@ -37,9 +38,9 @@ class SavedQueryEvaluator
 {
     /**
      * @param  array{ subscription_id?: string }  $logContext
-     *         Pre-resolved subscription metadata for the row so the
-     *         evaluator never has to hit the DB during the per-row
-     *         loop. The listener resolves these once per page-id.
+     *                                                         Pre-resolved subscription metadata for the row so the
+     *                                                         evaluator never has to hit the DB during the per-row
+     *                                                         loop. The listener resolves these once per page-id.
      */
     public function matches(SavedQuery $query, LogMessage $log, array $logContext = []): bool
     {

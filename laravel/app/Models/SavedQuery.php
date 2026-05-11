@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\AlertDelivery\SavedQueryEvaluator;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -12,7 +13,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * One named filter expression an operator wants to alert on.
  *
  * The `filter` column is a structured spec interpreted by
- * {@see \App\Services\AlertDelivery\SavedQueryEvaluator}. See the
+ * {@see SavedQueryEvaluator}. See the
  * 2026_05_11_191100_create_saved_queries_table migration for the
  * accepted shape; unknown keys are ignored so the spec can grow
  * without a migration.

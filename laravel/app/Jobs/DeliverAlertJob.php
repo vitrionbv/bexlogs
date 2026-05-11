@@ -4,7 +4,7 @@ namespace App\Jobs;
 
 use App\Models\AlertChannel;
 use App\Models\AlertDelivery;
-use App\Models\SavedQuery;
+use App\Services\AlertDelivery\AlertPayloadBuilder;
 use App\Services\AlertDelivery\DriverFactory;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -38,8 +38,8 @@ class DeliverAlertJob implements ShouldQueue
 
     /**
      * @param  array<string,mixed>  $payload
-     *         Pre-rendered driver-agnostic payload (see
-     *         {@see \App\Services\AlertDelivery\AlertPayloadBuilder}).
+     *                                        Pre-rendered driver-agnostic payload (see
+     *                                        {@see AlertPayloadBuilder}).
      */
     public function __construct(
         public int $alertChannelId,

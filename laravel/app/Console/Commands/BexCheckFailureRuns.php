@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
+use App\Models\User;
 use App\Services\AlertDelivery\SystemAlertEmitter;
 use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
@@ -129,7 +130,7 @@ class BexCheckFailureRuns extends Command
     private function maybeAlertConsecutiveFailures(
         SystemAlertEmitter $emitter,
         Subscription $sub,
-        \App\Models\User $owner,
+        User $owner,
         int &$counter,
     ): void {
         // Pull the most recent N finished jobs (completed or failed).
@@ -184,7 +185,7 @@ class BexCheckFailureRuns extends Command
             user: $owner,
             kind: SystemAlertEmitter::KIND_CONSECUTIVE_FAILURES,
             title: "Subscription «{$sub->name}» — ".self::FAILURE_RUN_THRESHOLD." consecutive {$reason}",
-            body: "The last ".self::FAILURE_RUN_THRESHOLD." scrape jobs for {$sub->name} ({$sub->environment}) have all failed with stop_reason={$reason}. Investigate the underlying cause before the queue backs up.",
+            body: 'The last '.self::FAILURE_RUN_THRESHOLD." scrape jobs for {$sub->name} ({$sub->environment}) have all failed with stop_reason={$reason}. Investigate the underlying cause before the queue backs up.",
             context: [
                 'subscription_id' => $sub->id,
                 'subscription_name' => $sub->name,
@@ -209,7 +210,7 @@ class BexCheckFailureRuns extends Command
     private function maybeAlertQuietSubscription(
         SystemAlertEmitter $emitter,
         Subscription $sub,
-        \App\Models\User $owner,
+        User $owner,
         CarbonImmutable $quietThreshold,
         int &$counter,
     ): void {
@@ -232,7 +233,7 @@ class BexCheckFailureRuns extends Command
         $emitter->emit(
             user: $owner,
             kind: SystemAlertEmitter::KIND_QUIET_SUBSCRIPTION,
-            title: "Subscription «{$sub->name}» — quiet for >".self::QUIET_THRESHOLD_HOURS."h",
+            title: "Subscription «{$sub->name}» — quiet for >".self::QUIET_THRESHOLD_HOURS.'h',
             body: $description,
             context: [
                 'subscription_id' => $sub->id,

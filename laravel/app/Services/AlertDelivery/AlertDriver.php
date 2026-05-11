@@ -20,10 +20,10 @@ interface AlertDriver
      * Send the rendered payload through the channel.
      *
      * @param  array<string,mixed>  $payload
-     *         Pre-rendered notification body shaped by
-     *         {@see AlertPayloadBuilder}. The driver picks the keys
-     *         it cares about (Slack: `text`/`blocks`; webhook: full
-     *         payload; email: `subject`/`body`/`recipient_override?`).
+     *                                        Pre-rendered notification body shaped by
+     *                                        {@see AlertPayloadBuilder}. The driver picks the keys
+     *                                        it cares about (Slack: `text`/`blocks`; webhook: full
+     *                                        payload; email: `subject`/`body`/`recipient_override?`).
      */
     public function send(AlertChannel $channel, array $payload): void;
 }
