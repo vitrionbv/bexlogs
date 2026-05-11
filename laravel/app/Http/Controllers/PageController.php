@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\LogMessage;
 use App\Models\Page;
 use App\Models\Subscription;
+use App\Services\Ai\LogQueryBuilder;
 use App\Services\ColdLogReader;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -84,7 +85,7 @@ class PageController extends Controller
         $sortDir = $filters['direction'] ?? 'desc';
 
         $query = LogMessage::query()->where('page_id', $page->id);
-        $this->applyFilters($query, $filters);
+        app(LogQueryBuilder::class)->applyFilters($query, $filters);
 
         $hotTotal = (clone $query)->count();
 
@@ -243,59 +244,6 @@ class PageController extends Controller
         }
 
         return $attrs;
-    }
-
-    private function applyFilters($query, array $filters): void
-    {
-        if (! empty($filters['startDate'])) {
-            $query->where('timestamp', '>=', $filters['startDate']);
-        }
-        if (! empty($filters['endDate'])) {
-            $query->where('timestamp', '<=', $filters['endDate']);
-        }
-        foreach (['type', 'action', 'method', 'status'] as $col) {
-            if (! empty($filters[$col])) {
-                $query->where($col, $filters[$col]);
-            }
-        }
-
-        // Entity = first whitespace-separated token of action. Postgres ILIKE
-        // gives case-insensitive prefix match without rebuilding an index.
-        if (! empty($filters['entity'])) {
-            $entity = $filters['entity'];
-            $query->where(function ($w) use ($entity) {
-                $w->where('action', 'ILIKE', $entity.' %')
-                    ->orWhere('action', 'ILIKE', $entity);
-            });
-        }
-
-        // Free-text search across action / path / method / json bodies. The
-        // user's needle has its SQL LIKE wildcards (`%` and `_`) escaped so
-        // a search for an entity id like `26205663` doesn't get reinterpreted
-        // as a wildcard pattern.
-        if (! empty($filters['q'])) {
-            $needle = '%'.str_replace(['%', '_'], ['\\%', '\\_'], $filters['q']).'%';
-            $query->where(function ($w) use ($needle) {
-                $w->where('action', 'ILIKE', $needle)
-                    ->orWhere('path', 'ILIKE', $needle)
-                    ->orWhere('method', 'ILIKE', $needle)
-                    ->orWhereRaw('parameters::text ILIKE ?', [$needle])
-                    ->orWhereRaw('request::text ILIKE ?', [$needle])
-                    ->orWhereRaw('response::text ILIKE ?', [$needle]);
-            });
-        }
-
-        if (! empty($filters['jsonFilters'])) {
-            foreach ($filters['jsonFilters'] as $jf) {
-                $field = $jf['field'];
-                $value = $jf['value'];
-                $query->where(function ($q) use ($field, $value) {
-                    foreach (['parameters', 'request', 'response'] as $col) {
-                        $q->orWhereRaw("$col::text ILIKE ?", ["%\"$field\":%$value%"]);
-                    }
-                });
-            }
-        }
     }
 
     private function authorizePageAccess(Request $request, Page $page): void
