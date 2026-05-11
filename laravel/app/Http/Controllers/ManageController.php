@@ -17,46 +17,242 @@ use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
 use Inertia\Response;
 
 class ManageController extends Controller
 {
+    /**
+     * Allow-list of sort modes the index page exposes via `?sort=…`. Any
+     * value outside this set falls back to `name`. Keeping the list
+     * tight means the controller never has to guard against
+     * SQL-injection or unknown column names — the sort key is mapped
+     * to a hard-coded ORDER BY fragment below in `applySubscriptionSort`.
+     *
+     * Default is `name` because that's what an alphabetically-curated
+     * UI most often wants; `id` is offered as the "stop the page from
+     * jumping when I edit a row" escape hatch (numeric subscription
+     * IDs never change after creation, so the order is bulletproof).
+     */
+    private const SORT_MODES = ['name', 'id', 'last_scraped', 'environment'];
+
     public function index(Request $request): Response
     {
         $user = $request->user();
+        $sort = $this->normalizeSort($request->query('sort'));
+        $search = trim((string) $request->query('q', ''));
+
+        // Eager-load with an explicit ORDER BY at every nesting level.
+        // The previous code only ordered `organizations` by name and
+        // left `applications` + `subscriptions` un-ordered, so Postgres
+        // was free to return them in heap order — which an UPDATE on
+        // any subscription row (toggling auto_scrape, bumping an
+        // interval, etc.) reshuffles, making the just-edited row
+        // visibly "jump" after the Inertia partial reload.
+        //
+        // Two-key sort everywhere: the primary human-friendly key, then
+        // `id` as a deterministic tiebreaker. The `id` tiebreaker is
+        // what guarantees the order is identical run-to-run even when
+        // two rows share the same primary value (two apps with the
+        // same name, two subs with the same `last_scraped_at`, etc.).
         $orgs = $user->organizations()
-            ->with(['applications.subscriptions'])
+            ->with([
+                'applications' => fn ($q) => $q->orderBy('name')->orderBy('id'),
+                'applications.subscriptions' => fn ($q) => $this->applySubscriptionSort($q, $sort),
+            ])
             ->orderBy('name')
+            ->orderBy('id')
             ->get();
 
-        return Inertia::render('Manage/Index', [
-            'organizations' => $orgs->map(fn (Organization $o) => [
-                'id' => $o->id,
-                'name' => $o->name,
-                'applications' => $o->applications->map(fn (Application $a) => [
-                    'id' => $a->id,
-                    'name' => $a->name,
-                    'subscriptions' => $a->subscriptions->map(fn (Subscription $s) => [
-                        'id' => $s->id,
-                        'name' => $s->name,
-                        'environment' => $s->environment,
-                        'auto_scrape' => $s->auto_scrape,
-                        'scrape_interval_minutes' => $s->scrape_interval_minutes,
-                        'max_pages_per_scrape' => $s->max_pages_per_scrape,
-                        'lookback_days_first_scrape' => $s->lookback_days_first_scrape,
-                        'max_duration_minutes' => $s->max_duration_minutes,
-                        'max_concurrent_jobs' => $s->max_concurrent_jobs,
-                        'job_spacing_minutes' => $s->job_spacing_minutes,
-                        'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
-                    ]),
+        $organizations = $orgs->map(fn (Organization $o) => [
+            'id' => $o->id,
+            'name' => $o->name,
+            'applications' => $o->applications->map(fn (Application $a) => [
+                'id' => $a->id,
+                'name' => $a->name,
+                'subscriptions' => $a->subscriptions->map(fn (Subscription $s) => [
+                    'id' => $s->id,
+                    'name' => $s->name,
+                    'environment' => $s->environment,
+                    'auto_scrape' => $s->auto_scrape,
+                    'scrape_interval_minutes' => $s->scrape_interval_minutes,
+                    'max_pages_per_scrape' => $s->max_pages_per_scrape,
+                    'lookback_days_first_scrape' => $s->lookback_days_first_scrape,
+                    'max_duration_minutes' => $s->max_duration_minutes,
+                    'max_concurrent_jobs' => $s->max_concurrent_jobs,
+                    'job_spacing_minutes' => $s->job_spacing_minutes,
+                    'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
                 ]),
             ]),
+        ]);
+
+        // Server-side text filter. Matches across org name, app name,
+        // sub name, and sub id — case-insensitive. Done in PHP rather
+        // than SQL because the cascade is already in memory and the
+        // dataset is small (per-user, capped by how many real
+        // BookingExperts subscriptions one operator manages — typically
+        // dozens, never thousands). Performing the filter post-load
+        // also keeps the SQL stable and the ordering deterministic.
+        if ($search !== '') {
+            $needle = Str::lower($search);
+            $organizations = $organizations
+                ->map(function (array $org) use ($needle) {
+                    $org['applications'] = collect($org['applications'])
+                        ->map(function (array $app) use ($needle) {
+                            $app['subscriptions'] = collect($app['subscriptions'])
+                                ->filter(fn (array $sub) => self::matchesQuery($sub, $needle))
+                                ->values()
+                                ->all();
+
+                            return $app;
+                        })
+                        // Hide apps with no matching subs UNLESS the
+                        // app name itself matches the needle (so
+                        // searching "verbleif" still surfaces the app
+                        // card even if no individual sub matches).
+                        ->filter(fn (array $app) => count($app['subscriptions']) > 0
+                            || Str::contains(Str::lower($app['name']), $needle)
+                            || Str::contains(Str::lower((string) $app['id']), $needle))
+                        ->values()
+                        ->all();
+
+                    return $org;
+                })
+                // Same rule one level up: keep the org card if any of
+                // its apps survived OR the org name/id matches.
+                ->filter(fn (array $org) => count($org['applications']) > 0
+                    || Str::contains(Str::lower($org['name']), $needle)
+                    || Str::contains(Str::lower((string) $org['id']), $needle))
+                ->values();
+        }
+
+        // Counts reflect the unfiltered dataset so the summary chip is
+        // a stable "your account holds N subscriptions" rather than a
+        // shifting "currently visible" number. The frontend renders
+        // both: total + visible.
+        $totals = $this->buildTotals($orgs);
+
+        return Inertia::render('Manage/Index', [
+            'organizations' => $organizations,
             'sessionsActive' => $user->bexSessions()
                 ->whereNull('expired_at')
                 ->count(),
+            'filters' => [
+                'sort' => $sort,
+                'q' => $search,
+            ],
+            'totals' => $totals,
         ]);
+    }
+
+    /**
+     * Map a raw `?sort=` query value to one of `SORT_MODES`. Anything
+     * unrecognized (typo, omitted, hostile) falls back to `name`.
+     */
+    private function normalizeSort(mixed $sort): string
+    {
+        $candidate = is_string($sort) ? $sort : '';
+
+        return in_array($candidate, self::SORT_MODES, true) ? $candidate : 'name';
+    }
+
+    /**
+     * Apply the selected sort mode to a Subscriptions query builder
+     * with a deterministic tiebreaker.
+     *
+     * The four modes:
+     *   - `name`         primary key for an alphabetically-curated UI.
+     *                    Default; what most operators expect.
+     *   - `id`           numeric-string sort via `LENGTH(id), id`,
+     *                    portable to both Postgres (prod) and SQLite
+     *                    (tests). Subscription IDs never change after
+     *                    creation, so this is the order-stability
+     *                    escape hatch operators can pick when an edit
+     *                    on a name- or last_scraped-sorted view would
+     *                    otherwise shuffle the row.
+     *   - `last_scraped` most-recently-scraped first; NULLS LAST so
+     *                    fresh subscriptions (never scraped yet) go
+     *                    to the bottom rather than masquerading as
+     *                    "ancient". Handled via a CASE expression
+     *                    because SQLite lacks NULLS LAST.
+     *   - `environment`  groups production / staging together — useful
+     *                    when an account spans both.
+     *
+     * Every mode appends `LENGTH(id), id` so two subscriptions sharing
+     * the primary value stay in a deterministic order; this is what
+     * stops the "jump" the user reported.
+     */
+    private function applySubscriptionSort(mixed $query, string $sort): mixed
+    {
+        // The closure passed to `with(['…' => fn($q) => …])` is invoked
+        // with a `Relations\HasMany` (or whichever relation type the
+        // eager-load resolves to), NOT a bare `Builder` — that's why
+        // the type here is `mixed`. Both classes forward
+        // `orderBy*` to the underlying query builder, so the body
+        // below works against either.
+        //
+        // Numeric-string sort that works on both Postgres and SQLite
+        // without a CAST — shorter strings come first, then alpha.
+        // For all-numeric IDs (today's reality) this matches natural
+        // numeric ordering: ['1', '10', '100', '2'] becomes
+        // ['1', '2', '10', '100'].
+        $idOrder = fn ($q) => $q->orderByRaw('LENGTH(id), id');
+
+        return match ($sort) {
+            'id' => $idOrder($query),
+
+            'last_scraped' => $idOrder(
+                $query->orderByRaw(
+                    'CASE WHEN last_scraped_at IS NULL THEN 1 ELSE 0 END, last_scraped_at DESC',
+                ),
+            ),
+
+            'environment' => $idOrder(
+                $query->orderBy('environment')->orderBy('name'),
+            ),
+
+            // `name` and any fallthrough.
+            default => $idOrder($query->orderBy('name')),
+        };
+    }
+
+    /**
+     * Substring match across the fields an operator most often types
+     * into the search box: subscription name, subscription id (so
+     * pasting an id from another tab Just Works), and the wrapping
+     * app/org names indirectly (handled in the caller — see
+     * `index()`).
+     */
+    private static function matchesQuery(array $sub, string $needle): bool
+    {
+        return Str::contains(Str::lower((string) $sub['name']), $needle)
+            || Str::contains(Str::lower((string) $sub['id']), $needle)
+            || Str::contains(Str::lower((string) $sub['environment']), $needle);
+    }
+
+    /**
+     * Compute the summary chip the index page renders under the
+     * header: total orgs / apps / subscriptions, plus how many subs
+     * have `auto_scrape = true`. Totals are over the un-filtered
+     * dataset so the chip stays stable while the user types in the
+     * search box.
+     *
+     * @param  \Illuminate\Database\Eloquent\Collection<int, Organization>  $orgs
+     * @return array{organizations:int, applications:int, subscriptions:int, auto_scrape_on:int}
+     */
+    private function buildTotals($orgs): array
+    {
+        $allApps = $orgs->flatMap(fn (Organization $o) => $o->applications);
+        $allSubs = $allApps->flatMap(fn (Application $a) => $a->subscriptions);
+
+        return [
+            'organizations' => $orgs->count(),
+            'applications' => $allApps->count(),
+            'subscriptions' => $allSubs->count(),
+            'auto_scrape_on' => $allSubs->where('auto_scrape', true)->count(),
+        ];
     }
 
     public function storeSubscription(Request $request): RedirectResponse

@@ -3,13 +3,17 @@ import { Head, Link, router, useForm } from '@inertiajs/vue3';
 import {
     AlertCircle,
     Building2,
+    ChevronDown,
+    ChevronRight,
     ExternalLink,
     KeyRound,
     Loader2,
     Play,
     Plus,
     RefreshCw,
+    Search,
     Trash2,
+    X,
 } from 'lucide-vue-next';
 import { computed, defineComponent, h, ref, watch } from 'vue';
 import { toast } from 'vue-sonner';
@@ -67,12 +71,154 @@ interface OrgRow {
     applications: AppRow[];
 }
 
-defineProps<{
+type SortMode = 'name' | 'id' | 'last_scraped' | 'environment';
+
+interface Totals {
+    organizations: number;
+    applications: number;
+    subscriptions: number;
+    auto_scrape_on: number;
+}
+
+const props = defineProps<{
     organizations: OrgRow[];
     sessionsActive: number;
+    filters: { sort: SortMode; q: string };
+    totals: Totals;
 }>();
 
 defineOptions({ layout: { breadcrumbs: [{ title: 'Manage', href: '/manage' }] } });
+
+// ─── Sort + search ───────────────────────────────────────────────────────────
+//
+// Both knobs are URL-driven so an Inertia partial reload (the
+// `router.patch` calls below that re-fetch `organizations` after an
+// inline edit) keeps the current view stable: the browser stays on
+// `/manage?sort=foo&q=bar`, the patch redirects back via `back()`,
+// and the response carries the same sorted/filtered organizations
+// prop. No client-side reshuffling, no flash of un-sorted content.
+//
+// Server-side ordering also means the row the user just edited stays
+// in its slot — the original "jump" bug — because the ORDER BY clause
+// is deterministic across runs (every level has an `id` tiebreaker).
+
+const SORT_OPTIONS: { value: SortMode; label: string; hint: string }[] = [
+    { value: 'name', label: 'Name (A–Z)', hint: 'Default. Stable while editing.' },
+    { value: 'id', label: 'ID', hint: 'Numeric subscription ID. Never moves on edit.' },
+    { value: 'last_scraped', label: 'Last scraped', hint: 'Most recent first; never-scraped last.' },
+    { value: 'environment', label: 'Environment', hint: 'Groups production / staging.' },
+];
+
+const sortMode = ref<SortMode>(props.filters.sort);
+const searchQuery = ref<string>(props.filters.q);
+
+// Debounce search input so typing doesn't fire an Inertia visit per
+// keystroke. 200ms is fast enough to feel live but slow enough to
+// avoid hammering the server with in-flight requests.
+let searchDebounce: ReturnType<typeof setTimeout> | null = null;
+
+function applyFilters(): void {
+    router.get(
+        '/manage',
+        // Drop empty `q` so the URL doesn't carry `?q=` noise when
+        // the search box is empty.
+        {
+            sort: sortMode.value,
+            ...(searchQuery.value ? { q: searchQuery.value } : {}),
+        },
+        {
+            preserveState: true,
+            preserveScroll: true,
+            replace: true,
+            // Only the parts that actually change with the filter.
+            // `sessionsActive` is unaffected; leave the prop in place.
+            only: ['organizations', 'filters', 'totals'],
+        },
+    );
+}
+
+function onSortChange(next: SortMode): void {
+    sortMode.value = next;
+    applyFilters();
+}
+
+function onSearchInput(value: string): void {
+    searchQuery.value = value;
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => applyFilters(), 200);
+}
+
+function clearSearch(): void {
+    searchQuery.value = '';
+    if (searchDebounce) clearTimeout(searchDebounce);
+    applyFilters();
+}
+
+// ─── Per-subscription expand/collapse ────────────────────────────────────────
+//
+// With many subscriptions the page used to render eight form fields
+// per row (auto-scrape, interval, three budget knobs, two concurrency
+// knobs, actions). That's a wall of inputs once you have more than a
+// handful of subs. Collapse the expensive bottom blocks by default;
+// the always-visible header row keeps the common controls (auto
+// toggle, interval, Scrape now, Delete) one click away.
+//
+// State is a Set of subscription IDs that are currently expanded,
+// plus an `expandAll` toggle for the bulk path. Local-only — not
+// persisted across navigations — so a fresh visit always starts
+// compact regardless of where the user left off.
+
+const expandedSubs = ref<Set<string>>(new Set());
+const expandAll = ref<boolean>(false);
+
+function isExpanded(subId: string): boolean {
+    return expandAll.value || expandedSubs.value.has(subId);
+}
+
+function toggleExpanded(subId: string): void {
+    const next = new Set(expandedSubs.value);
+    if (next.has(subId)) {
+        next.delete(subId);
+    } else {
+        next.add(subId);
+    }
+    expandedSubs.value = next;
+}
+
+function toggleExpandAll(): void {
+    expandAll.value = !expandAll.value;
+    if (!expandAll.value) {
+        // Collapsing "expand all" wipes any per-row expansions too —
+        // intent of the bulk button is "reset to compact".
+        expandedSubs.value = new Set();
+    }
+}
+
+// Format a `last_scraped_at` ISO string as a short relative-ish label
+// for the header row. We intentionally avoid pulling in date-fns
+// here; the four cases below cover the operator's mental model
+// ("just now / minutes / hours / days") without locale strings or
+// heavy formatters.
+function formatLastScraped(iso: string | null): string {
+    if (!iso) return 'never';
+    const ms = Date.now() - new Date(iso).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return 'just now';
+    const minutes = Math.floor(ms / 60_000);
+    if (minutes < 1) return 'just now';
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+}
+
+const hasFilter = computed(() => searchQuery.value.length > 0);
+const visibleSubCount = computed(() =>
+    props.organizations.reduce(
+        (acc, o) => acc + o.applications.reduce((a, app) => a + app.subscriptions.length, 0),
+        0,
+    ),
+);
 
 const dialogOpen = ref(false);
 type TabId = 'browse' | 'url' | 'manual';
@@ -487,6 +633,24 @@ const ManualNickname = defineComponent({
                 <p class="text-muted-foreground text-sm">
                     Organizations, applications, and BookingExperts subscriptions to scrape.
                 </p>
+                <p class="text-muted-foreground mt-1 text-xs">
+                    <span class="text-foreground font-medium">{{ totals.organizations }}</span>
+                    org<span v-if="totals.organizations !== 1">s</span>
+                    ·
+                    <span class="text-foreground font-medium">{{ totals.applications }}</span>
+                    app<span v-if="totals.applications !== 1">s</span>
+                    ·
+                    <span class="text-foreground font-medium">{{ totals.subscriptions }}</span>
+                    subscription<span v-if="totals.subscriptions !== 1">s</span>
+                    ·
+                    <span class="text-foreground font-medium">{{ totals.auto_scrape_on }}</span>
+                    auto-scrape on
+                    <span v-if="hasFilter" class="text-muted-foreground">
+                        — showing
+                        <span class="text-foreground font-medium">{{ visibleSubCount }}</span>
+                        match<span v-if="visibleSubCount !== 1">es</span>
+                    </span>
+                </p>
             </div>
             <Dialog v-model:open="dialogOpen">
                 <DialogTrigger as-child>
@@ -771,6 +935,70 @@ const ManualNickname = defineComponent({
             </Dialog>
         </header>
 
+        <!--
+            Filter toolbar. Hidden when the account has no
+            subscriptions yet (the empty-state card below is more
+            helpful than a search box over zero rows).
+        -->
+        <div
+            v-if="totals.subscriptions > 0"
+            class="border-border bg-background flex flex-wrap items-center gap-2 rounded-md border p-2"
+            data-testid="manage-filter-toolbar"
+        >
+            <div class="relative min-w-[220px] flex-1">
+                <Search class="text-muted-foreground pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2" />
+                <input
+                    type="search"
+                    placeholder="Search by name or ID…"
+                    :value="searchQuery"
+                    class="border-input bg-background focus-visible:ring-ring h-9 w-full rounded-md border pl-8 pr-8 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1"
+                    aria-label="Filter subscriptions"
+                    @input="onSearchInput(($event.target as HTMLInputElement).value)"
+                />
+                <button
+                    v-if="hasFilter"
+                    type="button"
+                    class="text-muted-foreground hover:text-foreground absolute right-2 top-1/2 -translate-y-1/2"
+                    aria-label="Clear search"
+                    @click="clearSearch"
+                >
+                    <X class="size-4" />
+                </button>
+            </div>
+
+            <div class="flex items-center gap-2">
+                <Label class="text-muted-foreground text-xs uppercase">Sort</Label>
+                <Select :model-value="sortMode" @update:model-value="(v) => onSortChange(v as SortMode)">
+                    <SelectTrigger class="h-9 w-[160px]">
+                        <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                        <SelectItem
+                            v-for="opt in SORT_OPTIONS"
+                            :key="opt.value"
+                            :value="opt.value"
+                        >
+                            <div class="flex flex-col">
+                                <span>{{ opt.label }}</span>
+                                <span class="text-muted-foreground text-[10px]">{{ opt.hint }}</span>
+                            </div>
+                        </SelectItem>
+                    </SelectContent>
+                </Select>
+            </div>
+
+            <Button
+                variant="outline"
+                size="sm"
+                class="ml-auto"
+                @click="toggleExpandAll"
+            >
+                <ChevronDown v-if="!expandAll" class="mr-1 size-4" />
+                <ChevronRight v-else class="mr-1 size-4" />
+                {{ expandAll ? 'Collapse all' : 'Expand all' }}
+            </Button>
+        </div>
+
         <Card v-if="!sessionsActive">
             <CardHeader>
                 <CardTitle class="flex items-center gap-2">
@@ -785,6 +1013,22 @@ const ManualNickname = defineComponent({
                     <Link href="/authenticate">Go to Sessions</Link>
                 </Button>
             </CardContent>
+        </Card>
+
+        <!--
+            Empty filter-state. The unfiltered empty state below
+            (`!organizations.length` when `!totals.subscriptions`)
+            tells the user to add a subscription; this one tells them
+            their filter is too narrow.
+        -->
+        <Card v-if="hasFilter && !organizations.length && totals.subscriptions > 0">
+            <CardHeader>
+                <CardTitle class="text-base">No subscriptions match “{{ searchQuery }}”</CardTitle>
+                <CardDescription>
+                    Try a different query, or
+                    <button class="underline underline-offset-2" @click="clearSearch">clear the search</button>.
+                </CardDescription>
+            </CardHeader>
         </Card>
 
         <Card v-if="!organizations.length">
@@ -818,16 +1062,32 @@ const ManualNickname = defineComponent({
                         v-for="sub in app.subscriptions"
                         :key="sub.id"
                         class="bg-muted/30 space-y-2 rounded-md p-3"
+                        data-testid="manage-sub-row"
                     >
                         <div class="flex flex-wrap items-center justify-between gap-3">
-                            <div class="flex items-center gap-3">
+                            <button
+                                type="button"
+                                class="flex flex-1 items-center gap-2 text-left"
+                                :aria-expanded="isExpanded(sub.id)"
+                                @click="toggleExpanded(sub.id)"
+                            >
+                                <ChevronDown
+                                    v-if="isExpanded(sub.id)"
+                                    class="text-muted-foreground size-4 shrink-0"
+                                />
+                                <ChevronRight v-else class="text-muted-foreground size-4 shrink-0" />
                                 <div class="flex flex-col">
                                     <span class="text-sm font-medium">{{ sub.name }}</span>
-                                    <span class="text-muted-foreground font-mono text-xs">
-                                        {{ sub.id }} · {{ sub.environment }}
+                                    <span class="text-muted-foreground flex items-center gap-2 text-xs">
+                                        <span class="font-mono">{{ sub.id }}</span>
+                                        <Badge variant="outline" class="px-1 py-0 text-[10px]">
+                                            {{ sub.environment }}
+                                        </Badge>
+                                        <span>·</span>
+                                        <span>last scrape: {{ formatLastScraped(sub.last_scraped_at) }}</span>
                                     </span>
                                 </div>
-                            </div>
+                            </button>
                             <div class="flex flex-wrap items-center gap-3 text-sm">
                                 <label class="flex items-center gap-2">
                                     <Switch
@@ -861,6 +1121,14 @@ const ManualNickname = defineComponent({
                             </div>
                         </div>
 
+                        <!--
+                            Budget + concurrency knobs collapse by default. The
+                            common-case controls (auto-scrape, interval, scrape
+                            now, delete) live in the header row above and stay
+                            always-visible; this block is the "edit advanced
+                            settings" surface that only shows when expanded.
+                        -->
+                        <div v-show="isExpanded(sub.id)" class="space-y-2">
                         <div
                             class="border-border/60 grid grid-cols-1 gap-3 border-t pt-2 sm:grid-cols-3"
                         >
@@ -992,6 +1260,7 @@ const ManualNickname = defineComponent({
                                     for this long. 10 minutes is a reasonable default.
                                 </p>
                             </div>
+                        </div>
                         </div>
                     </div>
                 </div>
