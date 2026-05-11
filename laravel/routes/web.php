@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Admin\ActivityController;
 use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\AlertsController;
 use App\Http\Controllers\Api\SearchController;
@@ -165,7 +166,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     // active typing.
     Route::get('api/search', SearchController::class)->name('api.search');
 
-    // Admin-only user management. Single-tenant app — one boolean
+    // Admin-only operator surfaces. Single-tenant app — one boolean
     // (`users.is_admin`) gates everything in this group.
     Route::middleware('admin')->prefix('admin')->name('admin.')->group(function () {
         Route::get('users', [UserController::class, 'index'])
@@ -178,6 +179,15 @@ Route::middleware(['auth', 'verified'])->group(function () {
             ->name('users.destroy');
         Route::post('users/{user}/password-reset', [UserController::class, 'sendPasswordResetLink'])
             ->name('users.password-reset');
+
+        // F18 — read-only activity / audit log. Paginated 50/row;
+        // user/action/date/subject filters round-trip through the
+        // query string so a deep-linked filtered view survives a
+        // refresh. Used to live at /settings/activity (any
+        // authenticated user) — moved here when the audit feed
+        // graduated to operator-only territory.
+        Route::get('activity', [ActivityController::class, 'index'])
+            ->name('activity.index');
     });
 });
 

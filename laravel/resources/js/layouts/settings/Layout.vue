@@ -28,15 +28,6 @@ const sidebarNavItems: NavItem[] = [
         title: 'Appearance',
         href: editAppearance(),
     },
-    // Static href rather than a wayfinder route alias because the
-    // wayfinder export only lands AFTER the first build that follows
-    // the route registration; using a string keeps the Vue side
-    // building cleanly even on a fresh checkout where the generated
-    // `routes/activity.ts` doesn't exist yet.
-    {
-        title: 'Activity',
-        href: '/settings/activity',
-    },
 ];
 
 const { isCurrentOrParentUrl } = useCurrentUrl();

@@ -1,6 +1,6 @@
 <?php
 
-namespace Tests\Feature\Settings;
+namespace Tests\Feature\Admin;
 
 use App\Models\Application;
 use App\Models\AuditLog;
@@ -16,8 +16,14 @@ use Inertia\Testing\AssertableInertia;
 use Tests\TestCase;
 
 /**
- * Inertia-flavoured tests for the Activity page (F18). Uses
- * `AssertableInertia` so we don't have to chase X-Inertia version
+ * Inertia-flavoured tests for the Admin Activity page (F18). The page
+ * lives behind the `admin` middleware (single-tenant `users.is_admin`
+ * boolean) so a non-admin visit must hit a 403 even when authenticated;
+ * an admin visit must see every audit row across users — that
+ * cross-user visibility is the whole reason the page graduated out of
+ * Settings (where it was scoped to "any signed-in user").
+ *
+ * Uses `AssertableInertia` so we don't have to chase X-Inertia version
  * mismatches in the assertion path — the framework's testing helper
  * stubs the version check.
  */
@@ -29,14 +35,20 @@ class ActivityPageTest extends TestCase
 
     private User $bob;
 
+    private User $eve;
+
     private Subscription $sub;
 
     protected function setUp(): void
     {
         parent::setUp();
 
-        $this->alice = User::factory()->create(['name' => 'Alice']);
-        $this->bob = User::factory()->create(['name' => 'Bob']);
+        // Alice + Bob are admins (the audit feed is operator-only).
+        // Eve is the bouncer-test fixture: a verified, signed-in user
+        // who must still get a 403 because she lacks `is_admin`.
+        $this->alice = User::factory()->create(['name' => 'Alice', 'is_admin' => true]);
+        $this->bob = User::factory()->create(['name' => 'Bob', 'is_admin' => true]);
+        $this->eve = User::factory()->create(['name' => 'Eve']);
 
         $org = Organization::create([
             'id' => 'org-'.Str::random(8),
@@ -90,16 +102,34 @@ class ActivityPageTest extends TestCase
         Carbon::setTestNow();
     }
 
-    public function test_unfiltered_returns_all_rows_newest_first(): void
+    public function test_non_admin_user_is_forbidden(): void
     {
+        // Eve is verified and signed in — the only thing missing is
+        // `is_admin`. EnsureUserIsAdmin must abort with 403 anyway;
+        // a 302 (e.g. a redirect to /login) would be a regression of
+        // the gate.
+        $this->actingAs($this->eve)
+            ->get(route('admin.activity.index'))
+            ->assertForbidden();
+    }
+
+    public function test_unfiltered_returns_all_rows_across_users_newest_first(): void
+    {
+        // The cross-user assertion is the load-bearing one: this is
+        // the behaviour that distinguishes the admin feed from a
+        // hypothetical user-scoped one. Alice (the caller) sees the
+        // row Bob produced, and the order is newest-first.
         $this->actingAs($this->alice)
-            ->get(route('activity.index'))
+            ->get(route('admin.activity.index'))
             ->assertOk()
             ->assertInertia(fn (AssertableInertia $page) => $page
-                ->component('settings/Activity')
+                ->component('Admin/Activity/Index')
                 ->where('logs.data.0.action', 'subscription.deleted')
+                ->where('logs.data.0.user.id', $this->bob->id)
                 ->where('logs.data.1.action', 'subscription.auto_scrape_toggled')
+                ->where('logs.data.1.user.id', $this->alice->id)
                 ->where('logs.data.2.action', 'subscription.budget_updated')
+                ->where('logs.data.2.user.id', $this->alice->id)
                 ->where('logs.meta.total', 3),
             );
     }
@@ -107,7 +137,7 @@ class ActivityPageTest extends TestCase
     public function test_user_filter_narrows_to_one_actor(): void
     {
         $this->actingAs($this->alice)
-            ->get(route('activity.index', ['user_id' => $this->bob->id]))
+            ->get(route('admin.activity.index', ['user_id' => $this->bob->id]))
             ->assertOk()
             ->assertInertia(fn (AssertableInertia $page) => $page
                 ->where('logs.meta.total', 1)
@@ -119,7 +149,7 @@ class ActivityPageTest extends TestCase
     public function test_action_multi_select_filter(): void
     {
         $this->actingAs($this->alice)
-            ->get(route('activity.index', [
+            ->get(route('admin.activity.index', [
                 'actions' => [
                     'subscription.budget_updated',
                     'subscription.auto_scrape_toggled',
@@ -133,7 +163,7 @@ class ActivityPageTest extends TestCase
     public function test_date_range_filter(): void
     {
         $this->actingAs($this->alice)
-            ->get(route('activity.index', ['from' => '2026-05-11T00:00:00Z']))
+            ->get(route('admin.activity.index', ['from' => '2026-05-11T00:00:00Z']))
             ->assertInertia(fn (AssertableInertia $page) => $page
                 ->where('logs.meta.total', 1)
                 ->where('logs.data.0.action', 'subscription.deleted'),
@@ -146,7 +176,7 @@ class ActivityPageTest extends TestCase
         // count doesn't drop — but this still exercises the
         // morph-class allow-list lookup.
         $this->actingAs($this->alice)
-            ->get(route('activity.index', [
+            ->get(route('admin.activity.index', [
                 'subject_type' => 'Subscription',
                 'subject_id' => $this->sub->id,
             ]))
@@ -158,7 +188,7 @@ class ActivityPageTest extends TestCase
     public function test_unknown_subject_type_is_ignored(): void
     {
         $this->actingAs($this->alice)
-            ->get(route('activity.index', [
+            ->get(route('admin.activity.index', [
                 'subject_type' => 'NotAModel',
                 'subject_id' => $this->sub->id,
             ]))
@@ -175,7 +205,7 @@ class ActivityPageTest extends TestCase
         // Illuminate\Testing\Fluent\Concerns), so we type-hint and
         // call `containsStrict()` rather than `in_array()`.
         $this->actingAs($this->alice)
-            ->get(route('activity.index'))
+            ->get(route('admin.activity.index'))
             ->assertInertia(function (AssertableInertia $page) {
                 $page->where(
                     'facets.actions',

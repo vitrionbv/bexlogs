@@ -3,6 +3,7 @@ import { Link, usePage } from '@inertiajs/vue3';
 import {
     Activity,
     BellRing,
+    History,
     KeyRound,
     LayoutDashboard,
     Radio,
@@ -39,6 +40,11 @@ const mainNavItems: NavItem[] = [
 
 const adminNavItems: NavItem[] = [
     { title: 'Users', href: '/admin/users', icon: Users },
+    // F18 audit feed. Used to live under Settings; promoted to the
+    // admin sidebar when the page graduated to operator-only
+    // territory (see App\Http\Controllers\Admin\ActivityController
+    // for the matching server-side gate).
+    { title: 'Activity', href: '/admin/activity', icon: History },
 ];
 
 const page = usePage();

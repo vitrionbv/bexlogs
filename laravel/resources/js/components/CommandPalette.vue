@@ -149,7 +149,12 @@ function pushRecent(result: PaletteResult): void {
 
 // ─── Static groups ───────────────────────────────────────────────────────────
 
-const NAV_ITEMS: PaletteResult[] = [
+// Pages every authenticated user can reach. Admin-only pages (e.g.
+// the Activity log) live in `ADMIN_NAV_ITEMS` below and are spliced
+// into `NAV_ITEMS` only when `is_admin` is true on the shared auth
+// prop — otherwise a non-admin clicking through the palette would
+// hit a 403 and the entry would just be a frustrating decoy.
+const BASE_NAV_ITEMS: PaletteResult[] = [
     { id: 'dashboard', kind: 'page', label: 'Dashboard', href: '/dashboard' },
     { id: 'logs', kind: 'page', label: 'Logs', href: '/logs' },
     { id: 'jobs', kind: 'page', label: 'Jobs', href: '/jobs' },
@@ -168,18 +173,40 @@ const NAV_ITEMS: PaletteResult[] = [
         href: '/settings/security',
     },
     {
-        id: 'settings.activity',
-        kind: 'page',
-        label: 'Settings · Activity',
-        href: '/settings/activity',
-    },
-    {
         id: 'settings.appearance',
         kind: 'page',
         label: 'Settings · Appearance',
         href: '/settings/appearance',
     },
 ];
+
+const ADMIN_NAV_ITEMS: PaletteResult[] = [
+    {
+        id: 'admin.activity',
+        kind: 'page',
+        label: 'Admin · Activity',
+        href: '/admin/activity',
+    },
+];
+
+// Splice the admin-only entries in only when the current user is an
+// admin. Reading `usePage()` here (rather than at the bottom of the
+// file alongside `isAuthed`) keeps the NAV_ITEMS computed declared
+// before its consumer in `groupedResults`. The shared auth prop is
+// the same object used by AppSidebar's admin gate, so the two
+// surfaces stay in lock-step.
+const palettePage = usePage();
+const isPaletteAdmin = computed<boolean>(() => {
+    const auth = (palettePage.props as { auth?: { user?: { is_admin?: boolean } | null } }).auth;
+
+    return !!auth?.user?.is_admin;
+});
+
+const NAV_ITEMS = computed<PaletteResult[]>(() =>
+    isPaletteAdmin.value
+        ? [...BASE_NAV_ITEMS, ...ADMIN_NAV_ITEMS]
+        : BASE_NAV_ITEMS,
+);
 
 const ACTION_ITEMS: PaletteResult[] = [
     {
@@ -305,7 +332,7 @@ const groupedResults = computed<
         groups.push({ kind: 'saved_query', title: 'Saved queries', items: sq });
     }
 
-    const pages = NAV_ITEMS.filter(staticFilter);
+    const pages = NAV_ITEMS.value.filter(staticFilter);
 
     if (pages.length > 0) {
         groups.push({ kind: 'page', title: 'Pages', items: pages });

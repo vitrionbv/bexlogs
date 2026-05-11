@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Http\Controllers\Settings;
+namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\AuditLog;
@@ -15,7 +15,7 @@ use Inertia\Inertia;
 use Inertia\Response;
 
 /**
- * Settings → Activity (F18).
+ * Admin → Activity (F18).
  *
  * Read-only feed over the `audit_logs` table with the four filters the
  * spec calls out: user, action, date range, and subject. The page is a
@@ -23,10 +23,20 @@ use Inertia\Response;
  * round-trip through the query string so a deep-linked filtered view
  * survives a refresh.
  *
- * Scoping: this is a single-tenant operator tool. Every user can see
- * every audit row — there's no per-user partition. If that ever
- * changes (multi-tenant pivot), this is where the scope clause would
- * live.
+ * Surface: this used to live under `/settings/activity` (any
+ * authenticated user could read it). It moved here when the page
+ * graduated to operator-only territory: the audit feed exposes who
+ * touched what across the whole instance, which is privileged
+ * information that belongs alongside `/admin/users`. Routing is gated
+ * by the same `admin` middleware ({@see EnsureUserIsAdmin}) the rest
+ * of `/admin/*` uses, so a non-admin visit returns 403 instead of
+ * pretending the page doesn't exist.
+ *
+ * Scoping: this is a single-tenant operator tool, so the query is
+ * intentionally global — every admin sees every audit row, including
+ * actions taken by other users. That cross-user visibility is the
+ * whole point of moving the page here, and is locked down by the
+ * matching feature test ({@see Tests\Feature\Admin\ActivityPageTest}).
  */
 class ActivityController extends Controller
 {
@@ -85,7 +95,7 @@ class ActivityController extends Controller
             'created_at' => $log->created_at?->toIso8601String(),
         ])->values();
 
-        return Inertia::render('settings/Activity', [
+        return Inertia::render('Admin/Activity/Index', [
             'logs' => [
                 'data' => $rows,
                 'meta' => [

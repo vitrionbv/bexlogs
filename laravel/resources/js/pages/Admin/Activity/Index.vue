@@ -67,7 +67,7 @@ const props = defineProps<{
 
 defineOptions({
     layout: {
-        breadcrumbs: [{ title: 'Activity', href: '/settings/activity' }],
+        breadcrumbs: [{ title: 'Activity', href: '/admin/activity' }],
     },
 });
 
@@ -142,7 +142,7 @@ function applyFilters(): void {
         payload.to = toValue.value;
     }
 
-    router.get('/settings/activity', payload, {
+    router.get('/admin/activity', payload, {
         preserveState: true,
         preserveScroll: true,
         replace: true,
@@ -157,7 +157,7 @@ function clearFilters(): void {
     toValue.value = '';
     selectedActions.value = new Set();
     router.get(
-        '/settings/activity',
+        '/admin/activity',
         {},
         { preserveState: true, preserveScroll: true },
     );
@@ -194,7 +194,7 @@ function pageUrl(page: number): string {
     const params = new URLSearchParams(window.location.search);
     params.set('page', String(page));
 
-    return `/settings/activity?${params.toString()}`;
+    return `/admin/activity?${params.toString()}`;
 }
 
 function gotoPage(page: number): void {
@@ -258,7 +258,7 @@ function payloadSummary(row: AuditRow): string {
 
     <h1 class="sr-only">Activity log</h1>
 
-    <div class="flex flex-col space-y-6">
+    <div class="mx-auto flex w-full max-w-6xl flex-col gap-4 p-4 md:p-6">
         <Heading
             variant="small"
             title="Activity log"
