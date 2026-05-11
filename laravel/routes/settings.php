@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Settings\ActivityController;
+use App\Http\Controllers\Settings\ApiTokenController;
 use App\Http\Controllers\Settings\ProfileController;
 use App\Http\Controllers\Settings\SecurityController;
 use Illuminate\Support\Facades\Route;
@@ -28,4 +29,16 @@ Route::middleware(['auth', 'verified'])->group(function () {
     // query string so a deep-linked filtered view survives refresh.
     Route::get('settings/activity', [ActivityController::class, 'index'])
         ->name('activity.index');
+
+    // Sanctum personal access tokens. The "create" response renders the
+    // plaintext token to the user exactly once (via a session flash);
+    // there is no GET endpoint that returns secret values.
+    Route::get('settings/api-tokens', [ApiTokenController::class, 'index'])
+        ->name('api-tokens.index');
+    Route::post('settings/api-tokens', [ApiTokenController::class, 'store'])
+        ->middleware('throttle:10,1')
+        ->name('api-tokens.store');
+    Route::delete('settings/api-tokens/{token}', [ApiTokenController::class, 'destroy'])
+        ->whereNumber('token')
+        ->name('api-tokens.destroy');
 });

@@ -2,6 +2,8 @@
 
 namespace App\Providers;
 
+use ApiPlatform\Laravel\Eloquent\Extension\QueryExtensionInterface;
+use App\Api\QueryExtension\OrganizationScopeExtension;
 use App\Models\BexSession;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
@@ -28,6 +30,17 @@ class AppServiceProvider extends ServiceProvider
         // singleton each observer would resolve a fresh instance and
         // the explicit `suppressNext()` calls would be no-ops.
         $this->app->singleton(AuditLogger::class);
+
+        // Tag our org-scoping query extension so api-platform's Eloquent
+        // CollectionProvider/ItemProvider pick it up automatically (the
+        // package consumes `app()->tagged(QueryExtensionInterface::class)`
+        // when constructing both providers). This is the single
+        // enforcement point that makes every #[ApiResource] read query
+        // org-scoped to the authenticated user — see
+        // app/Api/QueryExtension/OrganizationScopeExtension.php for the
+        // per-model rules.
+        $this->app->singleton(OrganizationScopeExtension::class);
+        $this->app->tag([OrganizationScopeExtension::class], QueryExtensionInterface::class);
     }
 
     /**
