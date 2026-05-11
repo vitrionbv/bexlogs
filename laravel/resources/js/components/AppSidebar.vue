@@ -2,6 +2,7 @@
 import { Link, usePage } from '@inertiajs/vue3';
 import {
     Activity,
+    BellRing,
     KeyRound,
     LayoutDashboard,
     ScrollText,
@@ -29,6 +30,7 @@ const mainNavItems: NavItem[] = [
     { title: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
     { title: 'Logs', href: '/logs', icon: ScrollText },
     { title: 'Jobs', href: '/jobs', icon: Activity },
+    { title: 'Alerts', href: '/alerts', icon: BellRing },
     { title: 'Sessions', href: '/authenticate', icon: KeyRound },
     { title: 'Manage', href: '/manage', icon: Settings2 },
 ];
