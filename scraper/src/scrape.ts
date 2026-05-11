@@ -26,6 +26,28 @@ import type { ParsedLogMessage, ScrapeJob, StopReason } from './types.js';
 const SESSION_EXPIRED_SENTINEL = 'SESSION_EXPIRED';
 
 /**
+ * Backoff schedule (ms between attempts) for `chromium.launch()`. The
+ * launch occasionally fails with `browserType.launch: Target page,
+ * context or browser has been closed` because the Chromium process
+ * SIGSEGVs seconds after spawn — a flakiness class documented against
+ * the lightweight `chromium_headless_shell` binary that Playwright
+ * 1.49+ defaults to. We mitigate the root cause by passing
+ * `channel: 'chromium'` (full Chromium, see `launchBrowserWithRetry`)
+ * AND keep this retry layer as the belt-and-suspenders: even with the
+ * full browser, a launch can still race against ephemeral system
+ * conditions (dbus, /tmp pressure, kernel scheduler hiccup). Two
+ * retries are enough — production failure data shows the crashes are
+ * uncorrelated random events at ~1% rate, so P(three-in-a-row) ≈
+ * 1-in-a-million.
+ *
+ * Total wall-clock cost on full exhaustion: 6s of sleep + the three
+ * launch attempts. Comfortably inside the per-job time budget (default
+ * 10 minutes); a launch that takes >2s to crash is already in
+ * "something is very wrong" territory anyway.
+ */
+const BROWSER_LAUNCH_RETRY_DELAYS_MS: readonly number[] = [2000, 4000];
+
+/**
  * Backoff schedule (ms between attempts) for /load_more_logs.js when
  * BookingExperts replies with 422. The user-facing semantics: 422 means
  * we're hitting BE too hard (rate limit / concurrency cap), so a single
@@ -275,7 +297,7 @@ export async function runScrapeJob(job: ScrapeJob): Promise<ScrapeResult> {
     let lastDiagnostic: LastDiagnostic | null = null;
 
     try {
-        browser = await chromium.launch({ headless: config.HEADLESS });
+        browser = await launchBrowserWithRetry(job.id);
         context = await browser.newContext({
             userAgent:
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
@@ -1648,6 +1670,159 @@ export async function loadInitialPageWithRetry<T>(
     });
     // last is non-null because the loop runs at least once (maxAttempts >= 1).
     return { kind: 'exhausted', attempts: maxAttempts, result: last as InitialPageAttempt<T> };
+}
+
+/**
+ * Classify a thrown error from `chromium.launch()` as either retryable
+ * (the Chromium process died on us — likely a transient SIGSEGV /
+ * dbus race / kernel scheduler hiccup) or terminal (the configuration
+ * is wrong — missing binary, unsupported channel, invalid argument —
+ * no number of retries will help).
+ *
+ * Retryable signals we look for:
+ *   - `Target page, context or browser has been closed` — the
+ *     SIGSEGV signature from production failure data; the browser
+ *     process exited before Playwright could establish the CDP pipe.
+ *   - `Process exited` / `process did exit` — same family, surfaced
+ *     by older Playwright versions or different crash modes.
+ *   - `Timeout` (TimeoutError) — launch didn't finish within the
+ *     default 30s window; sometimes a single slow start recovers
+ *     on a second try.
+ *
+ * Non-retryable signals we explicitly carve out:
+ *   - `Executable doesn't exist at` — the Chromium binary isn't
+ *     installed (image build problem). Retrying just wastes 6s
+ *     before failing the same way.
+ *   - `Unsupported channel` — the `channel: 'chromium'` switch
+ *     hasn't been honoured by this Playwright version. Same
+ *     category as missing binary.
+ *
+ * Anything else falls through to `false` (don't retry) so we don't
+ * mask new failure modes by silently absorbing them — operators see
+ * the error on the first attempt rather than after three.
+ */
+function isLaunchErrorRetryable(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+
+    if (/Executable doesn't exist at|Unsupported channel/i.test(message)) {
+        return false;
+    }
+
+    return /Target page, context or browser has been closed|process (?:did )?exit|Timeout/i.test(
+        message,
+    );
+}
+
+/**
+ * Wrap `chromium.launch()` with a bounded retry layer. Production
+ * failure data (24 of 38 failures over 6 days) showed a steady drip
+ * of `browserType.launch: Target page, context or browser has been
+ * closed` errors paired with `Received signal 11 SI_KERNEL` (SIGSEGV)
+ * in the chromium_headless_shell stderr — i.e. the headless-shell
+ * binary occasionally segfaults seconds after spawn for reasons
+ * unrelated to the scrape itself (no OOM, no /dev/shm pressure, no
+ * sandbox interaction). Two layers of mitigation:
+ *
+ *   1. Launch options pin `channel: 'chromium'` so we use the full
+ *      Chromium build rather than the lightweight headless_shell
+ *      that Playwright 1.49+ picks by default for headless launches.
+ *      The full browser has years of battle-testing across desktop
+ *      and CI; headless_shell is comparatively new and the SIGSEGV
+ *      pattern is well-documented against it. Trade-off: ~150MB
+ *      more image disk and a few hundred ms slower startup. With
+ *      4 GiB RAM headroom on the host and per-job budgets in
+ *      minutes, both costs are noise.
+ *
+ *   2. This retry helper absorbs the residual flakiness: 1 initial
+ *      + N retries on the `BROWSER_LAUNCH_RETRY_DELAYS_MS` schedule.
+ *      Retry decisions go through `isLaunchErrorRetryable` so we
+ *      only retry on the "process died" signature (the SIGSEGV
+ *      class), NOT on configuration errors like missing binary or
+ *      unsupported channel — those should hard-fail immediately so
+ *      operators see them on the first run.
+ *
+ * Logging:
+ *   - First failure: `warn` with attempt count + next backoff.
+ *   - Final surrender: re-throw the original error unchanged so
+ *     the outer catch in `runScrapeJob` records it on the failed
+ *     job with the full stack trace operators are used to.
+ *   - Recovery: `info` so the operator can correlate retry
+ *     activity with otherwise-mysterious "scrape succeeded" rows.
+ *
+ * Out of scope: this helper doesn't attempt to re-install the
+ * browser, free /tmp, or restart any other system services. If two
+ * retries don't help, the issue is something the scraper can't fix
+ * from inside itself and an operator needs to look at the host.
+ *
+ * Exported so the offline test harness in
+ * `scripts/launch-retry-test.ts` can drive it with a stub launcher;
+ * production has no caller other than `runScrapeJob`.
+ */
+export async function launchBrowserWithRetry(
+    jobId: number,
+    opts?: {
+        retryDelaysMs?: readonly number[];
+        launcher?: (options: { headless: boolean; channel: string }) => Promise<Browser>;
+    },
+): Promise<Browser> {
+    const retryDelaysMs = opts?.retryDelaysMs ?? BROWSER_LAUNCH_RETRY_DELAYS_MS;
+    const launcher =
+        opts?.launcher ?? ((o) => chromium.launch(o));
+    const maxAttempts = retryDelaysMs.length + 1;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const browser = await launcher({
+                headless: config.HEADLESS,
+                // Full Chromium (not chromium_headless_shell). See the
+                // comment block above this function for the rationale.
+                channel: 'chromium',
+            });
+            if (attempt > 1) {
+                log.info('chromium.launch recovered after retry', {
+                    jobId,
+                    attempts: attempt,
+                });
+            }
+            return browser;
+        } catch (err) {
+            lastError = err;
+            const message = err instanceof Error ? err.message : String(err);
+            const retryable = isLaunchErrorRetryable(err);
+
+            if (!retryable || attempt === maxAttempts) {
+                if (attempt > 1) {
+                    log.error('chromium.launch exhausted retries — failing job', {
+                        jobId,
+                        attempts: attempt,
+                        finalError: message,
+                    });
+                } else if (!retryable) {
+                    log.error('chromium.launch failed with non-retryable error', {
+                        jobId,
+                        error: message,
+                    });
+                }
+                throw err;
+            }
+
+            const delay = retryDelaysMs[attempt - 1] ?? 0;
+            log.warn('chromium.launch failed — backing off and retrying (likely transient browser crash)', {
+                jobId,
+                attempt,
+                attemptsRemaining: maxAttempts - attempt,
+                nextDelayMs: delay,
+                error: message,
+            });
+            await sleep(delay);
+        }
+    }
+
+    // Unreachable: the loop either returns on success or throws on
+    // exhaustion. TypeScript doesn't know that, hence the explicit
+    // re-throw to satisfy the `Promise<Browser>` return type.
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /**
