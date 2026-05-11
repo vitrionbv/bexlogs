@@ -134,8 +134,18 @@ class ScrapeEnqueueCommandTest extends TestCase
 
     public function test_second_concurrent_job_uses_slim_spacing_window(): void
     {
-        // Open the cap so a second concurrent job is permitted, and lock
-        // "now" so we can assert the exact slim-window math.
+        // Lock "now" BEFORE writing time-dependent columns so all of
+        // them — including `last_scraped_at` below — resolve against
+        // the fake clock. Previously the `setTestNow()` call lived
+        // AFTER the update, which meant `now()->subDays(2)` used real
+        // wall-clock time and landed in the FUTURE relative to the
+        // fake-now once real time advanced past 2026-05-06T20:00Z.
+        // That made the planner short-circuit on a future
+        // `last_scraped_at` and silently produced `queued=0` instead
+        // of the slim-window job this test asserts.
+        Carbon::setTestNow('2026-05-04T20:00:00Z');
+
+        // Open the cap so a second concurrent job is permitted.
         $this->subscription->update([
             'max_concurrent_jobs' => 2,
             'job_spacing_minutes' => 10,
@@ -144,8 +154,6 @@ class ScrapeEnqueueCommandTest extends TestCase
             // to the fixed 2x-spacing window instead.
             'last_scraped_at' => now()->subDays(2),
         ]);
-
-        Carbon::setTestNow('2026-05-04T20:00:00Z');
 
         // Sibling job started 11m ago — outside the spacing window so the
         // guard says yes; the planner sees the sibling and goes slim.
