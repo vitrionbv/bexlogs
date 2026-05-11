@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Admin\UserController;
+use App\Http\Controllers\Api\SearchController;
 use App\Http\Controllers\AuthenticateController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\ExtensionController;
@@ -123,6 +124,13 @@ Route::middleware(['auth', 'verified'])->group(function () {
         ->name('manage.browse.organizations-for-application');
     Route::get('manage/browse/applications/{application}/subscriptions', [ManageController::class, 'browseSubscriptionsForApplication'])
         ->name('manage.browse.subscriptions-for-application');
+
+    // Cmd-K command palette backing endpoint (F16). Scoped to the
+    // user's orgs; returns three groups (subscriptions, scrape jobs,
+    // saved queries) capped at 10 each. The palette debounces 150ms
+    // client-side so this endpoint sees at most ~6 hits/second under
+    // active typing.
+    Route::get('api/search', SearchController::class)->name('api.search');
 
     // Admin-only user management. Single-tenant app — one boolean
     // (`users.is_admin`) gates everything in this group.

@@ -8,10 +8,12 @@ import {
     ExternalLink,
     KeyRound,
     Loader2,
+    Pause,
     Play,
     Plus,
     RefreshCw,
     Search,
+    Settings2,
     Trash2,
     X,
 } from 'lucide-vue-next';
@@ -27,6 +29,7 @@ import {
     CardHeader,
     CardTitle,
 } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
     Dialog,
     DialogContent,
@@ -220,6 +223,238 @@ const visibleSubCount = computed(() =>
         0,
     ),
 );
+
+// ─── Bulk selection (F17) ────────────────────────────────────────────────────
+//
+// Operators with many subscriptions kept asking for a way to pause /
+// resume / re-budget multiple rows in a single click. The selection
+// state is a plain Set keyed by subscription id — flat and cheap to
+// reason about. The toolbar slides in once at least one row is
+// ticked and stays sticky to the top so it's always reachable even
+// after scrolling deep into the org list.
+//
+// "Select all visible" toggles every sub the current filter is
+// showing. Subscriptions filtered out by the search box are
+// intentionally NOT touched: a hidden row can't be reasoned about by
+// the operator at click-time, so we don't include it in bulk
+// operations either. That keeps the "I selected too much" risk
+// bounded to what the user can actually see.
+
+const selectedIds = ref<Set<string>>(new Set());
+
+const allVisibleSubs = computed<SubRow[]>(() =>
+    props.organizations.flatMap((o) => o.applications.flatMap((a) => a.subscriptions)),
+);
+
+const selectedCount = computed(() => selectedIds.value.size);
+
+const allVisibleSelected = computed(
+    () =>
+        allVisibleSubs.value.length > 0
+        && allVisibleSubs.value.every((s) => selectedIds.value.has(s.id)),
+);
+
+function isSelected(subId: string): boolean {
+    return selectedIds.value.has(subId);
+}
+
+function toggleSelected(subId: string): void {
+    const next = new Set(selectedIds.value);
+
+    if (next.has(subId)) {
+        next.delete(subId);
+    } else {
+        next.add(subId);
+    }
+
+    selectedIds.value = next;
+}
+
+function toggleSelectAllVisible(): void {
+    if (allVisibleSelected.value) {
+        // Clear only the *visible* selection so a partially-selected
+        // hidden set survives a "deselect all visible" click. In
+        // practice nothing's hidden once the user has the filter
+        // toolbar's text query cleared, but the property is what
+        // makes "select all" feel safe.
+        const next = new Set(selectedIds.value);
+        allVisibleSubs.value.forEach((s) => next.delete(s.id));
+        selectedIds.value = next;
+    } else {
+        const next = new Set(selectedIds.value);
+        allVisibleSubs.value.forEach((s) => next.add(s.id));
+        selectedIds.value = next;
+    }
+}
+
+function clearSelection(): void {
+    selectedIds.value = new Set();
+}
+
+const selectedSubs = computed<SubRow[]>(() =>
+    allVisibleSubs.value.filter((s) => selectedIds.value.has(s.id)),
+);
+
+// ─── Bulk operations (F17) ───────────────────────────────────────────────────
+//
+// Each operation maps to a dedicated server endpoint that mirrors the
+// per-sub validation but accepts an `subscription_ids` array. The
+// budget modal uses an opt-in checkbox per field so leaving a knob
+// untouched means "don't send this column to the server", which is
+// the safest default for a sparse-update endpoint.
+
+type BulkBudgetForm = {
+    apply: Record<BudgetField | 'auto_scrape' | 'scrape_interval_minutes', boolean>;
+    values: {
+        auto_scrape: boolean;
+        scrape_interval_minutes: number;
+        max_pages_per_scrape: number;
+        lookback_days_first_scrape: number;
+        max_duration_minutes: number;
+        max_concurrent_jobs: number;
+        job_spacing_minutes: number;
+        token_echo_max_attempts: number;
+    };
+};
+
+function blankBudgetForm(): BulkBudgetForm {
+    return {
+        apply: {
+            auto_scrape: false,
+            scrape_interval_minutes: false,
+            max_pages_per_scrape: false,
+            lookback_days_first_scrape: false,
+            max_duration_minutes: false,
+            max_concurrent_jobs: false,
+            job_spacing_minutes: false,
+            token_echo_max_attempts: false,
+        },
+        values: {
+            auto_scrape: true,
+            scrape_interval_minutes: 5,
+            max_pages_per_scrape: 200,
+            lookback_days_first_scrape: 30,
+            max_duration_minutes: 30,
+            max_concurrent_jobs: 1,
+            job_spacing_minutes: 10,
+            token_echo_max_attempts: 100,
+        },
+    };
+}
+
+const budgetForm = ref<BulkBudgetForm>(blankBudgetForm());
+const budgetDialogOpen = ref(false);
+const deleteDialogOpen = ref(false);
+const bulkProcessing = ref(false);
+
+function bulkPayloadIds(): string[] {
+    return Array.from(selectedIds.value);
+}
+
+function bulkPause(): void {
+    bulkProcessing.value = true;
+    router.patch(
+        '/manage/subscriptions/bulk',
+        { subscription_ids: bulkPayloadIds(), auto_scrape: false },
+        {
+            preserveScroll: true,
+            onFinish: () => {
+                bulkProcessing.value = false;
+                clearSelection();
+            },
+        },
+    );
+}
+
+function bulkResume(): void {
+    bulkProcessing.value = true;
+    router.patch(
+        '/manage/subscriptions/bulk',
+        { subscription_ids: bulkPayloadIds(), auto_scrape: true },
+        {
+            preserveScroll: true,
+            onFinish: () => {
+                bulkProcessing.value = false;
+                clearSelection();
+            },
+        },
+    );
+}
+
+function bulkScrape(): void {
+    bulkProcessing.value = true;
+    router.post(
+        '/manage/subscriptions/bulk/scrape',
+        { subscription_ids: bulkPayloadIds() },
+        {
+            preserveScroll: true,
+            onFinish: () => {
+                bulkProcessing.value = false;
+                // We intentionally KEEP the selection after a bulk
+                // scrape so the operator can re-trigger or follow up
+                // with a budget edit on the same set without
+                // re-ticking everything.
+            },
+        },
+    );
+}
+
+function submitBulkBudget(): void {
+    // Translate the (apply[], values{}) shape into a sparse server
+    // payload — only the columns whose `apply` checkbox is ticked
+    // ride along. This matches the controller's "sometimes" validators.
+    const payload: Record<string, unknown> = {
+        subscription_ids: bulkPayloadIds(),
+    };
+
+    (Object.keys(budgetForm.value.apply) as (keyof BulkBudgetForm['apply'])[]).forEach((key) => {
+        if (budgetForm.value.apply[key]) {
+            payload[key] = budgetForm.value.values[key];
+        }
+    });
+
+    // Spec says "leaving the checkbox off means don't touch this
+    // field"; if EVERY checkbox is off the server will flash a no-op
+    // status. Guard client-side too so the dialog stays open with a
+    // toast nudge instead of vanishing on an empty payload.
+    const touched
+        = Object.values(budgetForm.value.apply).some(Boolean)
+        && Object.keys(payload).length > 1;
+
+    if (!touched) {
+        toast.error('Tick at least one "Apply" checkbox to bulk-update.');
+
+        return;
+    }
+
+    bulkProcessing.value = true;
+    router.patch('/manage/subscriptions/bulk', payload, {
+        preserveScroll: true,
+        onSuccess: () => {
+            budgetDialogOpen.value = false;
+            budgetForm.value = blankBudgetForm();
+            clearSelection();
+        },
+        onFinish: () => {
+            bulkProcessing.value = false;
+        },
+    });
+}
+
+function submitBulkDelete(): void {
+    bulkProcessing.value = true;
+    router.delete('/manage/subscriptions/bulk', {
+        data: { subscription_ids: bulkPayloadIds() },
+        preserveScroll: true,
+        onSuccess: () => {
+            deleteDialogOpen.value = false;
+            clearSelection();
+        },
+        onFinish: () => {
+            bulkProcessing.value = false;
+        },
+    });
+}
 
 const dialogOpen = ref(false);
 type TabId = 'browse' | 'url' | 'manual';
@@ -942,6 +1177,73 @@ const ManualNickname = defineComponent({
         </header>
 
         <!--
+            Sticky bulk-actions toolbar (F17). Slides in once any
+            subscription is selected. `sticky top-0 z-10` makes it
+            ride above the org cards while the user scrolls; the
+            shadow + backdrop blur keep the underlying card edges
+            visually separated.
+        -->
+        <div
+            v-if="selectedCount > 0"
+            class="bg-background/95 border-border sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-md border p-2 shadow-sm backdrop-blur"
+            data-testid="manage-bulk-toolbar"
+        >
+            <span class="text-sm font-medium">
+                {{ selectedCount }} selected
+            </span>
+            <Button variant="ghost" size="sm" @click="clearSelection">
+                <X class="mr-1 size-4" /> Clear
+            </Button>
+
+            <span class="text-muted-foreground mx-1">·</span>
+
+            <Button
+                variant="outline"
+                size="sm"
+                :disabled="bulkProcessing"
+                @click="bulkPause"
+            >
+                <Pause class="mr-1 size-4" /> Pause all
+            </Button>
+            <Button
+                variant="outline"
+                size="sm"
+                :disabled="bulkProcessing"
+                @click="bulkResume"
+            >
+                <Play class="mr-1 size-4" /> Resume all
+            </Button>
+            <Button
+                variant="outline"
+                size="sm"
+                :disabled="bulkProcessing"
+                @click="bulkScrape"
+            >
+                <RefreshCw class="mr-1 size-4" :class="bulkProcessing && 'animate-spin'" />
+                Scrape now
+            </Button>
+            <Button
+                variant="outline"
+                size="sm"
+                :disabled="bulkProcessing"
+                @click="budgetDialogOpen = true"
+            >
+                <Settings2 class="mr-1 size-4" /> Edit budgets…
+            </Button>
+
+            <div class="ml-auto">
+                <Button
+                    variant="destructive"
+                    size="sm"
+                    :disabled="bulkProcessing"
+                    @click="deleteDialogOpen = true"
+                >
+                    <Trash2 class="mr-1 size-4" /> Delete selected
+                </Button>
+            </div>
+        </div>
+
+        <!--
             Filter toolbar. Hidden when the account has no
             subscriptions yet (the empty-state card below is more
             helpful than a search box over zero rows).
@@ -951,6 +1253,14 @@ const ManualNickname = defineComponent({
             class="border-border bg-background flex flex-wrap items-center gap-2 rounded-md border p-2"
             data-testid="manage-filter-toolbar"
         >
+            <label class="flex items-center gap-1 pr-2 text-xs">
+                <Checkbox
+                    :model-value="allVisibleSelected"
+                    aria-label="Select all visible subscriptions"
+                    @update:model-value="toggleSelectAllVisible"
+                />
+                <span class="text-muted-foreground uppercase">All visible</span>
+            </label>
             <div class="relative min-w-[220px] flex-1">
                 <Search class="text-muted-foreground pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2" />
                 <input
@@ -1068,9 +1378,25 @@ const ManualNickname = defineComponent({
                         v-for="sub in app.subscriptions"
                         :key="sub.id"
                         class="bg-muted/30 space-y-2 rounded-md p-3"
+                        :class="isSelected(sub.id) && 'ring-primary/40 ring-2 ring-offset-1'"
                         data-testid="manage-sub-row"
                     >
                         <div class="flex flex-wrap items-center justify-between gap-3">
+                            <!--
+                                Per-row checkbox lives outside the
+                                expand/collapse trigger because nesting
+                                an <input> inside the trigger would
+                                make every checkbox click also toggle
+                                the expanded state.
+                            -->
+                            <label class="flex items-center" @click.stop>
+                                <Checkbox
+                                    :model-value="isSelected(sub.id)"
+                                    :aria-label="`Select ${sub.name}`"
+                                    :data-testid="`manage-sub-checkbox-${sub.id}`"
+                                    @update:model-value="toggleSelected(sub.id)"
+                                />
+                            </label>
                             <button
                                 type="button"
                                 class="flex flex-1 items-center gap-2 text-left"
@@ -1306,6 +1632,176 @@ const ManualNickname = defineComponent({
                 </div>
             </CardContent>
         </Card>
+
+        <!--
+            Bulk-edit budgets dialog. Per-field "Apply to all"
+            checkboxes give the operator opt-in control over which
+            columns to push; an unchecked field is omitted from the
+            payload so the server's "sometimes" validator leaves the
+            column untouched.
+        -->
+        <Dialog v-model:open="budgetDialogOpen">
+            <DialogContent class="sm:max-w-2xl" data-testid="bulk-budget-dialog">
+                <DialogHeader>
+                    <DialogTitle>Edit budgets for {{ selectedCount }} subscriptions</DialogTitle>
+                    <DialogDescription>
+                        Tick "Apply" beside the fields you want to change. Unticked rows are left
+                        as-is on each subscription.
+                    </DialogDescription>
+                </DialogHeader>
+
+                <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.auto_scrape" />
+                            Apply · Auto-scrape
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <Switch v-model="budgetForm.values.auto_scrape" />
+                            <span class="text-sm">
+                                {{ budgetForm.values.auto_scrape ? 'On (resume)' : 'Off (pause)' }}
+                            </span>
+                        </label>
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.scrape_interval_minutes" />
+                            Apply · Interval (min)
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="1440"
+                            v-model.number="budgetForm.values.scrape_interval_minutes"
+                        />
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.max_pages_per_scrape" />
+                            Apply · Max pages
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="5000"
+                            v-model.number="budgetForm.values.max_pages_per_scrape"
+                        />
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.lookback_days_first_scrape" />
+                            Apply · Lookback (days, first scrape)
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="365"
+                            v-model.number="budgetForm.values.lookback_days_first_scrape"
+                        />
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.max_duration_minutes" />
+                            Apply · Max duration (min)
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="120"
+                            v-model.number="budgetForm.values.max_duration_minutes"
+                        />
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.max_concurrent_jobs" />
+                            Apply · Max concurrent jobs
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="10"
+                            v-model.number="budgetForm.values.max_concurrent_jobs"
+                        />
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.job_spacing_minutes" />
+                            Apply · Job spacing (min)
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="120"
+                            v-model.number="budgetForm.values.job_spacing_minutes"
+                        />
+                    </div>
+
+                    <div class="border-border space-y-1 rounded-md border p-2">
+                        <label class="flex items-center gap-2 text-xs uppercase">
+                            <Checkbox v-model="budgetForm.apply.token_echo_max_attempts" />
+                            Apply · Token-echo retries
+                        </label>
+                        <Input
+                            type="number"
+                            min="1"
+                            max="1000"
+                            v-model.number="budgetForm.values.token_echo_max_attempts"
+                        />
+                    </div>
+                </div>
+
+                <DialogFooter>
+                    <Button variant="ghost" @click="budgetDialogOpen = false">Cancel</Button>
+                    <Button :disabled="bulkProcessing" @click="submitBulkBudget">
+                        <Loader2 v-if="bulkProcessing" class="mr-1 size-4 animate-spin" />
+                        Apply to {{ selectedCount }}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+
+        <!--
+            Confirm-delete dialog. Lists the names being deleted so the
+            operator can sanity-check the selection one last time. We
+            cap the visible names at 10 — anything beyond that gets a
+            "…and N more" line because a 200-row scroll inside a
+            modal is its own UX problem.
+        -->
+        <Dialog v-model:open="deleteDialogOpen">
+            <DialogContent class="sm:max-w-lg" data-testid="bulk-delete-dialog">
+                <DialogHeader>
+                    <DialogTitle>Delete {{ selectedCount }} subscriptions?</DialogTitle>
+                    <DialogDescription>
+                        This removes the rows and every log message attached to them. The
+                        operation is not reversible.
+                    </DialogDescription>
+                </DialogHeader>
+
+                <ul class="bg-muted/30 max-h-60 overflow-y-auto rounded-md p-2 text-sm">
+                    <li v-for="sub in selectedSubs.slice(0, 10)" :key="sub.id" class="flex justify-between gap-2 py-0.5">
+                        <span class="truncate">{{ sub.name }}</span>
+                        <span class="text-muted-foreground font-mono text-xs">{{ sub.id }}</span>
+                    </li>
+                    <li v-if="selectedSubs.length > 10" class="text-muted-foreground py-0.5 text-xs italic">
+                        …and {{ selectedSubs.length - 10 }} more
+                    </li>
+                </ul>
+
+                <DialogFooter>
+                    <Button variant="ghost" @click="deleteDialogOpen = false">Cancel</Button>
+                    <Button variant="destructive" :disabled="bulkProcessing" @click="submitBulkDelete">
+                        <Loader2 v-if="bulkProcessing" class="mr-1 size-4 animate-spin" />
+                        Delete {{ selectedCount }}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
     </div>
 </template>
 
