@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\AuditLogger;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -9,7 +10,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 
 /**
- * Immutable activity-stream row written by {@see \App\Services\AuditLogger}.
+ * Immutable activity-stream row written by {@see AuditLogger}.
  *
  * The model is read-mostly: the only write path is `AuditLogger::record()`
  * (and the observers under `App\Observers\Audit*`). Treat instances

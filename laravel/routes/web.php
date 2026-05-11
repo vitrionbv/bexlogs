@@ -95,6 +95,18 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('manage', [ManageController::class, 'index'])->name('manage.index');
     Route::post('manage/subscriptions', [ManageController::class, 'storeSubscription'])
         ->name('manage.subscriptions.store');
+
+    // Bulk operations (F17). MUST be registered before the
+    // `manage/subscriptions/{subscription}` routes below — otherwise
+    // route-model-binding swallows "bulk" as a subscription id, the
+    // implicit binding 404s, and the bulk endpoints never run.
+    Route::patch('manage/subscriptions/bulk', [ManageController::class, 'bulkUpdate'])
+        ->name('manage.subscriptions.bulk-update');
+    Route::delete('manage/subscriptions/bulk', [ManageController::class, 'bulkDelete'])
+        ->name('manage.subscriptions.bulk-delete');
+    Route::post('manage/subscriptions/bulk/scrape', [ManageController::class, 'bulkEnqueueScrape'])
+        ->name('manage.subscriptions.bulk-scrape');
+
     Route::patch('manage/subscriptions/{subscription}', [ManageController::class, 'updateSubscription'])
         ->name('manage.subscriptions.update');
     Route::delete('manage/subscriptions/{subscription}', [ManageController::class, 'destroySubscription'])
