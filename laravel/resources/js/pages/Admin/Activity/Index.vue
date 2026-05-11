@@ -1,11 +1,26 @@
 <script setup lang="ts">
 import type { FormDataConvertible } from '@inertiajs/core';
 import { Head, router } from '@inertiajs/vue3';
-import { ChevronLeft, ChevronRight, Filter, X } from 'lucide-vue-next';
+import {
+    ChevronLeft,
+    ChevronRight,
+    Code2,
+    Filter,
+    X,
+} from 'lucide-vue-next';
 import { computed, ref, watch } from 'vue';
 import Heading from '@/components/Heading.vue';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogHeader,
+    DialogTitle,
+    DialogTrigger,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -15,6 +30,19 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
+import {
+    Table,
+    TableBody,
+    TableCell,
+    TableHead,
+    TableHeader,
+    TableRow,
+} from '@/components/ui/table';
+import {
+    Tooltip,
+    TooltipContent,
+    TooltipTrigger,
+} from '@/components/ui/tooltip';
 
 interface ActorRef {
     id: number;
@@ -235,21 +263,35 @@ function actionBadgeVariant(
     return 'default';
 }
 
-// Stringify payloads compactly. Objects render as pretty-JSON in a
-// disclosure; primitives render inline. The page never displays the
-// raw payload more than two levels deep — operators rarely need the
-// 5th-level fields, and dumping the full structure would visually
-// dominate the row.
-function payloadSummary(row: AuditRow): string {
+// Pretty-print payloads for the dialog viewer. Two-space indent +
+// newlines so the operator can scan the diff at a glance; the dialog
+// itself caps the height so a deeply-nested payload scrolls instead
+// of pushing the rest of the modal off-screen.
+function payloadPretty(row: AuditRow): string {
     if (!row.payload) {
         return '';
     }
 
     try {
-        return JSON.stringify(row.payload);
+        return JSON.stringify(row.payload, null, 2);
     } catch {
         return '';
     }
+}
+
+// `subject_type` arrives as the morph class FQCN (e.g.
+// `App\Models\Subscription`). The audit table column is the same
+// string so we can't shorten it server-side without breaking the
+// MorphTo relation, but the table only ever shows the leaf class
+// name to keep the column narrow.
+function shortTypeName(fqcn: string | null): string {
+    if (!fqcn) {
+        return '';
+    }
+
+    const parts = fqcn.split('\\');
+
+    return parts[parts.length - 1] ?? fqcn;
 }
 </script>
 
@@ -390,131 +432,235 @@ function payloadSummary(row: AuditRow): string {
         </section>
 
         <!--
-            Audit rows. Empty state distinguishes between "nothing has
-            ever been recorded" (fresh install) and "your filter is
-            too narrow" (rare, but happens) — same idiom the Manage
-            page uses for its empty filter state.
-        -->
-        <section
-            v-if="logs.data.length === 0"
-            class="rounded-md border p-6 text-sm text-muted-foreground"
-        >
-            <template v-if="anyFiltersActive">
-                No activity matches the current filters.
-                <button
-                    class="underline underline-offset-2"
-                    @click="clearFilters"
-                >
-                    Clear them
-                </button>
-                to see everything.
-            </template>
-            <template v-else>
-                No activity recorded yet. Take an action somewhere — adding a
-                subscription, toggling auto-scrape, etc. — and it'll show up
-                here.
-            </template>
-        </section>
+            Audit table. Each row is a single (timestamp, actor,
+            action, subject, IP, payload) tuple — the column set
+            preserves every field the legacy card layout surfaced;
+            user-agent rides as a tooltip on the IP cell instead of
+            its own column because UA strings are bulky and rarely
+            scanned.
 
-        <section v-else class="space-y-2">
+            Empty state is a single full-width row inside the table
+            body so the chrome (header row, card border) stays put
+            instead of swapping in a separate "no rows" panel — same
+            idiom Admin/Users uses.
+        -->
+        <Card>
+            <CardContent class="p-0">
+                <Table>
+                    <TableHeader>
+                        <TableRow>
+                            <TableHead class="w-44">Time</TableHead>
+                            <TableHead class="w-44">Actor</TableHead>
+                            <TableHead class="w-44">Action</TableHead>
+                            <TableHead>Subject</TableHead>
+                            <TableHead class="w-36">IP</TableHead>
+                            <TableHead class="w-24 text-right">
+                                Payload
+                            </TableHead>
+                        </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                        <TableRow
+                            v-if="logs.data.length === 0"
+                            class="hover:bg-transparent"
+                        >
+                            <TableCell
+                                colspan="6"
+                                class="text-muted-foreground py-10 text-center text-sm"
+                            >
+                                <template v-if="anyFiltersActive">
+                                    No activity matches the current filters.
+                                    <button
+                                        class="underline underline-offset-2"
+                                        @click="clearFilters"
+                                    >
+                                        Clear them
+                                    </button>
+                                    to see everything.
+                                </template>
+                                <template v-else>
+                                    No activity recorded yet. Take an action
+                                    somewhere — adding a subscription, toggling
+                                    auto-scrape, etc. — and it'll show up here.
+                                </template>
+                            </TableCell>
+                        </TableRow>
+
+                        <TableRow
+                            v-for="row in logs.data"
+                            :key="row.id"
+                            class="align-top"
+                        >
+                            <TableCell class="text-sm">
+                                <Tooltip>
+                                    <TooltipTrigger as-child>
+                                        <span class="text-muted-foreground">
+                                            {{ formatTimestamp(row.created_at) }}
+                                        </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                        {{ row.created_at ?? '—' }}
+                                    </TooltipContent>
+                                </Tooltip>
+                            </TableCell>
+                            <TableCell>
+                                <template v-if="row.user">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <span class="font-medium">
+                                                {{ row.user.name }}
+                                            </span>
+                                        </TooltipTrigger>
+                                        <TooltipContent>
+                                            {{ row.user.email }}
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </template>
+                                <span
+                                    v-else
+                                    class="text-muted-foreground italic"
+                                >
+                                    system
+                                </span>
+                            </TableCell>
+                            <TableCell>
+                                <Badge
+                                    :variant="actionBadgeVariant(row.action)"
+                                    class="font-mono text-[11px]"
+                                >
+                                    {{ actionLabel(row.action) }}
+                                </Badge>
+                            </TableCell>
+                            <TableCell>
+                                <div class="flex flex-col gap-0.5">
+                                    <span
+                                        v-if="row.subject_label"
+                                        class="text-foreground font-medium"
+                                    >
+                                        {{ row.subject_label }}
+                                    </span>
+                                    <code
+                                        v-else-if="row.subject_id"
+                                        class="font-mono text-xs"
+                                    >
+                                        {{ row.subject_id }}
+                                    </code>
+                                    <span v-else class="text-muted-foreground">
+                                        —
+                                    </span>
+                                    <span
+                                        v-if="row.subject_type"
+                                        class="text-muted-foreground text-xs"
+                                    >
+                                        {{ shortTypeName(row.subject_type) }}
+                                    </span>
+                                </div>
+                            </TableCell>
+                            <TableCell
+                                class="text-muted-foreground font-mono text-xs"
+                            >
+                                <template v-if="row.ip_address">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <span>{{ row.ip_address }}</span>
+                                        </TooltipTrigger>
+                                        <TooltipContent class="max-w-md">
+                                            <template v-if="row.user_agent">
+                                                {{ row.user_agent }}
+                                            </template>
+                                            <template v-else>
+                                                No user-agent recorded
+                                            </template>
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </template>
+                                <span v-else>—</span>
+                            </TableCell>
+                            <TableCell class="text-right">
+                                <Dialog v-if="row.payload">
+                                    <DialogTrigger as-child>
+                                        <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            class="h-8 px-2"
+                                        >
+                                            <Code2 class="size-4" />
+                                            <span class="ml-1">View</span>
+                                        </Button>
+                                    </DialogTrigger>
+                                    <DialogContent class="sm:max-w-2xl">
+                                        <DialogHeader>
+                                            <DialogTitle
+                                                class="flex items-center gap-2"
+                                            >
+                                                <Code2 class="size-4" />
+                                                Payload
+                                            </DialogTitle>
+                                            <DialogDescription>
+                                                {{ actionLabel(row.action) }} ·
+                                                {{
+                                                    formatTimestamp(
+                                                        row.created_at,
+                                                    )
+                                                }}
+                                            </DialogDescription>
+                                        </DialogHeader>
+                                        <pre
+                                            class="bg-muted text-foreground max-h-[60vh] overflow-auto rounded-md p-3 text-xs"
+                                            >{{ payloadPretty(row) }}</pre>
+                                    </DialogContent>
+                                </Dialog>
+                                <span v-else class="text-muted-foreground">
+                                    —
+                                </span>
+                            </TableCell>
+                        </TableRow>
+                    </TableBody>
+                </Table>
+            </CardContent>
+
+            <!--
+                Pagination footer lives inside the Card so the
+                border-t aligns with the table grid. Render-gated by
+                `last_page > 1` (no point in showing a single-page
+                paginator), but the row-count summary is always
+                present when any rows exist.
+            -->
             <div
-                v-for="row in logs.data"
-                :key="row.id"
-                class="rounded-md border border-border bg-card p-3 text-sm"
+                v-if="logs.meta.total > 0"
+                class="border-border text-muted-foreground flex items-center justify-between border-t p-3 text-xs"
             >
-                <div class="flex flex-wrap items-start justify-between gap-2">
-                    <div class="flex flex-col">
-                        <div class="flex flex-wrap items-center gap-2">
-                            <Badge :variant="actionBadgeVariant(row.action)">{{
-                                actionLabel(row.action)
-                            }}</Badge>
-                            <span
-                                v-if="row.user"
-                                class="font-medium text-foreground"
-                                >{{ row.user.name }}</span
-                            >
-                            <span v-else class="text-muted-foreground italic"
-                                >system</span
-                            >
-                            <span
-                                v-if="row.subject_label"
-                                class="text-muted-foreground"
-                            >
-                                on
-                                <span class="text-foreground">{{
-                                    row.subject_label
-                                }}</span>
-                            </span>
-                            <span
-                                v-else-if="row.subject_id"
-                                class="text-muted-foreground"
-                            >
-                                on
-                                <code class="font-mono text-xs">{{
-                                    row.subject_id
-                                }}</code>
-                            </span>
-                        </div>
-                        <div class="mt-1 text-xs text-muted-foreground">
-                            {{ formatTimestamp(row.created_at) }}
-                            <span v-if="row.ip_address">
-                                · {{ row.ip_address }}</span
-                            >
-                        </div>
-                    </div>
-                </div>
-                <details v-if="row.payload" class="mt-2">
-                    <summary
-                        class="cursor-pointer text-xs text-muted-foreground hover:underline"
-                    >
-                        Payload
-                    </summary>
-                    <pre
-                        class="mt-1 overflow-x-auto rounded-md bg-muted p-2 text-[11px] text-muted-foreground"
-                        >{{ payloadSummary(row) }}</pre
-                    >
-                </details>
-            </div>
-        </section>
-
-        <!--
-            Pagination footer. We render only prev/next + summary
-            because the action list is append-only and operators
-            scroll-back rather than jump-to-page. Disabled state is
-            driven by the paginator meta so the buttons can't push
-            users off the ends of the data.
-        -->
-        <footer
-            class="flex items-center justify-between text-xs text-muted-foreground"
-        >
-            <span v-if="logs.meta.total > 0">
-                Showing {{ logs.meta.from ?? 0 }}–{{ logs.meta.to ?? 0 }} of
-                {{ logs.meta.total }}
-            </span>
-            <span v-else>0 rows</span>
-
-            <div class="flex items-center gap-1" v-if="logs.meta.last_page > 1">
-                <Button
-                    variant="ghost"
-                    size="sm"
-                    :disabled="logs.meta.current_page <= 1"
-                    @click="gotoPage(logs.meta.current_page - 1)"
-                >
-                    <ChevronLeft class="size-4" /> Prev
-                </Button>
-                <span class="text-xs text-muted-foreground">
-                    Page {{ logs.meta.current_page }} /
-                    {{ logs.meta.last_page }}
+                <span>
+                    Showing {{ logs.meta.from ?? 0 }}–{{ logs.meta.to ?? 0 }} of
+                    {{ logs.meta.total }}
                 </span>
-                <Button
-                    variant="ghost"
-                    size="sm"
-                    :disabled="logs.meta.current_page >= logs.meta.last_page"
-                    @click="gotoPage(logs.meta.current_page + 1)"
+
+                <div
+                    v-if="logs.meta.last_page > 1"
+                    class="flex items-center gap-1"
                 >
-                    Next <ChevronRight class="size-4" />
-                </Button>
+                    <Button
+                        variant="ghost"
+                        size="sm"
+                        :disabled="logs.meta.current_page <= 1"
+                        @click="gotoPage(logs.meta.current_page - 1)"
+                    >
+                        <ChevronLeft class="size-4" /> Prev
+                    </Button>
+                    <span class="text-muted-foreground text-xs">
+                        Page {{ logs.meta.current_page }} /
+                        {{ logs.meta.last_page }}
+                    </span>
+                    <Button
+                        variant="ghost"
+                        size="sm"
+                        :disabled="logs.meta.current_page >= logs.meta.last_page"
+                        @click="gotoPage(logs.meta.current_page + 1)"
+                    >
+                        Next <ChevronRight class="size-4" />
+                    </Button>
+                </div>
             </div>
-        </footer>
+        </Card>
     </div>
 </template>
