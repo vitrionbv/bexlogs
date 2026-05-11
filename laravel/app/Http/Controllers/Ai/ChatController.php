@@ -176,7 +176,7 @@ class ChatController extends Controller
             abort(429, "Daily token cap of {$cap} reached. Try again tomorrow.");
         }
 
-        $userMessage = AiMessage::create([
+        AiMessage::create([
             'ai_conversation_id' => $conversation->id,
             'role' => 'user',
             'content' => $data['message'],
@@ -185,6 +185,7 @@ class ChatController extends Controller
         $ctx = new ToolContext(
             userId: (int) $user->id,
             subscriptionId: (string) $subscription->id,
+            conversationId: (int) $conversation->id,
         );
 
         // Capture state up-front so callbacks don't reach into the
@@ -232,7 +233,7 @@ class ChatController extends Controller
                     // Persist assistant message (even if it only made
                     // tool calls — we want the `tool_calls` JSON for
                     // replay).
-                    $assistantMessage = AiMessage::create([
+                    AiMessage::create([
                         'ai_conversation_id' => $conversation->id,
                         'role' => 'assistant',
                         'content' => $assistantText ?: null,
@@ -264,7 +265,7 @@ class ChatController extends Controller
 
                         $sse('tool_call', ['id' => $callId, 'name' => $name, 'args' => $args]);
 
-                        $result = $dispatcher->handle($name, $args, $ctx, $conversation->id);
+                        $result = $dispatcher->handle($name, $args, $ctx);
 
                         AiMessage::create([
                             'ai_conversation_id' => $conversation->id,
@@ -327,7 +328,7 @@ class ChatController extends Controller
         $toolCalls = [];
         $usage = ['input_tokens' => 0, 'output_tokens' => 0];
 
-        foreach ($client->chat($messages, $tools, $model, stream: true) as $chunk) {
+        foreach ($client->chatStream($messages, $tools, $model) as $chunk) {
             if (! is_array($chunk)) {
                 continue;
             }
