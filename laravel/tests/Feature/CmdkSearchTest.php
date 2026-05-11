@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\Application;
 use App\Models\BexSession;
 use App\Models\Organization;
+use App\Models\SavedQuery;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use App\Models\User;
@@ -131,7 +132,7 @@ class CmdkSearchTest extends TestCase
         // Guarantee the conditional class_exists branch takes the
         // fallback path: the SavedQuery class lives on Agent 2's
         // branch and isn't merged into this branch's history.
-        $this->assertFalse(class_exists(\App\Models\SavedQuery::class));
+        $this->assertFalse(class_exists(SavedQuery::class));
 
         $response = $this->actingAs($this->user)
             ->getJson(route('api.search', ['q' => 'anything']));
