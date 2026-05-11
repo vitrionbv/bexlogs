@@ -2,6 +2,8 @@
 import { Head, Link, router, useForm } from '@inertiajs/vue3';
 import {
     AlertCircle,
+    AlertTriangle,
+    BarChart3,
     Building2,
     ChevronDown,
     ChevronRight,
@@ -46,6 +48,33 @@ import {
     SelectValue,
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
+import {
+    Tooltip,
+    TooltipContent,
+    TooltipProvider,
+    TooltipTrigger,
+} from '@/components/ui/tooltip';
+import HealthBadge from '@/components/HealthBadge.vue';
+
+interface HealthInfo {
+    score: number;
+    label: 'healthy' | 'degraded' | 'unhealthy';
+    components: {
+        success_rate: number;
+        freshness: number;
+        stability: number;
+    };
+    sample_size: number;
+    last_success_at: string | null;
+}
+
+interface DriftSignal {
+    subscription_id: string;
+    subscription_name: string;
+    kind: string;
+    message: string;
+    detected_at: string;
+}
 
 interface SubRow {
     id: string;
@@ -60,6 +89,8 @@ interface SubRow {
     job_spacing_minutes: number;
     token_echo_max_attempts: number;
     last_scraped_at: string | null;
+    health: HealthInfo;
+    drift_signals: DriftSignal[];
 }
 interface AppRow {
     id: string;
@@ -1082,6 +1113,36 @@ const ManualNickname = defineComponent({
                                     class="text-muted-foreground size-4 shrink-0"
                                 />
                                 <ChevronRight v-else class="text-muted-foreground size-4 shrink-0" />
+                                <!--
+                                    Health dot + drift warning badge live INSIDE the
+                                    expand-toggle so the user can hit the toggle
+                                    target generously without missing — but the
+                                    tooltip + insights button below are not click
+                                    targets for the toggle (we stop propagation).
+                                -->
+                                <HealthBadge :health="sub.health" @click.stop />
+                                <TooltipProvider v-if="sub.drift_signals.length > 0" :delay-duration="100">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <span
+                                                class="text-warning inline-flex shrink-0 cursor-help"
+                                                :aria-label="`${sub.drift_signals.length} drift signal(s)`"
+                                                @click.stop
+                                            >
+                                                <AlertTriangle class="size-4" />
+                                            </span>
+                                        </TooltipTrigger>
+                                        <TooltipContent side="top" class="max-w-xs space-y-1 text-xs">
+                                            <p class="font-medium">Needs attention</p>
+                                            <p
+                                                v-for="(signal, idx) in sub.drift_signals"
+                                                :key="`${signal.kind}-${idx}`"
+                                            >
+                                                {{ signal.message }}
+                                            </p>
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </TooltipProvider>
                                 <div class="flex flex-col">
                                     <span class="text-sm font-medium">{{ sub.name }}</span>
                                     <span class="text-muted-foreground flex items-center gap-2 text-xs">
@@ -1113,6 +1174,11 @@ const ManualNickname = defineComponent({
                                     />
                                     <span class="text-muted-foreground text-xs">min</span>
                                 </div>
+                                <Button as-child variant="outline" size="sm">
+                                    <Link :href="`/subscriptions/${sub.id}/insights`">
+                                        <BarChart3 class="mr-1 size-4" /> View insights
+                                    </Link>
+                                </Button>
                                 <Button size="sm" @click="scrapeNow(sub)">
                                     <Play class="mr-1 size-4" /> Scrape now
                                 </Button>

@@ -83,11 +83,20 @@ type ServerStats = {
     generated_at: string;
 };
 
+type DriftSignal = {
+    subscription_id: string;
+    subscription_name: string;
+    kind: string;
+    message: string;
+    detected_at: string;
+};
+
 const props = defineProps<{
     summary: DashSummary;
     sessions: SessionRow[];
     pages: PageRow[];
     serverStats: ServerStats | null;
+    driftSignals: DriftSignal[];
 }>();
 
 const liveStats = ref<ServerStats | null>(props.serverStats);
@@ -386,6 +395,56 @@ const StatCard = defineComponent({
                                 <span class="tabular-nums">{{ formatBytes(liveStats.disk?.free) }}</span>
                             </div>
                         </div>
+                    </CardContent>
+                </Card>
+            </section>
+
+            <!--
+                Drift / anomaly panel — populated by AnomalyDetector.
+                One row per signal; click-through goes straight to the
+                Insights page for the affected subscription. Hidden
+                when the detector found nothing (the common case;
+                we don't want a permanent "looking healthy" tile to
+                desensitise the operator to it).
+            -->
+            <section v-if="driftSignals.length > 0">
+                <Card class="border-warning/50">
+                    <CardHeader class="flex-row items-center justify-between gap-2">
+                        <div>
+                            <CardTitle class="flex items-center gap-2">
+                                <AlertTriangle class="text-warning size-5" /> Needs attention
+                            </CardTitle>
+                            <CardDescription>
+                                Drift signals from the rolling baselines. Click a row to dig in.
+                            </CardDescription>
+                        </div>
+                        <Badge variant="warning" class="text-xs">
+                            {{ driftSignals.length }}
+                            signal<span v-if="driftSignals.length !== 1">s</span>
+                        </Badge>
+                    </CardHeader>
+                    <CardContent class="space-y-1">
+                        <Link
+                            v-for="(signal, idx) in driftSignals"
+                            :key="`${signal.subscription_id}-${signal.kind}-${idx}`"
+                            :href="`/subscriptions/${signal.subscription_id}/insights`"
+                            class="hover:bg-accent flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors"
+                        >
+                            <div class="flex min-w-0 items-center gap-2">
+                                <AlertTriangle class="text-warning size-4 shrink-0" />
+                                <div class="flex flex-col">
+                                    <span class="truncate text-sm font-medium">
+                                        {{ signal.subscription_name }}
+                                    </span>
+                                    <span class="text-muted-foreground truncate text-xs">
+                                        {{ signal.message }}
+                                    </span>
+                                </div>
+                            </div>
+                            <Badge variant="outline" class="text-[10px] uppercase">
+                                {{ signal.kind.replace(/_/g, ' ') }}
+                            </Badge>
+                        </Link>
                     </CardContent>
                 </Card>
             </section>

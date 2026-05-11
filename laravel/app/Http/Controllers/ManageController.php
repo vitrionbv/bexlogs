@@ -8,7 +8,9 @@ use App\Models\BexSession;
 use App\Models\Organization;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
+use App\Services\AnomalyDetector;
 use App\Services\BookingExpertsBrowser;
+use App\Services\HealthScoreCalculator;
 use App\Services\MayEnqueueResult;
 use App\Services\ScrapeEnqueueGuard;
 use App\Services\ScrapeWindowPlanner;
@@ -39,8 +41,11 @@ class ManageController extends Controller
      */
     private const SORT_MODES = ['name', 'id', 'last_scraped', 'environment'];
 
-    public function index(Request $request): Response
-    {
+    public function index(
+        Request $request,
+        HealthScoreCalculator $health,
+        AnomalyDetector $detector,
+    ): Response {
         $user = $request->user();
         $sort = $this->normalizeSort($request->query('sort'));
         $search = trim((string) $request->query('q', ''));
@@ -67,26 +72,46 @@ class ManageController extends Controller
             ->orderBy('id')
             ->get();
 
+        // Drift signals for the whole user-scope are computed once and
+        // looked up per-row below. The detector is bounded by the
+        // user's subscription count, so a single call beats N+1 even
+        // when half the subscriptions trigger zero signals.
+        $driftSignals = collect($detector->forUser((int) $user->id))
+            ->groupBy('subscription_id');
+
         $organizations = $orgs->map(fn (Organization $o) => [
             'id' => $o->id,
             'name' => $o->name,
             'applications' => $o->applications->map(fn (Application $a) => [
                 'id' => $a->id,
                 'name' => $a->name,
-                'subscriptions' => $a->subscriptions->map(fn (Subscription $s) => [
-                    'id' => $s->id,
-                    'name' => $s->name,
-                    'environment' => $s->environment,
-                    'auto_scrape' => $s->auto_scrape,
-                    'scrape_interval_minutes' => $s->scrape_interval_minutes,
-                    'max_pages_per_scrape' => $s->max_pages_per_scrape,
-                    'lookback_days_first_scrape' => $s->lookback_days_first_scrape,
-                    'max_duration_minutes' => $s->max_duration_minutes,
-                    'max_concurrent_jobs' => $s->max_concurrent_jobs,
-                    'job_spacing_minutes' => $s->job_spacing_minutes,
-                    'token_echo_max_attempts' => $s->token_echo_max_attempts,
-                    'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
-                ]),
+                'subscriptions' => $a->subscriptions->map(function (Subscription $s) use ($health, $driftSignals) {
+                    $h = $health->forSubscription($s);
+                    $signals = $driftSignals->get($s->id, collect())->values()->all();
+
+                    return [
+                        'id' => $s->id,
+                        'name' => $s->name,
+                        'environment' => $s->environment,
+                        'auto_scrape' => $s->auto_scrape,
+                        'scrape_interval_minutes' => $s->scrape_interval_minutes,
+                        'max_pages_per_scrape' => $s->max_pages_per_scrape,
+                        'lookback_days_first_scrape' => $s->lookback_days_first_scrape,
+                        'max_duration_minutes' => $s->max_duration_minutes,
+                        'max_concurrent_jobs' => $s->max_concurrent_jobs,
+                        'job_spacing_minutes' => $s->job_spacing_minutes,
+                        'token_echo_max_attempts' => $s->token_echo_max_attempts,
+                        'last_scraped_at' => $s->last_scraped_at?->toIso8601String(),
+                        'health' => [
+                            'score' => $h['score'],
+                            'label' => $h['label'],
+                            'components' => $h['components'],
+                            'sample_size' => $h['sample_size'],
+                            'last_success_at' => $h['last_success_at'],
+                        ],
+                        'drift_signals' => $signals,
+                    ];
+                }),
             ]),
         ]);
 

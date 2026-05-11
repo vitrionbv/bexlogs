@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\BexSession;
 use App\Models\Page as LogPage;
+use App\Services\AnomalyDetector;
 use App\Services\ServerMetrics;
 use App\Support\JobSummary;
 use Illuminate\Http\Request;
@@ -12,8 +13,11 @@ use Inertia\Response;
 
 class DashboardController extends Controller
 {
-    public function index(Request $request, ServerMetrics $metrics): Response
-    {
+    public function index(
+        Request $request,
+        ServerMetrics $metrics,
+        AnomalyDetector $detector,
+    ): Response {
         $user = $request->user();
 
         $sessions = $user->bexSessions()
@@ -58,11 +62,18 @@ class DashboardController extends Controller
         // private-server-stats Reverb channel.
         $serverStats = $user->is_admin ? $metrics->snapshot() : null;
 
+        // Drift signals from AnomalyDetector. The Vue side renders a
+        // "Needs attention" panel; entries link straight to the
+        // per-subscription Insights page where the operator can dig
+        // in. Empty list → the panel is hidden client-side.
+        $driftSignals = $detector->forUser((int) $user->id);
+
         return Inertia::render('Dashboard', [
             'summary' => JobSummary::dashboardForUser($user),
             'sessions' => $sessions,
             'pages' => $pages,
             'serverStats' => $serverStats,
+            'driftSignals' => $driftSignals,
         ]);
     }
 }
