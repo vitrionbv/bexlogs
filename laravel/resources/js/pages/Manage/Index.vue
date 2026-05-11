@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { FormDataConvertible } from '@inertiajs/core';
 import { Head, Link, router, useForm } from '@inertiajs/vue3';
 import {
     AlertCircle,
@@ -148,13 +149,21 @@ function onSortChange(next: SortMode): void {
 
 function onSearchInput(value: string): void {
     searchQuery.value = value;
-    if (searchDebounce) clearTimeout(searchDebounce);
+
+    if (searchDebounce) {
+clearTimeout(searchDebounce);
+}
+
     searchDebounce = setTimeout(() => applyFilters(), 200);
 }
 
 function clearSearch(): void {
     searchQuery.value = '';
-    if (searchDebounce) clearTimeout(searchDebounce);
+
+    if (searchDebounce) {
+clearTimeout(searchDebounce);
+}
+
     applyFilters();
 }
 
@@ -181,16 +190,19 @@ function isExpanded(subId: string): boolean {
 
 function toggleExpanded(subId: string): void {
     const next = new Set(expandedSubs.value);
+
     if (next.has(subId)) {
         next.delete(subId);
     } else {
         next.add(subId);
     }
+
     expandedSubs.value = next;
 }
 
 function toggleExpandAll(): void {
     expandAll.value = !expandAll.value;
+
     if (!expandAll.value) {
         // Collapsing "expand all" wipes any per-row expansions too —
         // intent of the bulk button is "reset to compact".
@@ -204,15 +216,34 @@ function toggleExpandAll(): void {
 // ("just now / minutes / hours / days") without locale strings or
 // heavy formatters.
 function formatLastScraped(iso: string | null): string {
-    if (!iso) return 'never';
+    if (!iso) {
+return 'never';
+}
+
     const ms = Date.now() - new Date(iso).getTime();
-    if (!Number.isFinite(ms) || ms < 0) return 'just now';
+
+    if (!Number.isFinite(ms) || ms < 0) {
+return 'just now';
+}
+
     const minutes = Math.floor(ms / 60_000);
-    if (minutes < 1) return 'just now';
-    if (minutes < 60) return `${minutes}m ago`;
+
+    if (minutes < 1) {
+return 'just now';
+}
+
+    if (minutes < 60) {
+return `${minutes}m ago`;
+}
+
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
+
+    if (hours < 24) {
+return `${hours}h ago`;
+}
+
     const days = Math.floor(hours / 24);
+
     return `${days}d ago`;
 }
 
@@ -403,7 +434,9 @@ function submitBulkBudget(): void {
     // Translate the (apply[], values{}) shape into a sparse server
     // payload — only the columns whose `apply` checkbox is ticked
     // ride along. This matches the controller's "sometimes" validators.
-    const payload: Record<string, unknown> = {
+    // The value type widens to FormDataConvertible because Inertia's
+    // `router.patch` typings reject `unknown`-valued payloads.
+    const payload: Record<string, FormDataConvertible> = {
         subscription_ids: bulkPayloadIds(),
     };
 

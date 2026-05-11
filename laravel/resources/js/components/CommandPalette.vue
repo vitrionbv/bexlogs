@@ -117,6 +117,7 @@ function pushRecent(result: PaletteResult): void {
     ].slice(0, RECENTS_CAP);
 
     recents.value = next;
+
     try {
         window.localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
     } catch {
@@ -174,6 +175,7 @@ async function runSearch(text: string): Promise<void> {
 
     fetchAbort = new AbortController();
     loading.value = true;
+
     try {
         const res = await fetch(`/api/search?q=${encodeURIComponent(text)}`, {
             headers: { Accept: 'application/json' },
@@ -200,6 +202,7 @@ watch(query, (next) => {
     if (fetchDebounce) {
         clearTimeout(fetchDebounce);
     }
+
     fetchDebounce = setTimeout(() => runSearch(next.trim()), 150);
 });
 
@@ -232,26 +235,31 @@ const groupedResults = computed<{ kind: ResultKind; title: string; items: Palett
     }
 
     const subs = (remote.value.subscriptions ?? []).filter(staticFilter);
+
     if (subs.length > 0) {
         groups.push({ kind: 'subscription', title: 'Subscriptions', items: subs });
     }
 
     const jobs = (remote.value.scrape_jobs ?? []).filter(staticFilter);
+
     if (jobs.length > 0) {
         groups.push({ kind: 'scrape_job', title: 'Scrape jobs', items: jobs });
     }
 
     const sq = (remote.value.saved_queries ?? []).filter(staticFilter);
+
     if (sq.length > 0) {
         groups.push({ kind: 'saved_query', title: 'Saved queries', items: sq });
     }
 
     const pages = NAV_ITEMS.filter(staticFilter);
+
     if (pages.length > 0) {
         groups.push({ kind: 'page', title: 'Pages', items: pages });
     }
 
     const actions = ACTION_ITEMS.filter(staticFilter);
+
     if (actions.length > 0) {
         groups.push({ kind: 'action', title: 'Actions', items: actions });
     }
@@ -294,20 +302,25 @@ function onListKeydown(e: KeyboardEvent): void {
     if (e.key === 'ArrowDown') {
         e.preventDefault();
         const total = flatResults.value.length;
+
         if (total === 0) {
             return;
         }
+
         activeIndex.value = (activeIndex.value + 1) % total;
     } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         const total = flatResults.value.length;
+
         if (total === 0) {
             return;
         }
+
         activeIndex.value = (activeIndex.value - 1 + total) % total;
     } else if (e.key === 'Enter') {
         e.preventDefault();
         const target = flatResults.value[activeIndex.value];
+
         if (target) {
             activate(target);
         }

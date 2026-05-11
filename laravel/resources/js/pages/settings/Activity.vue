@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { FormDataConvertible } from '@inertiajs/core';
 import { Head, router } from '@inertiajs/vue3';
 import { ChevronLeft, ChevronRight, Filter, X } from 'lucide-vue-next';
 import { computed, ref, watch } from 'vue';
@@ -109,23 +110,32 @@ function toggleAction(action: string): void {
 }
 
 function applyFilters(): void {
-    const payload: Record<string, unknown> = {};
+    // Inertia's `router.get` typings reject `unknown`-valued payloads
+    // — widen to FormDataConvertible (the union accepted by the
+    // RequestPayload type) so the call site type-checks while still
+    // covering the string|string[]|null shapes we put in here.
+    const payload: Record<string, FormDataConvertible> = {};
 
     if (userValue.value !== ANY_USER) {
         payload.user_id = userValue.value;
     }
+
     if (subjectTypeValue.value !== ANY_TYPE) {
         payload.subject_type = subjectTypeValue.value;
+
         if (subjectIdValue.value.trim()) {
             payload.subject_id = subjectIdValue.value.trim();
         }
     }
+
     if (selectedActions.value.size > 0) {
         payload.actions = Array.from(selectedActions.value);
     }
+
     if (fromValue.value) {
         payload.from = fromValue.value;
     }
+
     if (toValue.value) {
         payload.to = toValue.value;
     }
