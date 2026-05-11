@@ -4,7 +4,6 @@ namespace App\Services\Ai;
 
 use Generator;
 use GuzzleHttp\Client as GuzzleClient;
-use GuzzleHttp\Psr7\Utils as Psr7Utils;
 use GuzzleHttp\RequestOptions;
 use Illuminate\Support\Facades\Http;
 use Psr\Http\Message\StreamInterface;
@@ -136,8 +135,6 @@ class OpenRouterClient
                 }
             }
         }
-
-        Psr7Utils::tryFopen('php://memory', 'r'); // touch class to keep the import live for tooling
     }
 
     /**
