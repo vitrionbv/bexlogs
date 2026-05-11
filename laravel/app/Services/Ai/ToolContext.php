@@ -17,5 +17,6 @@ final readonly class ToolContext
     public function __construct(
         public int $userId,
         public string $subscriptionId,
+        public ?int $conversationId = null,
     ) {}
 }

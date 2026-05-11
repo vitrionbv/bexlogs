@@ -4,7 +4,6 @@ namespace App\Services\Ai\Tools;
 
 use App\Models\LogMessage;
 use App\Models\Page;
-use App\Services\Ai\Tool;
 use App\Services\Ai\ToolContext;
 
 /**
@@ -28,8 +27,17 @@ class ListPagesTool implements Tool
     public function jsonSchema(): array
     {
         return [
-            'type' => 'object',
-            'properties' => new \stdClass, // no params; emit `{}` not `[]`
+            'type' => 'function',
+            'function' => [
+                'name' => $this->name(),
+                'description' => $this->description(),
+                'parameters' => [
+                    'type' => 'object',
+                    'additionalProperties' => false,
+                    // no params; emit `{}` not `[]` so OpenRouter doesn't reject the schema.
+                    'properties' => new \stdClass,
+                ],
+            ],
         ];
     }
 
