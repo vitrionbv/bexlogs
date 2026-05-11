@@ -51,6 +51,18 @@ Schedule::command('bex:apply-retention')
     ->withoutOverlapping(60)
     ->runInBackground();
 
+// Recompute per-subscription drift baselines (p50/p95/p99 for duration
+// and rows_inserted, plus same-hour rolling averages for the last 7d).
+// Nightly is plenty — anomaly detection compares each new completed
+// job against yesterday's baseline; recomputing more frequently would
+// just smooth out the very signal we want to surface. 03:30 is after
+// the daily rollover but well before any operator-side morning
+// review, so the Manage badges are fresh by the time the day starts.
+Schedule::command('bex:compute-baselines')
+    ->dailyAt('03:30')
+    ->withoutOverlapping(60)
+    ->runInBackground();
+
 // Per-subscription cold-tier archival to Hetzner Object Storage.
 // Runs nightly at 04:00 UTC, an hour after the retention pass, so
 // the two cron jobs never compete for log_messages locks. NULL
