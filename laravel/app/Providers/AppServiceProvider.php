@@ -2,6 +2,13 @@
 
 namespace App\Providers;
 
+use App\Models\BexSession;
+use App\Models\ScrapeJob;
+use App\Models\Subscription;
+use App\Observers\AuditBexSessionObserver;
+use App\Observers\AuditScrapeJobObserver;
+use App\Observers\AuditSubscriptionObserver;
+use App\Services\AuditLogger;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
@@ -15,7 +22,12 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        // AuditLogger is bound as a singleton so the in-process dedup
+        // map (`$seen`) is shared between the controller writes and
+        // the fallback observers within the same request. Without the
+        // singleton each observer would resolve a fresh instance and
+        // the explicit `suppressNext()` calls would be no-ops.
+        $this->app->singleton(AuditLogger::class);
     }
 
     /**
@@ -24,6 +36,22 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $this->configureDefaults();
+        $this->registerAuditObservers();
+    }
+
+    /**
+     * Wire the audit observers onto the models whose lifecycle events
+     * should land in `audit_logs`. The controllers also call
+     * `AuditLogger::record()` directly with hand-curated payloads; the
+     * observer is the fallback for routes/commands the controllers
+     * don't cover. See {@see AuditLogger::$seen} for the dedup
+     * mechanism that keeps both layers from double-writing.
+     */
+    protected function registerAuditObservers(): void
+    {
+        Subscription::observe(AuditSubscriptionObserver::class);
+        BexSession::observe(AuditBexSessionObserver::class);
+        ScrapeJob::observe(AuditScrapeJobObserver::class);
     }
 
     /**

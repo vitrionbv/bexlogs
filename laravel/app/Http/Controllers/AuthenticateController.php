@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Events\BexSessionDeleted;
 use App\Models\BexSession;
 use App\Models\PairingToken;
+use App\Services\AuditLogger;
 use App\Services\BexSessionPruner;
 use App\Services\BexSessionRefresher;
 use Illuminate\Http\JsonResponse;
@@ -137,7 +138,7 @@ class AuthenticateController extends Controller
         return response()->json(['status' => 'waiting']);
     }
 
-    public function destroy(Request $request, BexSession $bexSession): RedirectResponse
+    public function destroy(Request $request, BexSession $bexSession, AuditLogger $audit): RedirectResponse
     {
         abort_unless($bexSession->user_id === $request->user()->id, 403);
 
@@ -145,6 +146,18 @@ class AuthenticateController extends Controller
         $deletedUserId = (int) $bexSession->user_id;
         $deletedEnv = (string) $bexSession->environment;
         $deletedEmail = $bexSession->account_email;
+
+        // Audit before delete: the observer's matching `session.disabled`
+        // hook also fires on delete, but with the morph still pointing
+        // at the live row we get a richer controller-side payload.
+        $audit->suppressNext('session.disabled', $bexSession);
+        $audit->record('session.disabled', $bexSession, [
+            'reason' => 'manual_revoke',
+            'old' => [
+                'environment' => $deletedEnv,
+                'account_email' => $deletedEmail,
+            ],
+        ], deduplicate: false);
 
         $bexSession->delete();
 

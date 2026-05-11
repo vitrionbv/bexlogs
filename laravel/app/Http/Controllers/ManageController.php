@@ -8,6 +8,7 @@ use App\Models\BexSession;
 use App\Models\Organization;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
+use App\Services\AuditLogger;
 use App\Services\BookingExpertsBrowser;
 use App\Services\MayEnqueueResult;
 use App\Services\ScrapeEnqueueGuard;
@@ -257,7 +258,7 @@ class ManageController extends Controller
         ];
     }
 
-    public function storeSubscription(Request $request): RedirectResponse
+    public function storeSubscription(Request $request, AuditLogger $audit): RedirectResponse
     {
         $data = $request->validate([
             'url' => 'nullable|string',
@@ -272,7 +273,12 @@ class ManageController extends Controller
 
         $ids = $this->resolveIds($data);
 
-        DB::transaction(function () use ($ids, $data, $request) {
+        // Hold a reference to the just-persisted Subscription so the
+        // post-transaction audit write has a populated model to record
+        // against (the observer's `created` hook also fires inside the
+        // transaction, but we want the controller's row to take
+        // precedence with a richer payload).
+        $created = DB::transaction(function () use ($ids, $data, $request, $audit) {
             Organization::query()->updateOrCreate(
                 ['id' => $ids['organization_id']],
                 [
@@ -287,7 +293,13 @@ class ManageController extends Controller
                     'name' => $data['application_name'] ?? "Application {$ids['application_id']}",
                 ],
             );
-            Subscription::query()->updateOrCreate(
+
+            // Suppress the observer's matching write — the controller
+            // already records this action with a richer payload below.
+            $sub = Subscription::query()->firstOrNew(['id' => $ids['subscription_id']]);
+            $audit->suppressNext('subscription.created', $sub);
+
+            return Subscription::query()->updateOrCreate(
                 ['id' => $ids['subscription_id']],
                 [
                     'application_id' => $ids['application_id'],
@@ -297,13 +309,84 @@ class ManageController extends Controller
             );
         });
 
+        $audit->record('subscription.created', $created, [
+            'new' => [
+                'id' => $created->id,
+                'name' => $created->name,
+                'environment' => $created->environment,
+            ],
+        ], deduplicate: false);
+
         return back()->with('status', 'subscription-added');
     }
 
-    public function updateSubscription(Request $request, Subscription $subscription): RedirectResponse
+    public function updateSubscription(Request $request, Subscription $subscription, AuditLogger $audit): RedirectResponse
     {
         $this->authorize($request, $subscription);
-        $data = $request->validate([
+        $data = $request->validate(self::updateValidationRules());
+
+        $diff = AuditLogger::diff($subscription, $data);
+
+        // Choose the action name based on the columns that actually
+        // changed — `auto_scrape` flips and budget-only edits are
+        // first-class on the Activity page; mixed edits fall back to
+        // `subscription.updated`. Empty diff (nothing changed) emits
+        // nothing.
+        //
+        // suppressNext MUST run before `update()` — the observer's
+        // `updated` hook fires inside the lifecycle event of the
+        // update call. If we suppressed afterwards the observer would
+        // already have persisted its own row and the controller's
+        // explicit `record(..., deduplicate: false)` below would add
+        // a second duplicate.
+        if ($diff['new'] !== []) {
+            $action = self::actionFor(array_keys($diff['new']));
+            $audit->suppressNext($action, $subscription);
+        }
+
+        $subscription->update($data);
+
+        if ($diff['new'] !== []) {
+            $action = self::actionFor(array_keys($diff['new']));
+            $audit->record($action, $subscription, $diff, deduplicate: false);
+        }
+
+        return back()->with('status', 'subscription-updated');
+    }
+
+    public function destroySubscription(Request $request, Subscription $subscription, AuditLogger $audit): RedirectResponse
+    {
+        $this->authorize($request, $subscription);
+
+        // Audit must be recorded BEFORE the delete: the morph relation
+        // needs a populated row to derive subject_id from, and the
+        // operator-friendly payload (name, environment) would otherwise
+        // be lost. Suppress the observer's matching write so the
+        // explicit controller row is the only one persisted.
+        $audit->suppressNext('subscription.deleted', $subscription);
+        $audit->record('subscription.deleted', $subscription, [
+            'old' => [
+                'id' => $subscription->id,
+                'name' => $subscription->name,
+                'environment' => $subscription->environment,
+            ],
+        ], deduplicate: false);
+
+        $subscription->delete();
+
+        return back()->with('status', 'subscription-deleted');
+    }
+
+    /**
+     * Shared validation rules used by both the per-sub update endpoint
+     * and the bulk-update endpoint. Pulled into a constant-shaped
+     * helper so the two paths stay in lock-step.
+     *
+     * @return array<string, string>
+     */
+    public static function updateValidationRules(): array
+    {
+        return [
             'name' => 'sometimes|string|max:255',
             'auto_scrape' => 'sometimes|boolean',
             'scrape_interval_minutes' => 'sometimes|integer|min:1|max:1440',
@@ -320,18 +403,36 @@ class ManageController extends Controller
             // wedge a worker for hours waiting on a quiet sub.
             'token_echo_max_attempts' => 'sometimes|integer|min:1|max:1000',
             'environment' => 'sometimes|in:production,staging',
-        ]);
-        $subscription->update($data);
-
-        return back()->with('status', 'subscription-updated');
+        ];
     }
 
-    public function destroySubscription(Request $request, Subscription $subscription): RedirectResponse
+    /**
+     * Choose the audit action for a subscription update based on which
+     * columns changed. Mirrors {@see AuditSubscriptionObserver::updated}
+     * so the controller and the observer agree on action naming and
+     * the dedup map can suppress the duplicate cleanly.
+     *
+     * @param  array<int, string>  $changedKeys
+     */
+    private static function actionFor(array $changedKeys): string
     {
-        $this->authorize($request, $subscription);
-        $subscription->delete();
+        if ($changedKeys === ['auto_scrape']) {
+            return 'subscription.auto_scrape_toggled';
+        }
 
-        return back()->with('status', 'subscription-deleted');
+        $budgetKeys = [
+            'scrape_interval_minutes',
+            'max_pages_per_scrape',
+            'lookback_days_first_scrape',
+            'max_duration_minutes',
+            'max_concurrent_jobs',
+            'job_spacing_minutes',
+            'token_echo_max_attempts',
+        ];
+
+        return array_diff($changedKeys, $budgetKeys) === []
+            ? 'subscription.budget_updated'
+            : 'subscription.updated';
     }
 
     public function enqueueScrape(
@@ -339,6 +440,7 @@ class ManageController extends Controller
         Subscription $subscription,
         ScrapeEnqueueGuard $guard,
         ScrapeWindowPlanner $planner,
+        AuditLogger $audit,
     ): RedirectResponse {
         $this->authorize($request, $subscription);
 
@@ -365,6 +467,11 @@ class ManageController extends Controller
         // a scheduler tick that overlaps a manual click doesn't pile on.
         $decision = $guard->mayEnqueue($subscription);
         if (! $decision->allowed) {
+            $audit->record('scrape.denied', $subscription, [
+                'reason' => $decision->reason,
+                'message' => $decision->message,
+            ], deduplicate: false);
+
             return $this->scrapeDeniedResponse($decision);
         }
 
@@ -374,6 +481,17 @@ class ManageController extends Controller
             'status' => ScrapeJob::STATUS_QUEUED,
             'params' => $planner->buildParamsWithOverrides($subscription, $overrides),
         ]);
+
+        // Audit row is keyed on the subscription (the operator-facing
+        // entity), with the job id recorded in the payload for
+        // traceability. The ScrapeJobObserver's matching `scrape.enqueued`
+        // write also fires but with `subject_type=ScrapeJob`, so the
+        // two rows describe the same event at different granularities
+        // and we leave both intact.
+        $audit->record('scrape.manual_triggered', $subscription, [
+            'scrape_job_id' => $job->id,
+            'overrides' => $overrides,
+        ], deduplicate: false);
 
         broadcast(new ScrapeJobUpdated(
             userId: (int) $request->user()->id,
@@ -388,6 +506,256 @@ class ManageController extends Controller
         ]);
 
         return back()->with('status', 'scrape-enqueued');
+    }
+
+    // ─── Bulk operations (F17) ──────────────────────────────────────────────
+    //
+    // The Manage page selection toolbar fans a single click out to N
+    // subscriptions. Three endpoints, all mirroring the per-sub
+    // counterparts:
+    //
+    //   - bulkUpdate         → applies a partial set of fields to each
+    //                          authorised sub. Caller passes only the
+    //                          fields they want to touch; everything
+    //                          else is left untouched per-row. Run
+    //                          inside a transaction so a validation
+    //                          failure aborts the whole batch (the
+    //                          alternative — partial application — was
+    //                          tested with operators and rejected as
+    //                          too confusing).
+    //
+    //   - bulkDelete         → cascading delete; identical authz to
+    //                          destroySubscription. Audit row per sub.
+    //
+    //   - bulkEnqueueScrape  → runs each sub through ScrapeEnqueueGuard
+    //                          independently. Returns a tally of queued
+    //                          vs skipped so the toolbar can flash a
+    //                          summary toast ("5 queued, 2 skipped").
+    //
+    // Authorization happens up front in a single query against the
+    // organizations table — anything the user doesn't own is silently
+    // dropped from the request set (NOT a 403, so a partially-stale
+    // selection doesn't fail the whole batch). Each endpoint then
+    // operates only on the authorised slice.
+
+    /**
+     * Apply a partial field update to every authorised subscription in
+     * the request set. Same validation rules as `updateSubscription`
+     * — anything that would 422 a single-row update 422s the batch.
+     */
+    public function bulkUpdate(Request $request, AuditLogger $audit): RedirectResponse
+    {
+        $payload = $request->validate(array_merge(
+            ['subscription_ids' => 'required|array|min:1', 'subscription_ids.*' => 'string'],
+            self::updateValidationRules(),
+        ));
+
+        $ids = $payload['subscription_ids'];
+        unset($payload['subscription_ids']);
+
+        if ($payload === []) {
+            // No-op update (caller didn't tick any "Apply to all"
+            // checkboxes). Bail with a friendly status rather than
+            // 422-ing — the UI guards against this too but the server
+            // is the source of truth.
+            return back()->with('status', 'bulk-update-noop');
+        }
+
+        $subs = $this->authorisedSubscriptions($request, $ids);
+        $updated = 0;
+
+        DB::transaction(function () use ($subs, $payload, $audit, &$updated) {
+            foreach ($subs as $sub) {
+                $diff = AuditLogger::diff($sub, $payload);
+                if ($diff['new'] === []) {
+                    continue;
+                }
+
+                // Suppress the observer's matching write BEFORE the
+                // update — the model lifecycle event fires inside
+                // `$sub->update($payload)` and would otherwise persist
+                // its own audit row first, leaving the explicit
+                // controller `record(..., deduplicate: false)` below
+                // to add a second one. Ordering matters.
+                $action = self::actionFor(array_keys($diff['new']));
+                $audit->suppressNext($action, $sub);
+                $sub->update($payload);
+                $audit->record($action, $sub, $diff, deduplicate: false);
+                $updated++;
+            }
+        });
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => $updated === 1
+                ? '1 subscription updated.'
+                : "{$updated} subscriptions updated.",
+        ]);
+
+        return back()->with('status', 'bulk-update-applied');
+    }
+
+    /**
+     * Delete every authorised subscription in the request set. The
+     * deletion cascade on the Subscription model is unchanged — this
+     * just batches the per-row delete loop with audit + a summary
+     * toast.
+     */
+    public function bulkDelete(Request $request, AuditLogger $audit): RedirectResponse
+    {
+        $payload = $request->validate([
+            'subscription_ids' => 'required|array|min:1',
+            'subscription_ids.*' => 'string',
+        ]);
+
+        $subs = $this->authorisedSubscriptions($request, $payload['subscription_ids']);
+        $deleted = 0;
+
+        DB::transaction(function () use ($subs, $audit, &$deleted) {
+            foreach ($subs as $sub) {
+                $audit->suppressNext('subscription.deleted', $sub);
+                $audit->record('subscription.deleted', $sub, [
+                    'old' => [
+                        'id' => $sub->id,
+                        'name' => $sub->name,
+                        'environment' => $sub->environment,
+                    ],
+                ], deduplicate: false);
+                $sub->delete();
+                $deleted++;
+            }
+        });
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => $deleted === 1
+                ? '1 subscription deleted.'
+                : "{$deleted} subscriptions deleted.",
+        ]);
+
+        return back()->with('status', 'bulk-delete-applied');
+    }
+
+    /**
+     * Enqueue a manual scrape for every authorised subscription. Each
+     * sub goes through {@see ScrapeEnqueueGuard} independently so the
+     * spacing/concurrency gates that apply to single clicks still
+     * apply per-row. Returns a structured tally for the toast — the
+     * UI surfaces "X queued, Y skipped (within spacing window)".
+     */
+    public function bulkEnqueueScrape(
+        Request $request,
+        ScrapeEnqueueGuard $guard,
+        ScrapeWindowPlanner $planner,
+        AuditLogger $audit,
+    ): RedirectResponse {
+        $payload = $request->validate([
+            'subscription_ids' => 'required|array|min:1',
+            'subscription_ids.*' => 'string',
+        ]);
+
+        $subs = $this->authorisedSubscriptions($request, $payload['subscription_ids']);
+
+        $queued = 0;
+        $skipped = 0;
+        $noSession = 0;
+        // Track which denial reasons fired so the toast can mention
+        // the dominant one rather than a generic "skipped" count.
+        $reasonCounts = [];
+
+        foreach ($subs as $sub) {
+            $session = $request->user()->activeBexSession($sub->environment);
+            if (! $session) {
+                $noSession++;
+                $skipped++;
+                $reasonCounts['no_session'] = ($reasonCounts['no_session'] ?? 0) + 1;
+                $audit->record('scrape.denied', $sub, [
+                    'reason' => 'no_session',
+                    'message' => "No active session for {$sub->environment}.",
+                ], deduplicate: false);
+
+                continue;
+            }
+
+            $decision = $guard->mayEnqueue($sub);
+            if (! $decision->allowed) {
+                $skipped++;
+                $reasonKey = $decision->reason ?? 'denied';
+                $reasonCounts[$reasonKey] = ($reasonCounts[$reasonKey] ?? 0) + 1;
+                $audit->record('scrape.denied', $sub, [
+                    'reason' => $decision->reason,
+                    'message' => $decision->message,
+                ], deduplicate: false);
+
+                continue;
+            }
+
+            $job = ScrapeJob::create([
+                'subscription_id' => $sub->id,
+                'bex_session_id' => $session->id,
+                'status' => ScrapeJob::STATUS_QUEUED,
+                'params' => $planner->buildParamsWithOverrides($sub, []),
+            ]);
+
+            $audit->record('scrape.manual_triggered', $sub, [
+                'scrape_job_id' => $job->id,
+                'via' => 'bulk',
+            ], deduplicate: false);
+
+            broadcast(new ScrapeJobUpdated(
+                userId: (int) $request->user()->id,
+                jobId: $job->id,
+                subscriptionId: (string) $sub->id,
+                status: $job->status,
+            ));
+
+            $queued++;
+        }
+
+        $message = match (true) {
+            $queued === 0 && $skipped === 0 => 'No matching subscriptions.',
+            $skipped === 0 => "{$queued} queued.",
+            $queued === 0 => "{$skipped} skipped.",
+            default => "{$queued} queued, {$skipped} skipped.",
+        };
+
+        Inertia::flash('toast', [
+            'type' => $queued === 0 ? 'warning' : 'success',
+            'message' => $message,
+        ]);
+
+        return back()
+            ->with('status', 'bulk-scrape-applied')
+            ->with('bulk_scrape_queued', $queued)
+            ->with('bulk_scrape_skipped', $skipped)
+            ->with('bulk_scrape_no_session', $noSession)
+            ->with('bulk_scrape_reasons', $reasonCounts);
+    }
+
+    /**
+     * Resolve the subset of `$ids` the authenticated user actually
+     * owns — anything outside their organizations is silently
+     * dropped. Returning a Collection (rather than a paginator or
+     * raw rows) keeps the bulk callers' iteration code identical to
+     * what a per-row controller would do.
+     *
+     * @param  array<int, string>  $ids
+     * @return Collection<int, Subscription>
+     */
+    private function authorisedSubscriptions(Request $request, array $ids): Collection
+    {
+        return Subscription::query()
+            ->whereIn('id', $ids)
+            ->whereExists(fn ($q) => $q
+                ->from('applications')
+                ->whereColumn('applications.id', 'subscriptions.application_id')
+                ->whereExists(fn ($qq) => $qq
+                    ->from('organizations')
+                    ->whereColumn('organizations.id', 'applications.organization_id')
+                    ->where('organizations.user_id', $request->user()->id),
+                ),
+            )
+            ->get();
     }
 
     /**

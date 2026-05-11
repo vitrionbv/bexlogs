@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Admin\UserController;
+use App\Http\Controllers\Api\SearchController;
 use App\Http\Controllers\AuthenticateController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\ExtensionController;
@@ -95,6 +96,18 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('manage', [ManageController::class, 'index'])->name('manage.index');
     Route::post('manage/subscriptions', [ManageController::class, 'storeSubscription'])
         ->name('manage.subscriptions.store');
+
+    // Bulk operations (F17). MUST be registered before the
+    // `manage/subscriptions/{subscription}` routes below — otherwise
+    // route-model-binding swallows "bulk" as a subscription id, the
+    // implicit binding 404s, and the bulk endpoints never run.
+    Route::patch('manage/subscriptions/bulk', [ManageController::class, 'bulkUpdate'])
+        ->name('manage.subscriptions.bulk-update');
+    Route::delete('manage/subscriptions/bulk', [ManageController::class, 'bulkDelete'])
+        ->name('manage.subscriptions.bulk-delete');
+    Route::post('manage/subscriptions/bulk/scrape', [ManageController::class, 'bulkEnqueueScrape'])
+        ->name('manage.subscriptions.bulk-scrape');
+
     Route::patch('manage/subscriptions/{subscription}', [ManageController::class, 'updateSubscription'])
         ->name('manage.subscriptions.update');
     Route::delete('manage/subscriptions/{subscription}', [ManageController::class, 'destroySubscription'])
@@ -111,6 +124,13 @@ Route::middleware(['auth', 'verified'])->group(function () {
         ->name('manage.browse.organizations-for-application');
     Route::get('manage/browse/applications/{application}/subscriptions', [ManageController::class, 'browseSubscriptionsForApplication'])
         ->name('manage.browse.subscriptions-for-application');
+
+    // Cmd-K command palette backing endpoint (F16). Scoped to the
+    // user's orgs; returns three groups (subscriptions, scrape jobs,
+    // saved queries) capped at 10 each. The palette debounces 150ms
+    // client-side so this endpoint sees at most ~6 hits/second under
+    // active typing.
+    Route::get('api/search', SearchController::class)->name('api.search');
 
     // Admin-only user management. Single-tenant app — one boolean
     // (`users.is_admin`) gates everything in this group.
