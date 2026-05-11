@@ -11,9 +11,12 @@ use App\Services\Ai\Tools\Tool;
 
 /**
  * Single source of truth for the agent's tool catalogue. Resolved
- * through the container so the constructor wires in the LogQueryBuilder
- * dependencies; called from both the ChatController (to advertise
- * tools to OpenRouter) and the ToolDispatcher (to run them).
+ * through the container so the constructor wires in the
+ * LogQueryBuilder dependencies; called from both the ChatController
+ * (to advertise tools to OpenRouter) and the ToolDispatcher (to
+ * run them). Each tool's `jsonSchema()` already returns the full
+ * OpenAI/OpenRouter `{type:function, function:{name,description,
+ * parameters}}` entry, so the registry just collects them.
  */
 class ToolRegistry
 {
