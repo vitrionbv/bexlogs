@@ -23,7 +23,14 @@ import {
     Plus,
     Search,
 } from 'lucide-vue-next';
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import {
+    computed,
+    nextTick,
+    onBeforeUnmount,
+    onMounted,
+    ref,
+    watch,
+} from 'vue';
 import {
     Dialog,
     DialogContent,
@@ -33,7 +40,13 @@ import {
 
 // Tag set for the group ordering. Reordering this array reorders the
 // groups in the palette UI.
-type ResultKind = 'recent' | 'subscription' | 'scrape_job' | 'saved_query' | 'page' | 'action';
+type ResultKind =
+    | 'recent'
+    | 'subscription'
+    | 'scrape_job'
+    | 'saved_query'
+    | 'page'
+    | 'action';
 
 interface PaletteResult {
     id: string;
@@ -90,7 +103,12 @@ function loadRecents(): void {
 
         if (Array.isArray(parsed)) {
             recents.value = (parsed as PaletteResult[])
-                .filter((r) => r && typeof r.id === 'string' && typeof r.label === 'string')
+                .filter(
+                    (r) =>
+                        r &&
+                        typeof r.id === 'string' &&
+                        typeof r.label === 'string',
+                )
                 .slice(0, RECENTS_CAP);
         }
     } catch {
@@ -113,7 +131,10 @@ function pushRecent(result: PaletteResult): void {
         // re-clicking a recent item moves it to position 0 instead of
         // creating a duplicate.
         { ...result, kind: 'recent' as ResultKind },
-        ...recents.value.filter((r) => `${r.kind === 'recent' ? result.kind : r.kind}:${r.id}` !== key),
+        ...recents.value.filter(
+            (r) =>
+                `${r.kind === 'recent' ? result.kind : r.kind}:${r.id}` !== key,
+        ),
     ].slice(0, RECENTS_CAP);
 
     recents.value = next;
@@ -134,10 +155,30 @@ const NAV_ITEMS: PaletteResult[] = [
     { id: 'jobs', kind: 'page', label: 'Jobs', href: '/jobs' },
     { id: 'manage', kind: 'page', label: 'Manage', href: '/manage' },
     { id: 'sessions', kind: 'page', label: 'Sessions', href: '/authenticate' },
-    { id: 'settings.profile', kind: 'page', label: 'Settings · Profile', href: '/settings/profile' },
-    { id: 'settings.security', kind: 'page', label: 'Settings · Security', href: '/settings/security' },
-    { id: 'settings.activity', kind: 'page', label: 'Settings · Activity', href: '/settings/activity' },
-    { id: 'settings.appearance', kind: 'page', label: 'Settings · Appearance', href: '/settings/appearance' },
+    {
+        id: 'settings.profile',
+        kind: 'page',
+        label: 'Settings · Profile',
+        href: '/settings/profile',
+    },
+    {
+        id: 'settings.security',
+        kind: 'page',
+        label: 'Settings · Security',
+        href: '/settings/security',
+    },
+    {
+        id: 'settings.activity',
+        kind: 'page',
+        label: 'Settings · Activity',
+        href: '/settings/activity',
+    },
+    {
+        id: 'settings.appearance',
+        kind: 'page',
+        label: 'Settings · Appearance',
+        href: '/settings/appearance',
+    },
 ];
 
 const ACTION_ITEMS: PaletteResult[] = [
@@ -221,12 +262,20 @@ function staticFilter(item: PaletteResult): boolean {
         return true;
     }
 
-    return item.label.toLowerCase().includes(trimmedQuery.value)
-        || (item.sublabel?.toLowerCase().includes(trimmedQuery.value) ?? false);
+    return (
+        item.label.toLowerCase().includes(trimmedQuery.value) ||
+        (item.sublabel?.toLowerCase().includes(trimmedQuery.value) ?? false)
+    );
 }
 
-const groupedResults = computed<{ kind: ResultKind; title: string; items: PaletteResult[] }[]>(() => {
-    const groups: { kind: ResultKind; title: string; items: PaletteResult[] }[] = [];
+const groupedResults = computed<
+    { kind: ResultKind; title: string; items: PaletteResult[] }[]
+>(() => {
+    const groups: {
+        kind: ResultKind;
+        title: string;
+        items: PaletteResult[];
+    }[] = [];
 
     // Recents only render when the query is empty — once the operator
     // is typing, the live search supersedes the cached list.
@@ -237,7 +286,11 @@ const groupedResults = computed<{ kind: ResultKind; title: string; items: Palett
     const subs = (remote.value.subscriptions ?? []).filter(staticFilter);
 
     if (subs.length > 0) {
-        groups.push({ kind: 'subscription', title: 'Subscriptions', items: subs });
+        groups.push({
+            kind: 'subscription',
+            title: 'Subscriptions',
+            items: subs,
+        });
     }
 
     const jobs = (remote.value.scrape_jobs ?? []).filter(staticFilter);
@@ -345,12 +398,12 @@ function onGlobalKeydown(e: KeyboardEvent): void {
     }
 
     if (
-        e.key === '/'
-        && !inMod
-        && !e.altKey
-        && !e.shiftKey
-        && !isEditableTarget(e.target)
-        && !open.value
+        e.key === '/' &&
+        !inMod &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !isEditableTarget(e.target) &&
+        !open.value
     ) {
         e.preventDefault();
         open.value = true;
@@ -365,10 +418,10 @@ function isEditableTarget(t: EventTarget | null): boolean {
     const tag = t.tagName;
 
     return (
-        tag === 'INPUT'
-        || tag === 'TEXTAREA'
-        || tag === 'SELECT'
-        || t.isContentEditable
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        t.isContentEditable
     );
 }
 
@@ -428,7 +481,7 @@ function indexOf(result: PaletteResult): number {
 <template>
     <Dialog v-if="isAuthed" v-model:open="open">
         <DialogContent
-            class="!top-[20%] !translate-y-0 !max-w-xl !p-0"
+            class="!top-[20%] !max-w-xl !translate-y-0 !p-0"
             :show-close-button="false"
             @keydown="onListKeydown"
         >
@@ -437,17 +490,21 @@ function indexOf(result: PaletteResult): number {
             </DialogHeader>
 
             <div class="flex items-center border-b px-3">
-                <Search class="text-muted-foreground mr-2 size-4 shrink-0" />
+                <Search class="mr-2 size-4 shrink-0 text-muted-foreground" />
                 <input
                     ref="inputRef"
                     v-model="query"
                     type="text"
                     placeholder="Search subscriptions, jobs, pages…"
                     aria-label="Command palette search"
-                    class="placeholder:text-muted-foreground h-11 w-full bg-transparent text-sm outline-none"
+                    class="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 />
-                <span v-if="loading" class="text-muted-foreground text-xs">…</span>
-                <kbd class="bg-muted text-muted-foreground ml-2 hidden rounded px-1.5 py-0.5 text-[10px] sm:inline">
+                <span v-if="loading" class="text-xs text-muted-foreground"
+                    >…</span
+                >
+                <kbd
+                    class="ml-2 hidden rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground sm:inline"
+                >
                     Esc
                 </kbd>
             </div>
@@ -455,14 +512,20 @@ function indexOf(result: PaletteResult): number {
             <div class="max-h-[60vh] overflow-y-auto p-1">
                 <div
                     v-if="flatResults.length === 0"
-                    class="text-muted-foreground p-4 text-center text-sm"
+                    class="p-4 text-center text-sm text-muted-foreground"
                 >
-                    <template v-if="query">No results for "{{ query }}".</template>
-                    <template v-else>Type to search, or pick a recent item.</template>
+                    <template v-if="query"
+                        >No results for "{{ query }}".</template
+                    >
+                    <template v-else
+                        >Type to search, or pick a recent item.</template
+                    >
                 </div>
 
                 <template v-for="group in groupedResults" :key="group.kind">
-                    <div class="text-muted-foreground px-2 pt-2 pb-1 text-[10px] font-medium uppercase">
+                    <div
+                        class="px-2 pt-2 pb-1 text-[10px] font-medium text-muted-foreground uppercase"
+                    >
                         {{ group.title }}
                     </div>
                     <ul class="space-y-0.5">
@@ -470,17 +533,22 @@ function indexOf(result: PaletteResult): number {
                             v-for="item in group.items"
                             :key="`${item.kind}-${item.id}`"
                             :data-active="indexOf(item) === activeIndex"
-                            class="hover:bg-muted data-[active=true]:bg-muted flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm"
+                            class="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-muted data-[active=true]:bg-muted"
                             role="option"
                             :aria-selected="indexOf(item) === activeIndex"
                             @click="activate(item)"
                             @mouseenter="activeIndex = indexOf(item)"
                         >
-                            <component :is="iconFor(item.kind)" class="text-muted-foreground size-4 shrink-0" />
-                            <span class="flex-1 truncate">{{ item.label }}</span>
+                            <component
+                                :is="iconFor(item.kind)"
+                                class="size-4 shrink-0 text-muted-foreground"
+                            />
+                            <span class="flex-1 truncate">{{
+                                item.label
+                            }}</span>
                             <span
                                 v-if="item.sublabel"
-                                class="text-muted-foreground truncate text-xs"
+                                class="truncate text-xs text-muted-foreground"
                             >
                                 {{ item.sublabel }}
                             </span>
@@ -489,13 +557,13 @@ function indexOf(result: PaletteResult): number {
                 </template>
             </div>
 
-            <div class="text-muted-foreground border-t px-3 py-2 text-[10px]">
-                <kbd class="bg-muted rounded px-1 py-0.5">↑</kbd>
-                <kbd class="bg-muted ml-1 rounded px-1 py-0.5">↓</kbd>
+            <div class="border-t px-3 py-2 text-[10px] text-muted-foreground">
+                <kbd class="rounded bg-muted px-1 py-0.5">↑</kbd>
+                <kbd class="ml-1 rounded bg-muted px-1 py-0.5">↓</kbd>
                 navigate
-                <kbd class="bg-muted ml-2 rounded px-1 py-0.5">↵</kbd>
+                <kbd class="ml-2 rounded bg-muted px-1 py-0.5">↵</kbd>
                 open
-                <span class="text-muted-foreground/60 ml-2">
+                <span class="ml-2 text-muted-foreground/60">
                     ⌘K to toggle
                 </span>
             </div>

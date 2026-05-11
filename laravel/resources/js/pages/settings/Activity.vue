@@ -66,7 +66,9 @@ const props = defineProps<{
 }>();
 
 defineOptions({
-    layout: { breadcrumbs: [{ title: 'Activity', href: '/settings/activity' }] },
+    layout: {
+        breadcrumbs: [{ title: 'Activity', href: '/settings/activity' }],
+    },
 });
 
 // ─── Filter state ────────────────────────────────────────────────────────────
@@ -154,17 +156,21 @@ function clearFilters(): void {
     fromValue.value = '';
     toValue.value = '';
     selectedActions.value = new Set();
-    router.get('/settings/activity', {}, { preserveState: true, preserveScroll: true });
+    router.get(
+        '/settings/activity',
+        {},
+        { preserveState: true, preserveScroll: true },
+    );
 }
 
 const anyFiltersActive = computed(
     () =>
-        userValue.value !== ANY_USER
-        || subjectTypeValue.value !== ANY_TYPE
-        || subjectIdValue.value !== ''
-        || fromValue.value !== ''
-        || toValue.value !== ''
-        || selectedActions.value.size > 0,
+        userValue.value !== ANY_USER ||
+        subjectTypeValue.value !== ANY_TYPE ||
+        subjectIdValue.value !== '' ||
+        fromValue.value !== '' ||
+        toValue.value !== '' ||
+        selectedActions.value.size > 0,
 );
 
 // When the subject type changes back to "any", reset the id so the
@@ -215,7 +221,9 @@ function actionLabel(action: string): string {
     return action.replace(/\./g, ' · ');
 }
 
-function actionBadgeVariant(action: string): 'default' | 'secondary' | 'destructive' | 'outline' {
+function actionBadgeVariant(
+    action: string,
+): 'default' | 'secondary' | 'destructive' | 'outline' {
     if (action.endsWith('.deleted') || action === 'scrape.denied') {
         return 'destructive';
     }
@@ -265,42 +273,62 @@ function payloadSummary(row: AuditRow): string {
             param at once.
         -->
         <section
-            class="border-border bg-card flex flex-col gap-3 rounded-md border p-3"
+            class="flex flex-col gap-3 rounded-md border border-border bg-card p-3"
             aria-label="Filters"
             data-testid="audit-filters"
         >
             <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <div class="space-y-1">
-                    <Label class="text-muted-foreground text-xs uppercase">User</Label>
+                    <Label class="text-xs text-muted-foreground uppercase"
+                        >User</Label
+                    >
                     <Select v-model="userValue">
                         <SelectTrigger class="h-9 w-full">
                             <SelectValue placeholder="Any user" />
                         </SelectTrigger>
                         <SelectContent>
                             <SelectItem :value="ANY_USER">Any user</SelectItem>
-                            <SelectItem v-for="u in facets.users" :key="u.id" :value="String(u.id)">
+                            <SelectItem
+                                v-for="u in facets.users"
+                                :key="u.id"
+                                :value="String(u.id)"
+                            >
                                 {{ u.name }}
-                                <span class="text-muted-foreground ml-1 text-xs">{{ u.email }}</span>
+                                <span
+                                    class="ml-1 text-xs text-muted-foreground"
+                                    >{{ u.email }}</span
+                                >
                             </SelectItem>
                         </SelectContent>
                     </Select>
                 </div>
 
                 <div class="space-y-1">
-                    <Label class="text-muted-foreground text-xs uppercase">Subject type</Label>
+                    <Label class="text-xs text-muted-foreground uppercase"
+                        >Subject type</Label
+                    >
                     <Select v-model="subjectTypeValue">
                         <SelectTrigger class="h-9 w-full">
                             <SelectValue placeholder="Any subject" />
                         </SelectTrigger>
                         <SelectContent>
-                            <SelectItem :value="ANY_TYPE">Any subject</SelectItem>
-                            <SelectItem v-for="t in facets.subject_types" :key="t" :value="t">{{ t }}</SelectItem>
+                            <SelectItem :value="ANY_TYPE"
+                                >Any subject</SelectItem
+                            >
+                            <SelectItem
+                                v-for="t in facets.subject_types"
+                                :key="t"
+                                :value="t"
+                                >{{ t }}</SelectItem
+                            >
                         </SelectContent>
                     </Select>
                 </div>
 
                 <div class="space-y-1">
-                    <Label class="text-muted-foreground text-xs uppercase">Subject ID</Label>
+                    <Label class="text-xs text-muted-foreground uppercase"
+                        >Subject ID</Label
+                    >
                     <Input
                         v-model="subjectIdValue"
                         placeholder="e.g. 12345"
@@ -310,18 +338,24 @@ function payloadSummary(row: AuditRow): string {
 
                 <div class="grid grid-cols-2 gap-2">
                     <div class="space-y-1">
-                        <Label class="text-muted-foreground text-xs uppercase">From</Label>
+                        <Label class="text-xs text-muted-foreground uppercase"
+                            >From</Label
+                        >
                         <Input v-model="fromValue" type="date" />
                     </div>
                     <div class="space-y-1">
-                        <Label class="text-muted-foreground text-xs uppercase">To</Label>
+                        <Label class="text-xs text-muted-foreground uppercase"
+                            >To</Label
+                        >
                         <Input v-model="toValue" type="date" />
                     </div>
                 </div>
             </div>
 
             <div class="space-y-1">
-                <Label class="text-muted-foreground text-xs uppercase">Actions</Label>
+                <Label class="text-xs text-muted-foreground uppercase"
+                    >Actions</Label
+                >
                 <div class="flex flex-wrap gap-1.5">
                     <button
                         v-for="action in facets.actions"
@@ -330,8 +364,8 @@ function payloadSummary(row: AuditRow): string {
                         class="cursor-pointer rounded-full border px-2 py-0.5 text-xs transition-colors"
                         :class="
                             selectedActions.has(action)
-                                ? 'bg-primary text-primary-foreground border-primary'
-                                : 'bg-background text-muted-foreground border-border hover:text-foreground'
+                                ? 'border-primary bg-primary text-primary-foreground'
+                                : 'border-border bg-background text-muted-foreground hover:text-foreground'
                         "
                         @click="toggleAction(action)"
                     >
@@ -361,14 +395,24 @@ function payloadSummary(row: AuditRow): string {
             too narrow" (rare, but happens) — same idiom the Manage
             page uses for its empty filter state.
         -->
-        <section v-if="logs.data.length === 0" class="text-muted-foreground rounded-md border p-6 text-sm">
+        <section
+            v-if="logs.data.length === 0"
+            class="rounded-md border p-6 text-sm text-muted-foreground"
+        >
             <template v-if="anyFiltersActive">
                 No activity matches the current filters.
-                <button class="underline underline-offset-2" @click="clearFilters">Clear them</button>
+                <button
+                    class="underline underline-offset-2"
+                    @click="clearFilters"
+                >
+                    Clear them
+                </button>
                 to see everything.
             </template>
             <template v-else>
-                No activity recorded yet. Take an action somewhere — adding a subscription, toggling auto-scrape, etc. — and it'll show up here.
+                No activity recorded yet. Take an action somewhere — adding a
+                subscription, toggling auto-scrape, etc. — and it'll show up
+                here.
             </template>
         </section>
 
@@ -376,34 +420,59 @@ function payloadSummary(row: AuditRow): string {
             <div
                 v-for="row in logs.data"
                 :key="row.id"
-                class="border-border bg-card rounded-md border p-3 text-sm"
+                class="rounded-md border border-border bg-card p-3 text-sm"
             >
                 <div class="flex flex-wrap items-start justify-between gap-2">
                     <div class="flex flex-col">
                         <div class="flex flex-wrap items-center gap-2">
-                            <Badge :variant="actionBadgeVariant(row.action)">{{ actionLabel(row.action) }}</Badge>
-                            <span v-if="row.user" class="text-foreground font-medium">{{ row.user.name }}</span>
-                            <span v-else class="text-muted-foreground italic">system</span>
-                            <span v-if="row.subject_label" class="text-muted-foreground">
-                                on <span class="text-foreground">{{ row.subject_label }}</span>
+                            <Badge :variant="actionBadgeVariant(row.action)">{{
+                                actionLabel(row.action)
+                            }}</Badge>
+                            <span
+                                v-if="row.user"
+                                class="font-medium text-foreground"
+                                >{{ row.user.name }}</span
+                            >
+                            <span v-else class="text-muted-foreground italic"
+                                >system</span
+                            >
+                            <span
+                                v-if="row.subject_label"
+                                class="text-muted-foreground"
+                            >
+                                on
+                                <span class="text-foreground">{{
+                                    row.subject_label
+                                }}</span>
                             </span>
-                            <span v-else-if="row.subject_id" class="text-muted-foreground">
-                                on <code class="font-mono text-xs">{{ row.subject_id }}</code>
+                            <span
+                                v-else-if="row.subject_id"
+                                class="text-muted-foreground"
+                            >
+                                on
+                                <code class="font-mono text-xs">{{
+                                    row.subject_id
+                                }}</code>
                             </span>
                         </div>
-                        <div class="text-muted-foreground mt-1 text-xs">
+                        <div class="mt-1 text-xs text-muted-foreground">
                             {{ formatTimestamp(row.created_at) }}
-                            <span v-if="row.ip_address"> · {{ row.ip_address }}</span>
+                            <span v-if="row.ip_address">
+                                · {{ row.ip_address }}</span
+                            >
                         </div>
                     </div>
                 </div>
                 <details v-if="row.payload" class="mt-2">
-                    <summary class="text-muted-foreground cursor-pointer text-xs hover:underline">
+                    <summary
+                        class="cursor-pointer text-xs text-muted-foreground hover:underline"
+                    >
                         Payload
                     </summary>
                     <pre
-                        class="bg-muted text-muted-foreground mt-1 overflow-x-auto rounded-md p-2 text-[11px]"
-                    >{{ payloadSummary(row) }}</pre>
+                        class="mt-1 overflow-x-auto rounded-md bg-muted p-2 text-[11px] text-muted-foreground"
+                        >{{ payloadSummary(row) }}</pre
+                    >
                 </details>
             </div>
         </section>
@@ -415,9 +484,12 @@ function payloadSummary(row: AuditRow): string {
             driven by the paginator meta so the buttons can't push
             users off the ends of the data.
         -->
-        <footer class="text-muted-foreground flex items-center justify-between text-xs">
+        <footer
+            class="flex items-center justify-between text-xs text-muted-foreground"
+        >
             <span v-if="logs.meta.total > 0">
-                Showing {{ logs.meta.from ?? 0 }}–{{ logs.meta.to ?? 0 }} of {{ logs.meta.total }}
+                Showing {{ logs.meta.from ?? 0 }}–{{ logs.meta.to ?? 0 }} of
+                {{ logs.meta.total }}
             </span>
             <span v-else>0 rows</span>
 
@@ -430,8 +502,9 @@ function payloadSummary(row: AuditRow): string {
                 >
                     <ChevronLeft class="size-4" /> Prev
                 </Button>
-                <span class="text-muted-foreground text-xs">
-                    Page {{ logs.meta.current_page }} / {{ logs.meta.last_page }}
+                <span class="text-xs text-muted-foreground">
+                    Page {{ logs.meta.current_page }} /
+                    {{ logs.meta.last_page }}
                 </span>
                 <Button
                     variant="ghost"
