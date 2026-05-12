@@ -36,7 +36,20 @@ class AuditSubscriptionObserver
 
     public function updated(Subscription $sub): void
     {
-        $dirty = $sub->getDirty();
+        // `updated_at` / `created_at` are noise for the audit trail —
+        // they always flip on every update, and on Postgres their
+        // `timestamp(0)` storage precision means whether they appear
+        // in `getDirty()` depends on whether the request happens to
+        // cross a second boundary, which makes any branch keyed off
+        // `array_keys($dirty)` non-deterministic between local sqlite
+        // (sub-second test runs) and CI pgsql (slower machine, often
+        // crosses a second). Strip them up front so the action
+        // classification and the payload both work off the
+        // application-meaningful columns only.
+        $dirty = array_diff_key(
+            $sub->getDirty(),
+            array_flip([$sub->getCreatedAtColumn(), $sub->getUpdatedAtColumn()]),
+        );
         if (! $dirty) {
             return;
         }
