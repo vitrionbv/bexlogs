@@ -31,9 +31,9 @@ const { isCurrentUrl } = useCurrentUrl();
                     :is-active="isCurrentUrl(item.href)"
                     :tooltip="item.title"
                 >
-                    <Link :href="item.href">
+                    <Link :href="item.href" class="min-w-0">
                         <component :is="item.icon" />
-                        <span>{{ item.title }}</span>
+                        <span class="min-w-0 flex-1 truncate">{{ item.title }}</span>
                     </Link>
                 </SidebarMenuButton>
             </SidebarMenuItem>
