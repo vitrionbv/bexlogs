@@ -20,6 +20,7 @@
         "laravel/wayfinder": "^0.1.14",
         "league/flysystem-aws-s3-v3": "^3.25",
         "openspout/openspout": "^5.7",
+        "phpdocumentor/type-resolver": "^2.0",
         "predis/predis": "^3.4"
     },
     "require-dev": {
