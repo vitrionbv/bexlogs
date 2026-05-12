@@ -144,10 +144,19 @@ class BexApplyRetentionTest extends TestCase
      * on SQLite for tests but the unique index still requires
      * uniqueness when set), so we hash the action string to keep
      * each row distinct.
+     *
+     * Hex digest (default sha256 output) — not raw bytes. Production
+     * stores 32 raw bytes in the bytea column via a typed bytea literal
+     * (see WorkerController::ingest), but DB::table()->insert() here
+     * goes through PDO's default string bind, which Postgres rejects
+     * as invalid UTF-8 for non-ASCII bytes. 64 ASCII hex chars round-
+     * trip cleanly through PDO on both pgsql and sqlite, and the
+     * (page_id, content_hash) unique index doesn't care about the
+     * exact encoding as long as the value is deterministic per row.
      */
     private function seedLog(string $timestamp, string $action): int
     {
-        $hash = hash('sha256', $timestamp.'|'.$action, binary: true);
+        $hash = hash('sha256', $timestamp.'|'.$action);
 
         return (int) DB::table('log_messages')->insertGetId([
             'page_id' => $this->page->id,

@@ -125,6 +125,7 @@ class AlertOnLogBatchListenerTest extends TestCase
             'action' => 'BookingsController#create',
             'method' => 'POST',
             'status' => '201',
+            'content_hash' => bin2hex(random_bytes(32)),
         ]);
 
         $event = new LogBatchInserted(
@@ -172,6 +173,7 @@ class AlertOnLogBatchListenerTest extends TestCase
             'action' => 'BookingsController#create',
             'method' => 'POST',
             'status' => '500',
+            'content_hash' => bin2hex(random_bytes(32)),
         ]);
 
         $event = new LogBatchInserted(
