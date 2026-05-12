@@ -68,14 +68,20 @@ jobs:
           cache: 'npm'
           cache-dependency-path: laravel/package-lock.json
 
+      # `.env` must exist before `composer install`: the post-autoload-dump
+      # hook runs `php artisan package:discover`, which now triggers Eloquent
+      # schema introspection because the User model uses PHP 8 attributes
+      # (#[Fillable], #[Hidden]). Without `.env`, Laravel falls back to its
+      # default DB_CONNECTION=sqlite and a missing database/database.sqlite
+      # makes the bootstrap fail.
+      - name: Copy environment
+        run: cp .env.example .env
+
       - name: Install Composer dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader
 
       - name: Install Node dependencies
         run: npm ci --no-audit --no-fund
-
-      - name: Copy environment
-        run: cp .env.example .env
 
       - name: Generate APP_KEY
         run: php artisan key:generate
