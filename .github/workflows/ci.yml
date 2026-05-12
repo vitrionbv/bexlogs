@@ -21,6 +21,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # DB + Redis env is hoisted to the job level so the post-autoload-dump
+    # hook (`php artisan package:discover --ansi`) inside `composer install`
+    # connects to the postgres service instead of falling back to the
+    # `.env.example` defaults, which point at the dev-only `root/laravel`
+    # superuser with no password and trip
+    # `SQLSTATE[08006] fe_sendauth: no password supplied`.
+    env:
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: bexlogs
+      DB_USERNAME: bexlogs
+      DB_PASSWORD: bexlogs
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+
     services:
       postgres:
         image: postgres:18-alpine
@@ -87,28 +103,12 @@ jobs:
         run: php artisan key:generate
 
       - name: Migrate
-        env:
-          DB_CONNECTION: pgsql
-          DB_HOST: 127.0.0.1
-          DB_PORT: 5432
-          DB_DATABASE: bexlogs
-          DB_USERNAME: bexlogs
-          DB_PASSWORD: bexlogs
         run: php artisan migrate --force
 
       - name: Build frontend
         run: npm run build
 
       - name: Run composer test
-        env:
-          DB_CONNECTION: pgsql
-          DB_HOST: 127.0.0.1
-          DB_PORT: 5432
-          DB_DATABASE: bexlogs
-          DB_USERNAME: bexlogs
-          DB_PASSWORD: bexlogs
-          REDIS_HOST: 127.0.0.1
-          REDIS_PORT: 6379
         run: composer test
 
   scraper:
