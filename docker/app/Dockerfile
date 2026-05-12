@@ -110,7 +110,8 @@ RUN printf '%s\n' \
         "VITE_APP_NAME=${VITE_APP_NAME}" \
     > .env \
     && php artisan wayfinder:generate --with-form \
-    && php artisan vendor:publish --tag=laravel-assets --force \
+    && php artisan vendor:publish --tag=api-platform-assets --force \
+    && test -d public/vendor/api-platform \
     && npm run build
 
 
@@ -146,10 +147,12 @@ COPY --from=vendor /app/vendor ./vendor
 COPY --from=frontend /app/public/build ./public/build
 # api-platform/laravel publishes its Swagger UI / Redoc / Scalar /
 # GraphiQL static assets to public/vendor/api-platform via
-# `vendor:publish --tag=laravel-assets`. Those assets are required
-# by /api/docs and are NOT regenerated at runtime, so carry them
-# from the frontend stage (which ran the publish step) into the
-# final image alongside the Vite build output.
+# `vendor:publish --tag=api-platform-assets` (the package's own tag —
+# `laravel-assets` is a different, mostly-empty tag that silently
+# no-ops). Those assets are required by /api/docs and are NOT
+# regenerated at runtime, so carry them from the frontend stage
+# (which ran the publish step) into the final image alongside the
+# Vite build output.
 COPY --from=frontend /app/public/vendor ./public/vendor
 
 RUN composer dump-autoload --optimize --classmap-authoritative --no-dev
