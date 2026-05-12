@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Admin\ActivityController;
 use App\Http\Controllers\Admin\UserController;
+use App\Http\Controllers\Ai\ChatController;
 use App\Http\Controllers\AlertsController;
 use App\Http\Controllers\Api\SearchController;
 use App\Http\Controllers\AuthenticateController;
@@ -94,6 +95,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('logs/live/since/{page}', [LiveLogsController::class, 'since'])
         ->name('logs.live.since');
     Route::get('logs/{page}', [PageController::class, 'show'])->name('logs.show');
+
     // The destroy-all-entries endpoint is `messages` (not `logs`) so the URL
     // doesn't read as `/logs/{id}/logs`, which is confusing.
     Route::delete('logs/{page}/messages', [PageController::class, 'destroyLogs'])->name('logs.messages.destroy');
@@ -107,6 +109,25 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::redirect('pages/{page}/logs', 'logs/{page}/messages', 301);
     Route::redirect('pages/{page}/export', 'logs/{page}/export', 301);
     Route::redirect('pages/{page}/import', 'logs/{page}/import', 301);
+
+    // Per-subscription "ask your logs" chat agent. Mounted under
+    // /logs/subscriptions/{subscription} so the route-model binding
+    // hits the same authorisation walk PageController uses; the
+    // streaming endpoint is throttled to 30 req/min/user so a single
+    // tab can't outrun the daily token cap on its own.
+    Route::prefix('logs/subscriptions/{subscription}/chat')
+        ->name('logs.chat.')
+        ->group(function () {
+            Route::get('/', [ChatController::class, 'index'])->name('index');
+            Route::post('/', [ChatController::class, 'start'])->name('start');
+            Route::get('/{conversation}', [ChatController::class, 'show'])
+                ->name('show');
+            Route::post('/{conversation}/stream', [ChatController::class, 'stream'])
+                ->middleware('throttle:30,1')
+                ->name('stream');
+            Route::delete('/{conversation}', [ChatController::class, 'destroy'])
+                ->name('destroy');
+        });
 
     // Per-subscription insights surface (health score, time-series
     // charts, recent jobs, embedded compact live tail). Linked from

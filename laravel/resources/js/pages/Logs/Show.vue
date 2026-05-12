@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { Head, Link, router } from '@inertiajs/vue3';
+import { Head, Link, router, usePage } from '@inertiajs/vue3';
 import {
     ChevronLeft,
     Download,
     Eye,
     Filter,
+    MessageSquareText,
     RefreshCw,
     Search,
     Trash2,
@@ -13,6 +14,7 @@ import {
 } from 'lucide-vue-next';
 import { computed, defineComponent, h, onMounted, ref, watch } from 'vue';
 import { toast } from 'vue-sonner';
+import AiChatPanel from '@/components/AiChatPanel.vue';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -327,6 +329,23 @@ function triggerImport(): void {
     fileInput.value?.click();
 }
 
+// "Ask your logs" chat panel — opened from a header button, scoped to
+// this page's subscription. Hidden entirely if Inertia's shared
+// `ai.enabled` flag is false (OPENROUTER_API_KEY missing).
+const inertiaPage = usePage();
+const agentEnabled = computed<boolean>(() => {
+    const flag = (inertiaPage.props as { ai?: { enabled?: boolean } }).ai
+        ?.enabled;
+
+    return flag === true;
+});
+const chatOpen = ref(false);
+const chatSubscription = computed(() => ({
+    id: props.page.subscription.id,
+    name: props.page.subscription.name,
+    environment: null,
+}));
+
 function handleImport(event: Event): void {
     const file = (event.target as HTMLInputElement).files?.[0];
 
@@ -482,6 +501,14 @@ const DetailSection = defineComponent({
                     @click="showLatest"
                 >
                     Show {{ newSinceMount }} new entr{{ newSinceMount === 1 ? 'y' : 'ies' }}
+                </Button>
+                <Button
+                    v-if="agentEnabled"
+                    variant="outline"
+                    size="sm"
+                    @click="chatOpen = true"
+                >
+                    <MessageSquareText class="size-4" /> Ask your logs
                 </Button>
                 <Button variant="outline" size="sm" @click="refresh">
                     <RefreshCw class="size-4" /> Refresh
@@ -687,6 +714,18 @@ const DetailSection = defineComponent({
                 </div>
             </DialogContent>
         </Dialog>
+
+        <!-- "Ask your logs" slide-over. The component is responsible for
+             its own conversation lifecycle (it POSTs /chat to start one
+             on first open, then streams). We only pass the subscription
+             scope + the agent-enabled flag. -->
+        <AiChatPanel
+            v-if="agentEnabled"
+            :open="chatOpen"
+            :subscription="chatSubscription"
+            :agent-enabled="agentEnabled"
+            @update:open="(v) => (chatOpen = v)"
+        />
     </div>
 </template>
 
