@@ -155,7 +155,36 @@ COPY --from=frontend /app/public/build ./public/build
 # Vite build output.
 COPY --from=frontend /app/public/vendor ./public/vendor
 
-RUN composer dump-autoload --optimize --classmap-authoritative --no-dev
+# `composer dump-autoload` fires `post-autoload-dump`, which runs
+# `php artisan package:discover --ansi`. That boots the framework
+# and triggers `ApiPlatformProvider::boot()`, which `loadRoutesFrom`s
+# the package's routes file. That file *eagerly* iterates every
+# `#[ApiResource]` model and calls `ModelMetadata::getAttributes()`,
+# which hits the database to introspect the table's columns.
+# Without a `.env` here Laravel falls back to sqlite at
+# `/app/database/database.sqlite` (the default in `config/database.php`),
+# that file doesn't exist, and the build dies with
+# `Database file at path [...] does not exist`.
+# Write the same neutral-driver stub the frontend stage uses, dump
+# the autoload + cached packages.php against it, and rm the stub so
+# the runtime image isn't carrying a build-time `.env` — the entrypoint
+# rebuilds artisan caches against the real runtime env on first boot
+# (see docker/app/entrypoint.sh).
+RUN printf '%s\n' \
+        "APP_ENV=production" \
+        "APP_KEY=base64:$(head -c 32 /dev/urandom | base64)" \
+        "APP_DEBUG=false" \
+        "LOG_CHANNEL=stderr" \
+        "DB_CONNECTION=sqlite" \
+        "DB_DATABASE=:memory:" \
+        "CACHE_STORE=array" \
+        "SESSION_DRIVER=array" \
+        "QUEUE_CONNECTION=sync" \
+        "BROADCAST_CONNECTION=log" \
+        "MAIL_MAILER=array" \
+    > .env \
+    && composer dump-autoload --optimize --classmap-authoritative --no-dev \
+    && rm .env
 
 
 # ─── Stage 4: Runtime ────────────────────────────────────────────────────────
