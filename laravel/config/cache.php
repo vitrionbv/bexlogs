@@ -119,12 +119,30 @@ return [
     | Serializable Classes
     |--------------------------------------------------------------------------
     |
-    | This value determines the classes that can be unserialized from cache
-    | storage. By default, no PHP classes will be unserialized from your
-    | cache to prevent gadget chain attacks if your APP_KEY is leaked.
+    | Passed through to PHP's `unserialize()` as `allowed_classes`:
+    |   - `false` blocks ALL classes (the Laravel 13 hardening default),
+    |   - `true` / `null` allows everything,
+    |   - an array allows only the listed classes.
+    |
+    | We allow everything because `api-platform/laravel` caches a deep
+    | metadata graph (`ResourceMetadataCollection`, `ApiResource`,
+    | `ApiProperty`, `PropertyNameCollection` + every Eloquent model that
+    | participates in the graph) via `Cache::rememberForever`, and re-reads
+    | those entries recursively within a single request when resolving
+    | nested resource relations. With `false`, the recursive re-read comes
+    | back as `__PHP_Incomplete_Class` and the typed factory return blows
+    | up the boot — which used to take down the Docker frontend stage in
+    | CI/deploy as soon as the `vendor:publish` / `wayfinder:generate`
+    | steps booted Laravel.
+    |
+    | The gadget-chain threat the hardening guards against requires both
+    | a leaked APP_KEY AND attacker write access to the cache backend; on
+    | this app the cache backend is the local file store owned by the app
+    | user, so the practical risk is much lower than the cost of having
+    | api-platform unusable.
     |
     */
 
-    'serializable_classes' => false,
+    'serializable_classes' => true,
 
 ];
