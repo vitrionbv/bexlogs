@@ -147,6 +147,45 @@ jobs:
       APP_DIR: /opt/bexlogs
       COMPOSE: docker compose -f /opt/bexlogs/docker-compose.production.yml --env-file /opt/bexlogs/laravel/.env
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  Why the `scraper` service is treated differently from app/queue/
+    #  scheduler/reverb in the steps below:
+    #
+    #  The Laravel containers (app, queue, scheduler, reverb) all run
+    #  short request- or worker-bounded units of work — HTTP responses,
+    #  redis-queue jobs that finish in seconds, schedule ticks. SIGKILL'ing
+    #  one of them mid-deploy loses at most one in-flight HTTP request
+    #  (caller retries) or one queued job (Laravel re-dispatches on the
+    #  next worker tick). Recreating these on every deploy is fine and
+    #  picks up image/env/config changes deterministically.
+    #
+    #  The scraper container is the opposite: it owns long-running
+    #  Playwright/Chromium scrape jobs that take up to ~75 minutes each
+    #  (full backfill of a property's BookingExperts log). Recycling the
+    #  container mid-job kills the browser, drops every page that was
+    #  paginated/parsed-but-not-yet-batched, and the work is *not*
+    #  resumable — the next job picks up from the start of the cursor,
+    #  not from the partial state we just discarded. Backfill job 38640
+    #  was lost this way to the deploy of 5e70d7b (a queue/scheduler
+    #  healthcheck-only commit that had no business touching scraper).
+    #
+    #  Mechanism of the previous bug: this job used to run
+    #  `$COMPOSE build app scraper` unconditionally, then
+    #  `$COMPOSE up -d`. Even when the scraper source was byte-identical,
+    #  the rebuild produced fresh `COPY src ./src` and `npm install`
+    #  layers (BuildKit cache bust we don't fully control), which gave
+    #  `bexlogs/scraper:latest` a new image SHA, which in turn made
+    #  `compose up -d` recreate the scraper container.
+    #
+    #  Fix: gate the scraper build on two precise signals — whether
+    #  `scraper/**` paths changed (build context) and whether the
+    #  resolved scraper service config hash changed (YAML block + env
+    #  interpolation, exactly what compose itself uses to decide on
+    #  recreation). When neither tripped, we skip the build — the
+    #  local image SHA stays stable, and `compose up -d` is a no-op
+    #  for the scraper service. The running scrape job survives.
+    # ─────────────────────────────────────────────────────────────────────
+
     steps:
       # We deliberately don't use actions/checkout — the runner already has
       # the repo at /opt/bexlogs and that's the working tree we deploy from.
@@ -160,20 +199,128 @@ jobs:
           echo "Target ref: $TARGET"
 
       - name: Pull source
+        id: pull
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
+          # Capture the working-tree HEAD and the *resolved* scraper
+          # service config hash BEFORE fetching/pulling. We use
+          # `compose config --hash scraper` because it's exactly the
+          # signal compose itself uses to decide whether a service's
+          # container needs recreating: it covers the YAML block plus
+          # all interpolated env vars but ignores edits to *other*
+          # service blocks. This is more accurate than path-only diffs
+          # for compose YAML changes (e.g. a queue:-only healthcheck
+          # edit must NOT trigger a scraper rebuild). Capturing
+          # github.event.before is unreliable on workflow_dispatch;
+          # capturing it from the working tree always works.
+          BEFORE_SHA="$(git rev-parse HEAD)"
+          # `|| true` guards against pipefail when compose config fails
+          # (e.g. a transiently broken pre-pull YAML or missing env file).
+          # An empty hash falls through to the rebuild=true branch later.
+          BEFORE_SCRAPER_HASH="$( ($COMPOSE config --hash scraper 2>/dev/null || true) | awk '{print $2}')"
           git fetch --all --prune
           git checkout "${{ steps.ref.outputs.target }}"
           git pull --ff-only origin "${{ steps.ref.outputs.target }}"
-          echo "HEAD now at $(git rev-parse --short HEAD)"
+          AFTER_SHA="$(git rev-parse HEAD)"
+          echo "before_sha=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+          echo "after_sha=$AFTER_SHA"   >> "$GITHUB_OUTPUT"
+          echo "before_scraper_hash=$BEFORE_SCRAPER_HASH" >> "$GITHUB_OUTPUT"
+          echo "HEAD now at ${AFTER_SHA:0:7} (was ${BEFORE_SHA:0:7})"
+          echo "Scraper config hash pre-pull: ${BEFORE_SCRAPER_HASH:-<unavailable>}"
 
-      - name: Build images
+      # Decide whether the scraper image needs a rebuild on this deploy.
+      # See the long comment at the top of this job for the rationale.
+      #
+      # Triggers a rebuild when ANY of:
+      #   - any path under `scraper/**` changed (source, Dockerfile,
+      #     package.json, lockfile, …) — the build context's actual
+      #     content drives the image SHA, so we MUST rebuild
+      #   - the resolved scraper service config hash changed — covers
+      #     edits to the `scraper:` block in `docker-compose.production.yml`
+      #     AND changes to any env var the scraper interpolates (e.g.
+      #     `MAX_CONCURRENT_SCRAPES` in laravel/.env). A pure queue:-block
+      #     YAML edit does NOT flip this hash — verified empirically.
+      #   - the scraper image isn't built locally yet (cold start /
+      #     someone manually pruned the cache)
+      #   - we couldn't compute BEFORE_SCRAPER_HASH (compose config
+      #     failed pre-pull, e.g. broken YAML or missing env file) —
+      #     fall through to rebuild rather than risk a stale image
+      #   - it's a workflow_dispatch (manual re-run, operator intent)
+      - name: Detect scraper-relevant changes
+        id: scraper_changes
         working-directory: ${{ env.APP_DIR }}
-        run: $COMPOSE build app scraper
+        run: |
+          set -euo pipefail
+          BEFORE_SHA="${{ steps.pull.outputs.before_sha }}"
+          AFTER_SHA="${{ steps.pull.outputs.after_sha }}"
+          BEFORE_SCRAPER_HASH="${{ steps.pull.outputs.before_scraper_hash }}"
+          AFTER_SCRAPER_HASH="$( ($COMPOSE config --hash scraper 2>/dev/null || true) | awk '{print $2}')"
+          echo "Scraper config hash post-pull: ${AFTER_SCRAPER_HASH:-<unavailable>}"
+
+          decide() {
+            echo "rebuild=$1" >> "$GITHUB_OUTPUT"
+            echo "Decision: rebuild scraper = $1 — $2"
+          }
+
+          if ! docker image inspect bexlogs/scraper:latest >/dev/null 2>&1; then
+            decide true "bexlogs/scraper:latest not present locally (cold start)"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            decide true "workflow_dispatch — assuming operator wants a fresh build"
+            exit 0
+          fi
+
+          if [ -z "$BEFORE_SCRAPER_HASH" ] || [ -z "$AFTER_SCRAPER_HASH" ]; then
+            decide true "couldn't compute scraper config hash (BEFORE='$BEFORE_SCRAPER_HASH', AFTER='$AFTER_SCRAPER_HASH') — rebuilding to be safe"
+            exit 0
+          fi
+
+          if [ "$BEFORE_SCRAPER_HASH" != "$AFTER_SCRAPER_HASH" ]; then
+            decide true "scraper config hash changed ($BEFORE_SCRAPER_HASH → $AFTER_SCRAPER_HASH)"
+            exit 0
+          fi
+
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+            decide false "no commits in $BEFORE_SHA..$AFTER_SHA and scraper config unchanged — skipping scraper rebuild"
+            exit 0
+          fi
+
+          if ! CHANGED=$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" 2>/dev/null); then
+            decide true "git diff $BEFORE_SHA..$AFTER_SHA failed (history unreachable)"
+            exit 0
+          fi
+
+          echo "Changed paths in $BEFORE_SHA..$AFTER_SHA:"
+          printf '  %s\n' $CHANGED
+
+          if printf '%s\n' "$CHANGED" | grep -qE '^scraper/'; then
+            decide true "scraper/** touched (build context changed)"
+          else
+            decide false "no scraper/** changes and scraper config hash unchanged — skipping scraper rebuild to preserve any in-flight scrape job"
+          fi
+
+      - name: Build app image
+        working-directory: ${{ env.APP_DIR }}
+        run: $COMPOSE build app
+
+      - name: Build scraper image
+        if: steps.scraper_changes.outputs.rebuild == 'true'
+        working-directory: ${{ env.APP_DIR }}
+        run: $COMPOSE build scraper
 
       - name: Bring stack up
         working-directory: ${{ env.APP_DIR }}
+        # `up -d --remove-orphans` is still a blanket up across every
+        # service, BUT compose only RECREATES a container when its image
+        # SHA or resolved config hash changed. When the scraper image was
+        # not rebuilt above and the YAML didn't touch the `scraper:` block,
+        # both are stable — compose reports the scraper as up-to-date and
+        # leaves the running container (and its in-flight scrape job)
+        # untouched. The other services pick up new app-image SHAs / YAML
+        # changes as before.
         run: $COMPOSE up -d --remove-orphans
 
       - name: Wait for app health
@@ -209,7 +356,12 @@ jobs:
           $COMPOSE exec -T app php artisan reverb:restart || true
           $COMPOSE restart reverb
 
-      - name: Restart workers
+      # Deliberately scoped to queue + scheduler. The `scraper` service is
+      # NOT restarted here — its container hosts long-running scrape jobs
+      # (see the deploy-job header comment). The Laravel queue/scheduler
+      # workers re-fetch their dispatched job state from redis, so a hard
+      # restart here is safe and necessary to pick up new code.
+      - name: Restart queue + scheduler workers
         working-directory: ${{ env.APP_DIR }}
         run: |
           $COMPOSE exec -T app php artisan queue:restart || true
