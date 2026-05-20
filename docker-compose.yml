@@ -35,6 +35,13 @@ services:
       dockerfile: Dockerfile
     container_name: bexlogs-scraper
     restart: unless-stopped
+    # See docker-compose.production.yml for the long comment.
+    # Short version: Node is not a real init, Chromium spawns ~30
+    # children per launch, and crashed children get re-parented to
+    # PID 1 (Node) which never reaps them — eventually we hit
+    # the container cgroup's `pids.max` and every browser.launch()
+    # returns `spawn … EAGAIN`. tini reaps on SIGCHLD.
+    init: true
     profiles: ["full"]
     depends_on:
       postgres:

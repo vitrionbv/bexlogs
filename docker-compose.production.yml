@@ -163,6 +163,20 @@ services:
       context: ./scraper
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Run Docker's tini as PID 1. The scraper's own Dockerfile starts
+    # `node dist/index.js` directly, and Node is not a real init — it
+    # does not reap orphaned children. Playwright launches Chromium,
+    # which itself spawns ~30 subprocesses (zygote, gpu, utility,
+    # crashpad_handler, …). Whenever a Chromium instance crashes
+    # mid-scrape its surviving children get re-parented to PID 1
+    # (Node), which never wait(2)s them. They accumulate as defunct
+    # entries against the container's cgroup `pids.max`; once we hit
+    # the cap every `browser.launch()` returns `spawn … EAGAIN` and
+    # all subsequent jobs fail. `init: true` tells Docker to inject
+    # tini ahead of our command, and tini reaps orphans every time
+    # it gets `SIGCHLD`. The other services (app/queue/reverb/
+    # scheduler) already get tini from the PHP image's entrypoint.
+    init: true
     depends_on:
       app:
         condition: service_healthy
