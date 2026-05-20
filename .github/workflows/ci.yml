@@ -138,7 +138,9 @@ jobs:
     needs: [laravel, scraper]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, linux, bexlogs]
-    timeout-minutes: 25
+    # pg_trgm CREATE INDEX CONCURRENTLY on ~1M log_messages rows can take
+    # 45–60 min (request/response ::text GIN indexes are ~1.5 GB each).
+    timeout-minutes: 90
     concurrency:
       group: deploy-prod
       cancel-in-progress: false
