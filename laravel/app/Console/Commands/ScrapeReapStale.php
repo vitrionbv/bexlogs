@@ -16,9 +16,10 @@ use Illuminate\Support\Facades\Log;
  * `HEARTBEAT_INTERVAL_MS` (default 30 s) for the entire lifetime of
  * an in-flight job — covering browser startup, slow page loads, and
  * quiet pagination windows where no batch flush would otherwise
- * refresh the column. The default 3-minute reaper threshold below
- * leaves ~6× slack so a single missed tick (transient network blip)
- * doesn't trigger a false reap.
+ * refresh the column. The default 10-minute reaper threshold below
+ * leaves ~20× slack (30 s tick rate) so a single missed tick, a slow
+ * token-echo page, or a brief app restart during deploy doesn't
+ * trigger a false reap on a live backfill.
  *
  * If you find yourself wanting to reduce heartbeat load, raise this
  * threshold rather than lower the scraper's tick rate — the reaper
@@ -38,7 +39,7 @@ use Illuminate\Support\Facades\Log;
 class ScrapeReapStale extends Command
 {
     protected $signature = 'scrape:reap-stale
-        {--minutes=3 : Consider a running job stale after this many minutes without a heartbeat.}';
+        {--minutes=10 : Consider a running job stale after this many minutes without a heartbeat.}';
 
     protected $description = 'Mark running scrape_jobs as failed when the worker has gone silent.';
 
