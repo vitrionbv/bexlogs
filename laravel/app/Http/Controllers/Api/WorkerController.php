@@ -14,7 +14,9 @@ use App\Support\LogMessageHasher;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\Response as SymfonyResponse;
 
 class WorkerController extends Controller
@@ -147,6 +149,16 @@ class WorkerController extends Controller
         $data = $request->validate([
             'messages' => 'required|array',
             'pages_processed' => 'nullable|integer|min:0',
+            // Min/max BookingExperts event-timestamp seen in this
+            // batch. Optional — workers may omit (e.g. empty
+            // batches, all-unparseable timestamps). Stored as a
+            // free-form ISO 8601 string and re-parsed via Carbon
+            // below so we tolerate millisecond / offset variants.
+            // Capped at 64 chars (longest ISO 8601 form is
+            // `YYYY-MM-DDTHH:MM:SS.SSSSSS+HH:MM` = 32 chars; 64
+            // gives breathing room without admitting log spam).
+            'batch_oldest_event_at' => 'nullable|string|max:64',
+            'batch_newest_event_at' => 'nullable|string|max:64',
             // Per-page token-echo attempt list. Each entry is the
             // *total* attempts the retry helper spent on a single
             // page (1 = no retry, >1 = N-1 echo retries). The worker
@@ -243,8 +255,10 @@ class WorkerController extends Controller
         $receivedInBatch = count($rows);
         $pagesProcessed = isset($data['pages_processed']) ? (int) $data['pages_processed'] : null;
         $echoAttemptsByPage = $data['echo_attempts_by_page'] ?? null;
+        $batchOldestEventAt = $data['batch_oldest_event_at'] ?? null;
+        $batchNewestEventAt = $data['batch_newest_event_at'] ?? null;
 
-        [$stored, $mergedStats] = DB::transaction(function () use ($job, $rows, $receivedInBatch, $pagesProcessed, $echoAttemptsByPage) {
+        [$stored, $mergedStats] = DB::transaction(function () use ($job, $rows, $receivedInBatch, $pagesProcessed, $echoAttemptsByPage, $batchOldestEventAt, $batchNewestEventAt) {
             $locked = ScrapeJob::query()->whereKey($job->id)->lockForUpdate()->firstOrFail();
 
             // Use the Query Builder's insertOrIgnore — NOT Eloquent's
@@ -316,6 +330,51 @@ class WorkerController extends Controller
                     ],
                     $echoAttemptsByPage,
                 ));
+            }
+
+            // Roll the per-batch min/max event timestamps up into
+            // job-lifetime `oldest_event_at` / `newest_event_at`.
+            // These track the oldest/newest BookingExperts event
+            // timestamps SEEN during this scrape job's lifetime —
+            // independent of the requested window in
+            // `params.start_time` / `params.end_time`. Useful for
+            // ops to verify a backfill actually reached the
+            // requested depth (e.g. requested 30d back, but
+            // oldest_event_at = 7d means the BE log only goes that
+            // far). Each side is rolled up independently so a
+            // batch carrying only one of the two still updates the
+            // corresponding aggregate.
+            if ($batchOldestEventAt !== null) {
+                try {
+                    $incoming = Carbon::parse($batchOldestEventAt);
+                    $existing = isset($prev['oldest_event_at'])
+                        ? Carbon::parse((string) $prev['oldest_event_at'])
+                        : null;
+                    $merged['oldest_event_at'] = ($existing && $existing->lt($incoming) ? $existing : $incoming)
+                        ->toIso8601String();
+                } catch (\Throwable $e) {
+                    Log::warning('worker.batch.oldest_event_at_parse_failed', [
+                        'job_id' => $job->id,
+                        'value' => $batchOldestEventAt,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+            if ($batchNewestEventAt !== null) {
+                try {
+                    $incoming = Carbon::parse($batchNewestEventAt);
+                    $existing = isset($prev['newest_event_at'])
+                        ? Carbon::parse((string) $prev['newest_event_at'])
+                        : null;
+                    $merged['newest_event_at'] = ($existing && $existing->gt($incoming) ? $existing : $incoming)
+                        ->toIso8601String();
+                } catch (\Throwable $e) {
+                    Log::warning('worker.batch.newest_event_at_parse_failed', [
+                        'job_id' => $job->id,
+                        'value' => $batchNewestEventAt,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             }
 
             $locked->update([

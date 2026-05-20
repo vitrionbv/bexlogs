@@ -121,6 +121,28 @@ type ScrapeJobStats = {
      * hint on the running job's row.
      */
     echo_attempts_by_page?: { page: number; attempts: number }[];
+    /**
+     * Oldest / newest BookingExperts event timestamps actually
+     * observed in any batch during this scrape job's lifetime —
+     * rolled up server-side from the per-batch
+     * `batch_oldest_event_at` / `batch_newest_event_at` values the
+     * worker sends on each /batch POST.
+     *
+     * Distinct from `params.start_time` / `params.end_time`, which
+     * is the *requested* window the scraper asked BE to fetch. The
+     * observed range can be narrower (BE's log doesn't go back as
+     * far as we asked) or strictly inside the requested window
+     * (typical case — we asked for 30d, the activity in that
+     * subscription only spans 12d). Both fields render side-by-side
+     * in the detail dialog so an operator can spot a backfill that
+     * didn't reach the requested depth.
+     *
+     * Stored as ISO 8601 strings (Carbon::toIso8601String) on the
+     * Laravel side; rendered via the same `fmt(...)` helper as the
+     * other timestamp fields.
+     */
+    oldest_event_at?: string;
+    newest_event_at?: string;
     stop_reason?: StopReason;
     [key: string]: unknown;
 };
@@ -584,6 +606,16 @@ function formatLogWindow(
         return null;
     }
 
+    return makeWindow(start, end);
+}
+
+// Same `{start, end, duration}` shape as `formatLogWindow`, but
+// keyed off arbitrary ISO 8601 strings (used for the
+// `stats.oldest_event_at` / `stats.newest_event_at` "Events seen"
+// line in the detail dialog — see template). Returns null on any
+// parse failure so the template hides the row entirely instead of
+// rendering "Invalid Date → Invalid Date (NaNm)".
+function makeWindow(start: string, end: string): { start: string; end: string; duration: string } | null {
     const startMs = Date.parse(start);
     const endMs = Date.parse(end);
 
@@ -714,6 +746,24 @@ const filterChips = computed(() =>
 );
 
 const focusedLogWindow = computed(() => formatLogWindow(focused.value?.params ?? null));
+
+// Observed event range (oldest → newest BookingExperts event timestamps
+// actually ingested by THIS run, rolled up server-side across batches).
+// Renders below `focusedLogWindow` so an operator can compare
+// requested-vs-observed at a glance — e.g. requested 30d back, observed
+// 7d back means BE's log doesn't go that deep on this subscription.
+// Hidden when either field is missing (legacy jobs, or jobs that
+// haven't shipped a non-empty /batch yet).
+const focusedEventsSeen = computed(() => {
+    const oldest = focused.value?.stats?.oldest_event_at;
+    const newest = focused.value?.stats?.newest_event_at;
+
+    if (typeof oldest !== 'string' || typeof newest !== 'string') {
+        return null;
+    }
+
+    return makeWindow(oldest, newest);
+});
 
 const Field = defineComponent({
     name: 'Field',
@@ -1054,17 +1104,33 @@ const Field = defineComponent({
                         <div
                             v-if="focusedLogWindow"
                             class="mb-2 space-y-1"
-                            title="Range of BookingExperts log events this run fetched — not the scrape runtime."
+                            title="Time range the scraper was asked to fetch."
                         >
                             <div class="text-xs">
-                                <span class="text-muted-foreground">Log window:</span>
+                                <span class="text-muted-foreground">Requested window:</span>
                                 <span class="font-mono ml-1">{{ focusedLogWindow.start }}</span>
                                 <span class="text-muted-foreground mx-1">→</span>
                                 <span class="font-mono">{{ focusedLogWindow.end }}</span>
                                 <span class="text-muted-foreground ml-1">({{ focusedLogWindow.duration }})</span>
                             </div>
                             <small class="text-muted-foreground block text-[11px]">
-                                Range of BookingExperts log events this run fetched — not the scrape runtime.
+                                Time range the scraper was asked to fetch.
+                            </small>
+                        </div>
+                        <div
+                            v-if="focusedEventsSeen"
+                            class="mb-2 space-y-1"
+                            title="Oldest and newest BookingExperts event timestamps actually ingested by this run."
+                        >
+                            <div class="text-xs">
+                                <span class="text-muted-foreground">Events seen:</span>
+                                <span class="font-mono ml-1">{{ focusedEventsSeen.start }}</span>
+                                <span class="text-muted-foreground mx-1">→</span>
+                                <span class="font-mono">{{ focusedEventsSeen.end }}</span>
+                                <span class="text-muted-foreground ml-1">({{ focusedEventsSeen.duration }})</span>
+                            </div>
+                            <small class="text-muted-foreground block text-[11px]">
+                                Oldest and newest BookingExperts event timestamps actually ingested by this run.
                             </small>
                         </div>
                         <pre class="bg-muted max-h-60 overflow-auto rounded p-2 text-xs whitespace-pre-wrap break-all font-mono">{{ JSON.stringify(focused.params, null, 2) }}</pre>

@@ -10,9 +10,11 @@ use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use App\Models\User;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use Illuminate\Testing\TestResponse;
+use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
 /**
@@ -269,6 +271,189 @@ class WorkerBatchStatsTest extends TestCase
     }
 
     /**
+     * Cross-batch rollup: per-batch min/max event timestamps shipped
+     * via `batch_oldest_event_at` / `batch_newest_event_at` must
+     * collapse into a job-lifetime `stats.oldest_event_at` /
+     * `stats.newest_event_at` that always tracks the global extremes
+     * across every batch the worker has shipped so far. This is the
+     * "did the backfill actually reach the requested depth?" signal
+     * the Jobs detail dialog surfaces alongside the requested window.
+     */
+    #[Test]
+    public function it_rolls_up_oldest_and_newest_event_timestamps_across_batches(): void
+    {
+        // Batch #1 — the middle window. Establishes the baseline pair
+        // (no prior values, so both fields are written verbatim).
+        $b1Old = '2026-05-10T10:00:00Z';
+        $b1New = '2026-05-10T18:00:00Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-10T12:00:00Z', 1)],
+            oldestEventAt: $b1Old,
+            newestEventAt: $b1New,
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertCarbonEq($b1Old, $this->job->stats['oldest_event_at'] ?? null);
+        $this->assertCarbonEq($b1New, $this->job->stats['newest_event_at'] ?? null);
+
+        // Batch #2 — older window. Should pull `oldest_event_at`
+        // back; `newest_event_at` must NOT regress (b2 newest is
+        // older than b1 newest).
+        $b2Old = '2026-05-05T00:00:00Z';
+        $b2New = '2026-05-05T23:59:59Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-05T12:00:00Z', 2)],
+            oldestEventAt: $b2Old,
+            newestEventAt: $b2New,
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertCarbonEq($b2Old, $this->job->stats['oldest_event_at'] ?? null);
+        $this->assertCarbonEq(
+            $b1New,
+            $this->job->stats['newest_event_at'] ?? null,
+            'newest_event_at must not regress when batch #2 is wholly inside the prior window',
+        );
+
+        // Batch #3 — newer window. Should push `newest_event_at`
+        // forward; `oldest_event_at` must NOT regress (b3 oldest
+        // is newer than b2 oldest, which currently holds the
+        // global min).
+        $b3Old = '2026-05-15T08:00:00Z';
+        $b3New = '2026-05-20T20:00:00Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-18T12:00:00Z', 3)],
+            oldestEventAt: $b3Old,
+            newestEventAt: $b3New,
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertCarbonEq(
+            $b2Old,
+            $this->job->stats['oldest_event_at'] ?? null,
+            'oldest_event_at must not regress when batch #3 starts inside the prior coverage',
+        );
+        $this->assertCarbonEq($b3New, $this->job->stats['newest_event_at'] ?? null);
+    }
+
+    /**
+     * Edge case: a /batch POST without either rollup field must
+     * leave the existing `stats.oldest_event_at` /
+     * `stats.newest_event_at` untouched. The contract is "missing
+     * = no signal" — never a null overwrite.
+     */
+    #[Test]
+    public function it_preserves_existing_event_range_when_batch_omits_rollup_fields(): void
+    {
+        // Seed values from a non-empty batch.
+        $seedOld = '2026-05-08T00:00:00Z';
+        $seedNew = '2026-05-08T12:00:00Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-08T06:00:00Z', 1)],
+            oldestEventAt: $seedOld,
+            newestEventAt: $seedNew,
+        )->assertOk();
+
+        $this->job->refresh();
+        $beforeOld = $this->job->stats['oldest_event_at'] ?? null;
+        $beforeNew = $this->job->stats['newest_event_at'] ?? null;
+
+        // Second batch carries messages but NO rollup fields (mirrors
+        // an in-flight worker rolling deploy or a worker whose batch
+        // had only unparseable timestamps — both legitimate "skip"
+        // cases per the scraper-side contract in `postBatch`).
+        $this->postBatch(
+            messages: [$this->message('2026-05-08T07:00:00Z', 2)],
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertSame(
+            $beforeOld,
+            $this->job->stats['oldest_event_at'] ?? null,
+            'oldest_event_at must survive a batch that omits batch_oldest_event_at',
+        );
+        $this->assertSame(
+            $beforeNew,
+            $this->job->stats['newest_event_at'] ?? null,
+            'newest_event_at must survive a batch that omits batch_newest_event_at',
+        );
+    }
+
+    /**
+     * Edge case: a /batch POST that supplies only ONE side of the
+     * pair must roll up just that side. Useful for the (rare)
+     * single-message batch where min == max but the worker still
+     * happens to send both (which is fine — exercised below
+     * symmetrically), and for any future worker that decides to
+     * skip one side because of a parse failure on a single
+     * timestamp.
+     */
+    #[Test]
+    public function it_rolls_up_only_the_supplied_side_when_one_field_is_missing(): void
+    {
+        // Seed the pair so we have prior values on both sides.
+        $seedOld = '2026-05-12T00:00:00Z';
+        $seedNew = '2026-05-12T12:00:00Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-12T06:00:00Z', 1)],
+            oldestEventAt: $seedOld,
+            newestEventAt: $seedNew,
+        )->assertOk();
+
+        $this->job->refresh();
+        $beforeNew = $this->job->stats['newest_event_at'] ?? null;
+
+        // Batch supplies only oldest — must pull oldest back, leave
+        // newest exactly as it was.
+        $newerOld = '2026-05-01T00:00:00Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-01T12:00:00Z', 2)],
+            oldestEventAt: $newerOld,
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertCarbonEq($newerOld, $this->job->stats['oldest_event_at'] ?? null);
+        $this->assertSame(
+            $beforeNew,
+            $this->job->stats['newest_event_at'] ?? null,
+            'newest_event_at must survive a batch that supplies only batch_oldest_event_at',
+        );
+
+        // Symmetric: supply only newest — must push newest forward,
+        // leave oldest exactly as it was.
+        $beforeOld = $this->job->stats['oldest_event_at'] ?? null;
+        $newerNew = '2026-05-25T23:00:00Z';
+        $this->postBatch(
+            messages: [$this->message('2026-05-25T22:00:00Z', 3)],
+            newestEventAt: $newerNew,
+        )->assertOk();
+
+        $this->job->refresh();
+        $this->assertSame(
+            $beforeOld,
+            $this->job->stats['oldest_event_at'] ?? null,
+            'oldest_event_at must survive a batch that supplies only batch_newest_event_at',
+        );
+        $this->assertCarbonEq($newerNew, $this->job->stats['newest_event_at'] ?? null);
+    }
+
+    /**
+     * Carbon-aware equality so we tolerate ISO 8601 reformatting
+     * (the controller normalizes to `Carbon::toIso8601String()` —
+     * `2026-05-10T10:00:00Z` flows in, `2026-05-10T10:00:00+00:00`
+     * flows out). String compare would false-fail on the offset
+     * shape; comparing as instants is the actual contract.
+     */
+    private function assertCarbonEq(string $expected, mixed $actual, string $message = ''): void
+    {
+        $this->assertNotNull($actual, $message ?: 'expected a non-null timestamp');
+        $this->assertTrue(
+            Carbon::parse($expected)->equalTo(Carbon::parse((string) $actual)),
+            $message ?: "expected {$expected}, got {$actual}",
+        );
+    }
+
+    /**
      * @param  array<int, array<string, mixed>>  $messages
      * @param  array<int, array{page:int, attempts:int}>|null  $echoAttempts
      */
@@ -276,6 +461,8 @@ class WorkerBatchStatsTest extends TestCase
         array $messages,
         ?int $pagesProcessed = null,
         ?array $echoAttempts = null,
+        ?string $oldestEventAt = null,
+        ?string $newestEventAt = null,
     ): TestResponse {
         $body = ['messages' => $messages];
         if ($pagesProcessed !== null) {
@@ -283,6 +470,12 @@ class WorkerBatchStatsTest extends TestCase
         }
         if ($echoAttempts !== null) {
             $body['echo_attempts_by_page'] = $echoAttempts;
+        }
+        if ($oldestEventAt !== null) {
+            $body['batch_oldest_event_at'] = $oldestEventAt;
+        }
+        if ($newestEventAt !== null) {
+            $body['batch_newest_event_at'] = $newestEventAt;
         }
 
         return $this

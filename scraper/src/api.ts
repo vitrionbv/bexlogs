@@ -58,6 +58,35 @@ export async function postBatch(
     if (pagesProcessed != null) {
         body.pages_processed = pagesProcessed;
     }
+    // Min/max event-timestamps in THIS batch. Laravel's /batch
+    // handler rolls them up across batches into a job-lifetime
+    // `stats.oldest_event_at` / `stats.newest_event_at` so operators
+    // can see the actual data window the scrape ingested
+    // (independent of the requested window in
+    // `params.start_time` / `params.end_time` — useful for
+    // verifying a backfill actually reached the requested depth).
+    //
+    // `Date.parse` is used because BookingExperts' timestamps are
+    // ISO 8601 with varying offsets and millisecond precision; it
+    // returns NaN on garbage which we filter out.
+    //
+    // Empty / all-unparseable batches just skip the fields entirely
+    // — Laravel's merge logic treats missing fields as "no signal"
+    // (the contract is "missing = no signal", never `null`).
+    if (messages.length > 0) {
+        let minMs = Number.POSITIVE_INFINITY;
+        let maxMs = Number.NEGATIVE_INFINITY;
+        for (const m of messages) {
+            const ms = Date.parse(m.timestamp);
+            if (Number.isNaN(ms)) continue;
+            if (ms < minMs) minMs = ms;
+            if (ms > maxMs) maxMs = ms;
+        }
+        if (Number.isFinite(minMs) && Number.isFinite(maxMs)) {
+            body.batch_oldest_event_at = new Date(minMs).toISOString();
+            body.batch_newest_event_at = new Date(maxMs).toISOString();
+        }
+    }
     // Always re-send the full list on every batch — sender-of-truth
     // semantics. Laravel overwrites rather than merges, so we don't
     // have to track diffs. Skipped entirely when the array is empty
