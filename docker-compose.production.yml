@@ -77,6 +77,38 @@ services:
       DB_PORT: 5432
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # Server-side broadcast routing. The Laravel HTTP processes (this
+      # container, plus `queue` and `scheduler` since they share the
+      # same env block via x-app-env) emit Pusher events to Reverb
+      # using these three values. Pointing them at the internal
+      # docker-network DNS name `reverb:8080` over plain HTTP keeps
+      # synchronous broadcasts (notably `LogBatchInserted`, which is
+      # `ShouldBroadcastNow` for live-feed ordering) on a sub-ms
+      # round-trip. They explicitly OVERRIDE whatever `laravel/.env`
+      # sets for REVERB_HOST / PORT / SCHEME — Compose's `environment`
+      # block wins over `env_file`, which is the whole point of
+      # repeating these here.
+      #
+      # The browser bundle still talks to Reverb via the public
+      # hostname: that's what the `VITE_REVERB_*` build args at the
+      # top of this file bake in (CDN → Caddy → reverb), and they
+      # are the only Reverb-related vars baked into the JS that
+      # ships to clients. Do NOT collapse the two into one var —
+      # they have to differ.
+      #
+      # Pre-fix, all containers broadcast via the public hostname,
+      # which round-tripped through Cloudflare → Caddy → ingress
+      # back into the same docker network. A single 10s WAN timeout
+      # inside `WorkerController::batch` was returning 500 to the
+      # scraper and failing the worker job (the data write itself
+      # had succeeded). Defense-in-depth on top of this routing
+      # change: every `broadcast()` in the worker-path controllers
+      # is now wrapped in `App\Support\SafeBroadcast::dispatch` so
+      # broadcast failures log a warning but never fail the data
+      # mutation — see WorkerController / JobsController.
+      REVERB_HOST: reverb
+      REVERB_PORT: 8080
+      REVERB_SCHEME: http
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,6 +134,15 @@ services:
       DB_PORT: 5432
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # Internal docker-network broadcasting. Same rationale as
+      # the `app` service — queued listeners that broadcast
+      # (`ShouldBroadcast` events processed off the redis queue)
+      # would otherwise round-trip through the public hostname
+      # exactly like the synchronous `ShouldBroadcastNow` path
+      # that took down job 38616. See `app` for the full block.
+      REVERB_HOST: reverb
+      REVERB_PORT: 8080
+      REVERB_SCHEME: http
     depends_on:
       postgres:
         condition: service_healthy
@@ -123,6 +164,14 @@ services:
       DB_PORT: 5432
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # Internal broadcasting routing — same as `app` and `queue`.
+      # The scheduler runs `php artisan schedule:work`, which fires
+      # `ScrapeReapStale` etc. inline; those commands broadcast
+      # status updates and would otherwise round-trip via the
+      # public hostname.
+      REVERB_HOST: reverb
+      REVERB_PORT: 8080
+      REVERB_SCHEME: http
     depends_on:
       postgres:
         condition: service_healthy
@@ -156,6 +205,26 @@ services:
       - bexlogs_storage:/var/www/html/storage
     networks:
       - bexlogs
+    # Reverb listens on 8080 (set via REVERB_SERVER_PORT in
+    # laravel/.env), NOT 80. Previously this service had no
+    # healthcheck and Docker inferred liveness from the
+    # `app` service's php-fpm `/up` probe, which obviously
+    # said nothing about whether reverb itself was up.
+    #
+    # Pusher's HTTP layer answers WebSocket upgrades on `/`
+    # and returns 4xx for plain GETs — that's still proof of
+    # liveness (the TCP listener is accepting connections),
+    # so we deliberately omit `--fail` and just check that
+    # curl gets ANY response. Connection-refused / timeout
+    # → non-zero exit → Docker marks unhealthy. The
+    # `--connect-timeout 5` keeps a wedged kernel from
+    # holding the probe past the healthcheck timeout window.
+    healthcheck:
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--connect-timeout", "5", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
 
   scraper:
     image: bexlogs/scraper:latest
@@ -177,6 +246,25 @@ services:
     # it gets `SIGCHLD`. The other services (app/queue/reverb/
     # scheduler) already get tini from the PHP image's entrypoint.
     init: true
+    # Defense-in-depth on top of `init: true` for the orphan-Chromium
+    # postmortem. With MAX_CONCURRENT_SCRAPES at the recommended
+    # ceiling and tini reaping correctly, the working set sits well
+    # under 200 PIDs. 1024 leaves a 5x safety margin and means any
+    # future leak — Chromium subprocess crash that tini somehow
+    # misses, a runaway shell-out, anything — hits a hard cgroup
+    # wall instead of OOMing the host's PID table. RSS is similarly
+    # bounded: Chromium + Playwright + node typically share
+    # ~600–900MB; 2g is generous and keeps the blast radius
+    # bounded if a page leaks DOM nodes / event listeners.
+    #
+    # Operator note: the live PID count for this container is
+    # readable inside it at `/sys/fs/cgroup/pids.current`, and the
+    # cap at `/sys/fs/cgroup/pids.max`. A cheap Datadog/Prometheus
+    # exporter could scrape `pids.current / pids.max` and alert at
+    # 0.6 to catch a creeping leak before it bites. Not wiring that
+    # here — just leaving the breadcrumb.
+    pids_limit: 1024
+    mem_limit: 2g
     depends_on:
       app:
         condition: service_healthy
@@ -191,6 +279,35 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     networks:
       - bexlogs
+    # Process-liveness check. The scraper has no HTTP endpoint to
+    # probe, so we look for the Node entrypoint by command line.
+    #
+    # `pgrep -f` matches against the full argv. We anchor with
+    # `^node ` so the pattern matches the worker's own argv
+    # (`node dist/index.js`) but does NOT false-match the
+    # healthcheck shell process itself: that process's cmdline
+    # starts with `[ "$(pgrep …)" -ge 1 ]`, which doesn't begin
+    # with `node `, so the count comes back 0 when the worker
+    # is dead.
+    #
+    # `pgrep -x node` would be the obvious alternative but
+    # doesn't work for Node specifically: V8 / libuv rename the
+    # process's `comm` field to `MainThread`, which `pgrep -x`
+    # matches against rather than the executable name. The argv
+    # match via `-f` is the reliable form.
+    #
+    # Playwright's Chromium child processes do NOT run as `node`
+    # (they're chromium binaries), so the count is bounded by
+    # however many node entrypoints we run — which is exactly 1
+    # in this image. The 60s interval is plenty: a dead worker
+    # process recovers via `restart: unless-stopped` on the next
+    # tick; we don't need second-level granularity here.
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(pgrep -fc '^node ')\" -ge 1 ]"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   postgres:
     image: postgres:18-alpine

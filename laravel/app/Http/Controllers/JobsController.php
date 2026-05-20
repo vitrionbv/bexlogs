@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Events\ScrapeJobUpdated;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
+use App\Support\SafeBroadcast;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -108,7 +109,10 @@ class JobsController extends Controller
             'stats' => null,
         ])->save();
 
-        broadcast(ScrapeJobUpdated::fromJob($job->fresh()));
+        SafeBroadcast::dispatch(
+            ScrapeJobUpdated::fromJob($job->fresh()),
+            'JobsController::retry',
+        );
 
         return back()->with('success', "Job #{$job->id} requeued.");
     }
@@ -126,7 +130,10 @@ class JobsController extends Controller
             'completed_at' => now(),
         ])->save();
 
-        broadcast(ScrapeJobUpdated::fromJob($job->fresh()));
+        SafeBroadcast::dispatch(
+            ScrapeJobUpdated::fromJob($job->fresh()),
+            'JobsController::cancel',
+        );
 
         return back()->with('success', "Job #{$job->id} cancelled.");
     }
@@ -135,9 +142,9 @@ class JobsController extends Controller
     {
         $this->authorizeJob($request, $job);
 
-        $broadcast = ScrapeJobUpdated::fromJob($job);
+        $event = ScrapeJobUpdated::fromJob($job);
         $job->delete();
-        broadcast($broadcast);
+        SafeBroadcast::dispatch($event, 'JobsController::destroy');
 
         return back()->with('success', "Job #{$job->id} deleted.");
     }

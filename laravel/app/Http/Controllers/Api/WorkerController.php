@@ -11,6 +11,7 @@ use App\Models\Page;
 use App\Models\ScrapeJob;
 use App\Models\Subscription;
 use App\Support\LogMessageHasher;
+use App\Support\SafeBroadcast;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
@@ -108,12 +109,12 @@ class WorkerController extends Controller
         $app = $sub->application;
         $org = $app->organization;
 
-        broadcast(new ScrapeJobUpdated(
+        SafeBroadcast::dispatch(new ScrapeJobUpdated(
             userId: (int) $org->user_id,
             jobId: $job->id,
             subscriptionId: (string) $job->subscription_id,
             status: $job->status,
-        ));
+        ), 'WorkerController::nextJob');
 
         return response()->json([
             'id' => $job->id,
@@ -389,23 +390,23 @@ class WorkerController extends Controller
             $latestTimestamp = collect($rows)->pluck('timestamp')->max();
             $totalInPage = (int) LogMessage::where('page_id', $page->id)->count();
 
-            broadcast(new LogBatchInserted(
+            SafeBroadcast::dispatch(new LogBatchInserted(
                 userId: (int) $org->user_id,
                 pageId: (int) $page->id,
                 subscriptionId: (string) $sub->id,
                 inserted: (int) $stored,
                 totalInPage: $totalInPage,
                 latestTimestamp: $latestTimestamp,
-            ));
+            ), 'WorkerController::batch.LogBatchInserted');
         }
 
-        broadcast(new ScrapeJobUpdated(
+        SafeBroadcast::dispatch(new ScrapeJobUpdated(
             userId: (int) $org->user_id,
             jobId: $job->id,
             subscriptionId: (string) $job->subscription_id,
             status: $job->fresh()->status,
             stats: $mergedStats,
-        ));
+        ), 'WorkerController::batch.ScrapeJobUpdated');
 
         return response()->json([
             'received' => $receivedInBatch,
@@ -504,7 +505,10 @@ class WorkerController extends Controller
             'last_scraped_at' => now(),
         ]);
 
-        broadcast(ScrapeJobUpdated::fromJob($current->fresh()));
+        SafeBroadcast::dispatch(
+            ScrapeJobUpdated::fromJob($current->fresh()),
+            'WorkerController::complete',
+        );
 
         return response()->noContent();
     }
@@ -568,7 +572,10 @@ class WorkerController extends Controller
                 ]);
         }
 
-        broadcast(ScrapeJobUpdated::fromJob($job->fresh()));
+        SafeBroadcast::dispatch(
+            ScrapeJobUpdated::fromJob($job->fresh()),
+            'WorkerController::fail',
+        );
 
         return response()->noContent();
     }
