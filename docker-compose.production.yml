@@ -154,6 +154,24 @@ services:
       - bexlogs_storage:/var/www/html/storage
     networks:
       - bexlogs
+    # Process-liveness check. This container inherits the
+    # `curl http://127.0.0.1/up` HEALTHCHECK from docker/app/Dockerfile,
+    # which would always fail here — `queue:work` doesn't run an HTTP
+    # listener. We override with a pgrep against the artisan worker's
+    # argv (`pgrep -f` matches the full command line). Mirrors the
+    # pattern used for the `scraper` service further down.
+    #
+    # Anchored on the literal `artisan queue:work` substring so the
+    # healthcheck shell process (whose argv begins with `[ "$(pgrep …)" -ge 1 ]`)
+    # cannot false-match itself. The Dockerfile's tini ENTRYPOINT keeps
+    # tini at PID 1; the artisan worker is its child and `pgrep` will
+    # find exactly 1 match while the worker is alive.
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(pgrep -fc 'artisan queue:work')\" -ge 1 ]"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   scheduler:
     <<: [*app_image, *app_env]
@@ -183,6 +201,24 @@ services:
       - bexlogs_storage:/var/www/html/storage
     networks:
       - bexlogs
+    # Process-liveness check. This container inherits the
+    # `curl http://127.0.0.1/up` HEALTHCHECK from docker/app/Dockerfile,
+    # which would always fail here — `schedule:work` doesn't run an HTTP
+    # listener. We override with a pgrep against the artisan worker's
+    # argv (`pgrep -f` matches the full command line). Mirrors the
+    # pattern used for the `scraper` service further down.
+    #
+    # Anchored on the literal `artisan schedule:work` substring so the
+    # healthcheck shell process (whose argv begins with `[ "$(pgrep …)" -ge 1 ]`)
+    # cannot false-match itself. The Dockerfile's tini ENTRYPOINT keeps
+    # tini at PID 1; the artisan worker is its child and `pgrep` will
+    # find exactly 1 match while the worker is alive.
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(pgrep -fc 'artisan schedule:work')\" -ge 1 ]"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   reverb:
     <<: [*app_image, *app_env]
