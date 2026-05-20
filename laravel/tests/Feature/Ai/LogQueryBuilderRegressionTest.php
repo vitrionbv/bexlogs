@@ -173,7 +173,7 @@ class LogQueryBuilderRegressionTest extends TestCase
     public function test_json_filters_are_postgres_only(): void
     {
         if ($this->app['db.connection']->getDriverName() !== 'pgsql') {
-            $this->markTestSkipped('jsonFilters use Postgres ::text; covered by integration env.');
+            $this->markTestSkipped('jsonFilters use Postgres jsonb; covered by integration env.');
         }
 
         LogMessage::factory()->create([
@@ -184,6 +184,52 @@ class LogQueryBuilderRegressionTest extends TestCase
         $count = $this->builder->applyFilters(
             LogMessage::query()->where('page_id', $this->page->id),
             ['jsonFilters' => [['field' => 'todo_id', 'value' => '26205663']]],
+        )->count();
+
+        $this->assertSame(1, $count);
+    }
+
+    public function test_json_filters_match_nested_numeric_field(): void
+    {
+        if ($this->app['db.connection']->getDriverName() !== 'pgsql') {
+            $this->markTestSkipped('jsonFilters use Postgres jsonb; covered by integration env.');
+        }
+
+        LogMessage::factory()->create([
+            'page_id' => $this->page->id,
+            'parameters' => ['data' => ['reservation_id' => 918273645]],
+        ]);
+        LogMessage::factory()->create([
+            'page_id' => $this->page->id,
+            'parameters' => ['data' => ['reservation_id' => 111111111]],
+        ]);
+
+        $count = $this->builder->applyFilters(
+            LogMessage::query()->where('page_id', $this->page->id),
+            ['jsonFilters' => [['field' => 'reservation_id', 'value' => '918273645']]],
+        )->count();
+
+        $this->assertSame(1, $count);
+    }
+
+    public function test_q_finds_numeric_id_in_nested_json_body(): void
+    {
+        if ($this->app['db.connection']->getDriverName() !== 'pgsql') {
+            $this->markTestSkipped('Free-text q uses Postgres ILIKE / ::text; covered by integration env.');
+        }
+
+        LogMessage::factory()->create([
+            'page_id' => $this->page->id,
+            'parameters' => ['payload' => ['todo_id' => 26205663]],
+        ]);
+        LogMessage::factory()->create([
+            'page_id' => $this->page->id,
+            'parameters' => ['payload' => ['todo_id' => 99999999]],
+        ]);
+
+        $count = $this->builder->applyFilters(
+            LogMessage::query()->where('page_id', $this->page->id),
+            ['q' => '26205663'],
         )->count();
 
         $this->assertSame(1, $count);

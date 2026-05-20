@@ -58,7 +58,10 @@ class LogQueryBuilder
         // Free-text search across action / path / method / json bodies. The
         // user's needle has its SQL LIKE wildcards (`%` and `_`) escaped so
         // a search for an entity id like `26205663` doesn't get reinterpreted
-        // as a wildcard pattern.
+        // as a wildcard pattern. JSON columns are matched via ::text ILIKE,
+        // which is backed on Postgres by pg_trgm GIN indexes (see migration
+        // add_log_message_trgm_indexes) so ID lookups stay sub-second on
+        // large subscriptions.
         if (! empty($filters['q'])) {
             $needle = '%'.str_replace(['%', '_'], ['\\%', '\\_'], $filters['q']).'%';
             $query->where(function ($w) use ($needle) {
@@ -73,17 +76,45 @@ class LogQueryBuilder
 
         if (! empty($filters['jsonFilters'])) {
             foreach ($filters['jsonFilters'] as $jf) {
-                $field = $jf['field'];
-                $value = $jf['value'];
-                $query->where(function ($q) use ($field, $value) {
-                    foreach (['parameters', 'request', 'response'] as $col) {
-                        $q->orWhereRaw("$col::text ILIKE ?", ["%\"$field\":%$value%"]);
-                    }
-                });
+                $this->applyJsonFieldFilter($query, (string) $jf['field'], (string) $jf['value']);
             }
         }
 
         return $query;
+    }
+
+    /**
+     * Match a JSON field/value pair across parameters/request/response.
+     *
+     * Two tiers, OR'd together:
+     *   1. Top-level `@>` containment — hits the existing jsonb_path_ops
+     *      GIN indexes when the key lives at the document root.
+     *   2. `::text ILIKE` — nested keys and odd serializations; accelerated
+     *      by pg_trgm GIN indexes on the ::text expressions (see migration
+     *      add_log_message_trgm_indexes).
+     */
+    private function applyJsonFieldFilter(Builder $query, string $field, string $value): void
+    {
+        $safeField = preg_replace('/[^a-zA-Z0-9_]/', '', $field);
+        if ($safeField === '' || $value === '') {
+            return;
+        }
+
+        $textNeedle = '%"'.$safeField.'":%'.str_replace(['%', '_'], ['\\%', '\\_'], $value).'%';
+
+        $query->where(function ($q) use ($safeField, $value, $textNeedle) {
+            foreach (['parameters', 'request', 'response'] as $col) {
+                $q->orWhere(function ($w) use ($col, $safeField, $value, $textNeedle) {
+                    $w->whereRaw("{$col} @> ?::jsonb", [json_encode([$safeField => $value])]);
+
+                    if (ctype_digit($value)) {
+                        $w->orWhereRaw("{$col} @> ?::jsonb", [json_encode([$safeField => (int) $value])]);
+                    }
+
+                    $w->orWhereRaw("{$col}::text ILIKE ?", [$textNeedle]);
+                });
+            }
+        });
     }
 
     /**
