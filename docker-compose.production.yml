@@ -158,16 +158,26 @@ services:
     # `curl http://127.0.0.1/up` HEALTHCHECK from docker/app/Dockerfile,
     # which would always fail here — `queue:work` doesn't run an HTTP
     # listener. We override with a pgrep against the artisan worker's
-    # argv (`pgrep -f` matches the full command line). Mirrors the
-    # pattern used for the `scraper` service further down.
+    # argv (`pgrep -f` matches the full command line).
     #
-    # Anchored on the literal `artisan queue:work` substring so the
-    # healthcheck shell process (whose argv begins with `[ "$(pgrep …)" -ge 1 ]`)
-    # cannot false-match itself. The Dockerfile's tini ENTRYPOINT keeps
-    # tini at PID 1; the artisan worker is its child and `pgrep` will
-    # find exactly 1 match while the worker is alive.
+    # CMD form (not CMD-SHELL) is deliberate. The app image ships
+    # BusyBox pgrep v1.37 (`/usr/bin/pgrep`): `-c` does not exist
+    # there (only `-flanovx`), and `-f` does NOT exclude the calling
+    # parent shell — so a CMD-SHELL wrapper always self-matches via
+    # the `sh -c "pgrep -f 'artisan …'"` argv (false positive even
+    # when the worker is dead). Invoking pgrep directly skips the
+    # shell entirely; pgrep already excludes its own PID, leaving
+    # only the worker(s) as matchable processes.
+    #
+    # The `scraper` service further down uses a CMD-SHELL form with
+    # `pgrep -fc` because its image ships procps-ng pgrep, where
+    # both `-c` and parent-shell exclusion work. Do NOT copy this
+    # block's form to scraper or vice versa without re-checking the
+    # base image's pgrep flavour.
+    #
+    # Supersedes commit 70cda58 which used the broken CMD-SHELL form.
     healthcheck:
-      test: ["CMD-SHELL", "[ \"$$(pgrep -fc 'artisan queue:work')\" -ge 1 ]"]
+      test: ["CMD", "pgrep", "-f", "artisan queue:work"]
       interval: 60s
       timeout: 10s
       start_period: 30s
@@ -205,16 +215,19 @@ services:
     # `curl http://127.0.0.1/up` HEALTHCHECK from docker/app/Dockerfile,
     # which would always fail here — `schedule:work` doesn't run an HTTP
     # listener. We override with a pgrep against the artisan worker's
-    # argv (`pgrep -f` matches the full command line). Mirrors the
-    # pattern used for the `scraper` service further down.
+    # argv (`pgrep -f` matches the full command line).
     #
-    # Anchored on the literal `artisan schedule:work` substring so the
-    # healthcheck shell process (whose argv begins with `[ "$(pgrep …)" -ge 1 ]`)
-    # cannot false-match itself. The Dockerfile's tini ENTRYPOINT keeps
-    # tini at PID 1; the artisan worker is its child and `pgrep` will
-    # find exactly 1 match while the worker is alive.
+    # CMD form (not CMD-SHELL) is deliberate; see the long comment
+    # on the `queue` service above for the BusyBox-vs-procps-ng
+    # rationale. Short version: the app image's pgrep is BusyBox
+    # which lacks `-c` AND matches the calling shell's own argv,
+    # so any CMD-SHELL wrapper would always self-match the pattern.
+    # CMD form skips the shell, pgrep excludes its own PID, only
+    # the worker(s) are matchable.
+    #
+    # Supersedes commit 70cda58 which used the broken CMD-SHELL form.
     healthcheck:
-      test: ["CMD-SHELL", "[ \"$$(pgrep -fc 'artisan schedule:work')\" -ge 1 ]"]
+      test: ["CMD", "pgrep", "-f", "artisan schedule:work"]
       interval: 60s
       timeout: 10s
       start_period: 30s
