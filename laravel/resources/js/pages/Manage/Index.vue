@@ -17,11 +17,13 @@ import {
     RefreshCw,
     Search,
     Settings2,
+    SlidersHorizontal,
     Trash2,
     X,
 } from 'lucide-vue-next';
 import { computed, defineComponent, h, ref, watch } from 'vue';
 import { toast } from 'vue-sonner';
+import HealthBadge from '@/components/HealthBadge.vue';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -58,7 +60,6 @@ import {
     TooltipProvider,
     TooltipTrigger,
 } from '@/components/ui/tooltip';
-import HealthBadge from '@/components/HealthBadge.vue';
 
 interface HealthInfo {
     score: number;
@@ -661,9 +662,11 @@ function updateLifecycle(sub: SubRow, field: LifecycleField, raw: string): void 
     } else {
         const parsed = Number(trimmed);
         const bounds = LIFECYCLE_BOUNDS[field];
+
         if (!Number.isFinite(parsed) || parsed < bounds.min || parsed > bounds.max) {
             return;
         }
+
         nextValue = Math.floor(parsed);
     }
 
@@ -677,12 +680,14 @@ function updateLifecycle(sub: SubRow, field: LifecycleField, raw: string): void 
         // not just the server's rendered hint (which always reflects
         // the *current* persisted retention).
         const projection = projectRetentionImpact(sub, nextValue);
+
         if (projection > 0) {
             retentionConfirm.value = {
                 sub,
                 nextValue,
                 impactCount: projection,
             };
+
             return;
         }
     }
@@ -715,7 +720,10 @@ function projectRetentionImpact(sub: SubRow, _nextDays: number): number {
 }
 
 function confirmRetentionShorten(): void {
-    if (!retentionConfirm.value) return;
+    if (!retentionConfirm.value) {
+return;
+}
+
     const { sub, nextValue } = retentionConfirm.value;
     persistLifecycleUpdate(sub, 'retention_days', nextValue);
     retentionConfirm.value = null;
@@ -756,6 +764,140 @@ function scrapeNow(sub: SubRow): void {
             },
         },
     );
+}
+
+// ─── Custom scrape dialog ────────────────────────────────────────────────────
+//
+// A one-off, operator-driven escape hatch that posts to the same
+// /manage/subscriptions/{id}/scrape endpoint as the quick "Scrape now"
+// button, but lets the user override the worker's safety nets:
+//
+//   - start_time / end_time:    explicit ISO 8601 window; useful for
+//                                back-filling a known gap.
+//   - max_pages:                hard pagination ceiling; default 200,
+//                                bumped to ~1M for full historical pulls.
+//   - max_duration_minutes:     wall-clock budget before the worker
+//                                aborts cleanly. Default 10, up to 24h.
+//   - token_echo_max_attempts:  how many times to retry when
+//                                BookingExperts echoes the same
+//                                next_token; raise on flaky pages.
+//   - early_stop_duplicate_pages /
+//     early_stop_min_duplicates: disable the "already caught up"
+//                                early-stop so a backfill keeps
+//                                paginating through duplicates to
+//                                reach historical data behind a wall
+//                                of already-scraped rows.
+//
+// The dialog is shared across rows; `customScrapeSub` holds the row
+// the dialog was opened from. Empty fields are omitted from the
+// payload so the server-side ScrapeWindowPlanner's per-subscription
+// defaults survive (matches the `array_filter` rule in
+// `mergeOverrides`).
+interface CustomScrapeForm {
+    start_time: string;
+    end_time: string;
+    max_pages: number | '';
+    max_duration_minutes: number | '';
+    token_echo_max_attempts: number | '';
+    early_stop_duplicate_pages: number | '';
+    early_stop_min_duplicates: number | '';
+}
+
+function blankCustomScrapeForm(): CustomScrapeForm {
+    return {
+        start_time: '',
+        end_time: '',
+        max_pages: '',
+        max_duration_minutes: '',
+        token_echo_max_attempts: '',
+        early_stop_duplicate_pages: '',
+        early_stop_min_duplicates: '',
+    };
+}
+
+const customScrapeDialogOpen = ref(false);
+const customScrapeSub = ref<SubRow | null>(null);
+const customScrapeForm = ref<CustomScrapeForm>(blankCustomScrapeForm());
+const customScrapeShowAdvanced = ref(false);
+const customScrapeProcessing = ref(false);
+
+function openCustomScrape(sub: SubRow): void {
+    customScrapeSub.value = sub;
+    customScrapeForm.value = blankCustomScrapeForm();
+    customScrapeShowAdvanced.value = false;
+    customScrapeDialogOpen.value = true;
+}
+
+// Preset that mirrors the manual tinker call used for historical
+// backfills: lift every safety ceiling so a multi-day window can run
+// to natural completion without the duplicate-density early-stop
+// firing partway through.
+function applyFullBackfillPreset(): void {
+    customScrapeForm.value.max_pages = 999_999;
+    customScrapeForm.value.max_duration_minutes = 720;
+    customScrapeForm.value.token_echo_max_attempts = 100;
+    customScrapeForm.value.early_stop_duplicate_pages = 999_999;
+    customScrapeForm.value.early_stop_min_duplicates = 999_999_999;
+    customScrapeShowAdvanced.value = true;
+}
+
+function submitCustomScrape(): void {
+    const sub = customScrapeSub.value;
+
+    if (!sub) {
+return;
+}
+
+    const payload: Record<string, FormDataConvertible> = {};
+    const form = customScrapeForm.value;
+
+    if (form.start_time.trim() !== '') {
+payload.start_time = form.start_time.trim();
+}
+
+    if (form.end_time.trim() !== '') {
+payload.end_time = form.end_time.trim();
+}
+
+    if (form.max_pages !== '') {
+payload.max_pages = form.max_pages;
+}
+
+    if (form.max_duration_minutes !== '') {
+payload.max_duration_minutes = form.max_duration_minutes;
+}
+
+    if (form.token_echo_max_attempts !== '') {
+payload.token_echo_max_attempts = form.token_echo_max_attempts;
+}
+
+    if (form.early_stop_duplicate_pages !== '') {
+payload.early_stop_duplicate_pages = form.early_stop_duplicate_pages;
+}
+
+    if (form.early_stop_min_duplicates !== '') {
+payload.early_stop_min_duplicates = form.early_stop_min_duplicates;
+}
+
+    customScrapeProcessing.value = true;
+    router.post(`/manage/subscriptions/${sub.id}/scrape`, payload, {
+        preserveScroll: true,
+        onSuccess: () => {
+            customScrapeDialogOpen.value = false;
+            customScrapeSub.value = null;
+            customScrapeForm.value = blankCustomScrapeForm();
+        },
+        onError: (errs) => {
+            const first = Object.values(errs)[0];
+
+            if (first) {
+toast.error(String(first));
+}
+        },
+        onFinish: () => {
+            customScrapeProcessing.value = false;
+        },
+    });
 }
 
 // ─── Browse tab state ────────────────────────────────────────────────────────
@@ -1696,6 +1838,21 @@ const ManualNickname = defineComponent({
                                 <Button size="sm" @click="scrapeNow(sub)">
                                     <Play class="mr-1 size-4" /> Scrape now
                                 </Button>
+                                <TooltipProvider :delay-duration="200">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <Button
+                                                size="icon"
+                                                variant="outline"
+                                                @click="openCustomScrape(sub)"
+                                                :aria-label="`Custom scrape for ${sub.name}`"
+                                            >
+                                                <SlidersHorizontal class="size-4" />
+                                            </Button>
+                                        </TooltipTrigger>
+                                        <TooltipContent>Custom scrape (advanced overrides)</TooltipContent>
+                                    </Tooltip>
+                                </TooltipProvider>
                                 <Button
                                     size="icon"
                                     variant="ghost"
@@ -1978,6 +2135,229 @@ const ManualNickname = defineComponent({
                 </div>
             </CardContent>
         </Card>
+
+        <!--
+            Custom scrape dialog. Operator-driven escape hatch that
+            mirrors the override payload `enqueueScrape` accepts: an
+            explicit time window plus per-job toggles for the worker's
+            safety nets. Empty fields are not sent — the
+            ScrapeWindowPlanner falls back to the subscription's
+            configured defaults for whatever the operator left blank.
+        -->
+        <Dialog v-model:open="customScrapeDialogOpen">
+            <DialogContent
+                class="sm:max-w-2xl"
+                data-testid="custom-scrape-dialog"
+            >
+                <DialogHeader>
+                    <DialogTitle>
+                        Custom scrape<span v-if="customScrapeSub">
+                            for {{ customScrapeSub.name }}
+                        </span>
+                    </DialogTitle>
+                    <DialogDescription>
+                        Run a one-off scrape with explicit overrides. Leave a field blank to
+                        use the subscription's configured default. Useful for back-filling
+                        historical gaps without weakening the auto-scrape settings.
+                    </DialogDescription>
+                </DialogHeader>
+
+                <div class="space-y-4">
+                    <div
+                        class="bg-muted/40 flex flex-wrap items-center gap-2 rounded-md border border-dashed p-2 text-xs"
+                    >
+                        <span class="text-muted-foreground">Quick presets:</span>
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            @click="applyFullBackfillPreset"
+                        >
+                            Full historical backfill
+                        </Button>
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            @click="customScrapeForm = blankCustomScrapeForm()"
+                        >
+                            Clear all
+                        </Button>
+                    </div>
+
+                    <section class="space-y-2">
+                        <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                            Time window
+                        </h3>
+                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                            <div class="space-y-1">
+                                <Label for="custom-scrape-start">Start time</Label>
+                                <Input
+                                    id="custom-scrape-start"
+                                    type="text"
+                                    placeholder="2026-05-15T00:00:00Z"
+                                    v-model="customScrapeForm.start_time"
+                                />
+                                <p class="text-muted-foreground text-[11px]">
+                                    Earliest event to fetch. ISO 8601 (UTC). Blank uses
+                                    last_scraped_at − 30 min (or the configured first-scrape
+                                    lookback on a brand-new subscription).
+                                </p>
+                            </div>
+                            <div class="space-y-1">
+                                <Label for="custom-scrape-end">End time</Label>
+                                <Input
+                                    id="custom-scrape-end"
+                                    type="text"
+                                    placeholder="2026-05-18T17:42:31Z"
+                                    v-model="customScrapeForm.end_time"
+                                />
+                                <p class="text-muted-foreground text-[11px]">
+                                    Latest event to fetch. Blank uses "now". For a backwards
+                                    backfill, set this to the oldest event your last run
+                                    reached, plus a 2–4 hour overlap.
+                                </p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="space-y-2">
+                        <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                            Budgets
+                        </h3>
+                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                            <div class="space-y-1">
+                                <Label for="custom-scrape-max-pages">Max pages</Label>
+                                <Input
+                                    id="custom-scrape-max-pages"
+                                    type="number"
+                                    min="1"
+                                    max="1000000"
+                                    placeholder="200"
+                                    v-model.number="customScrapeForm.max_pages"
+                                />
+                                <p class="text-muted-foreground text-[11px]">
+                                    Hard cap on paginated requests (≈25 entries / page).
+                                    Bump to 999 999 for a full backfill.
+                                </p>
+                            </div>
+                            <div class="space-y-1">
+                                <Label for="custom-scrape-max-duration">Max duration (min)</Label>
+                                <Input
+                                    id="custom-scrape-max-duration"
+                                    type="number"
+                                    min="1"
+                                    max="1440"
+                                    placeholder="10"
+                                    v-model.number="customScrapeForm.max_duration_minutes"
+                                />
+                                <p class="text-muted-foreground text-[11px]">
+                                    Wall-clock ceiling; the worker aborts cleanly when
+                                    reached. Up to 1440 (24 h).
+                                </p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="space-y-2">
+                        <button
+                            type="button"
+                            class="text-muted-foreground hover:text-foreground flex items-center gap-1 text-xs font-semibold uppercase tracking-wide"
+                            @click="customScrapeShowAdvanced = !customScrapeShowAdvanced"
+                        >
+                            <ChevronDown
+                                v-if="customScrapeShowAdvanced"
+                                class="size-3"
+                            />
+                            <ChevronRight v-else class="size-3" />
+                            Advanced (retry &amp; early-stop overrides)
+                        </button>
+                        <div
+                            v-show="customScrapeShowAdvanced"
+                            class="space-y-3"
+                        >
+                            <div class="space-y-1">
+                                <Label for="custom-scrape-echo">
+                                    Token-echo retry attempts
+                                </Label>
+                                <Input
+                                    id="custom-scrape-echo"
+                                    type="number"
+                                    min="1"
+                                    max="1000"
+                                    placeholder="100"
+                                    v-model.number="customScrapeForm.token_echo_max_attempts"
+                                />
+                                <p class="text-muted-foreground text-[11px]">
+                                    When BookingExperts replies with the same
+                                    <code>next_token</code> instead of a new page, retry up
+                                    to this many times before giving up. Raise on flaky
+                                    pages.
+                                </p>
+                            </div>
+
+                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                <div class="space-y-1">
+                                    <Label for="custom-scrape-dup-pages">
+                                        Duplicate-stop · consecutive pages
+                                    </Label>
+                                    <Input
+                                        id="custom-scrape-dup-pages"
+                                        type="number"
+                                        min="1"
+                                        max="1000000"
+                                        placeholder="default"
+                                        v-model.number="customScrapeForm.early_stop_duplicate_pages"
+                                    />
+                                    <p class="text-muted-foreground text-[11px]">
+                                        Stop after this many fully-duplicate pages in a
+                                        row. Set to 999 999 to disable, so a backfill can
+                                        paginate through duplicates to reach older data.
+                                    </p>
+                                </div>
+                                <div class="space-y-1">
+                                    <Label for="custom-scrape-dup-min">
+                                        Duplicate-stop · minimum total
+                                    </Label>
+                                    <Input
+                                        id="custom-scrape-dup-min"
+                                        type="number"
+                                        min="1"
+                                        max="1000000000"
+                                        placeholder="default"
+                                        v-model.number="customScrapeForm.early_stop_min_duplicates"
+                                    />
+                                    <p class="text-muted-foreground text-[11px]">
+                                        Minimum total duplicate rows observed before the
+                                        early-stop is allowed to fire. Pairs with the
+                                        consecutive-pages knob above.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <DialogFooter>
+                    <Button
+                        variant="ghost"
+                        @click="customScrapeDialogOpen = false"
+                    >
+                        Cancel
+                    </Button>
+                    <Button
+                        :disabled="customScrapeProcessing"
+                        @click="submitCustomScrape"
+                    >
+                        <Loader2
+                            v-if="customScrapeProcessing"
+                            class="mr-1 size-4 animate-spin"
+                        />
+                        Queue scrape
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
 
         <!--
             Bulk-edit budgets dialog. Per-field "Apply to all"

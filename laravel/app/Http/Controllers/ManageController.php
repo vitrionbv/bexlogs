@@ -591,10 +591,17 @@ class ManageController extends Controller
         }
 
         $overrides = $request->validate([
-            'start_time' => 'nullable|string',
-            'end_time' => 'nullable|string',
-            'max_pages' => 'nullable|integer|min:1|max:5000',
-            'max_duration_minutes' => 'nullable|integer|min:1|max:120',
+            'start_time' => 'nullable|date',
+            'end_time' => 'nullable|date',
+            'max_pages' => 'nullable|integer|min:1|max:1000000',
+            'max_duration_minutes' => 'nullable|integer|min:1|max:1440',
+            // Per-job overrides for the worker's stall/retry safety nets.
+            // These live on `params` (not on the Subscription table) so the
+            // operator can disable them for a one-off historical backfill
+            // without permanently weakening the auto-scrape path.
+            'token_echo_max_attempts' => 'nullable|integer|min:1|max:1000',
+            'early_stop_duplicate_pages' => 'nullable|integer|min:1|max:1000000',
+            'early_stop_min_duplicates' => 'nullable|integer|min:1|max:1000000000',
         ]);
 
         // Application-level concurrency gate. The Postgres partial unique
