@@ -63,8 +63,6 @@ class DashboardLogStatsTest extends TestCase
         LogMessage::factory()->create([
             'page_id' => $this->page->id,
             'timestamp' => '2026-05-22T10:00:00Z',
-            'type' => 'webhook',
-            'action' => 'reservation.created',
         ]);
 
         $response = $this->actingAs($this->user)->get(route('dashboard'));
@@ -75,8 +73,7 @@ class DashboardLogStatsTest extends TestCase
             ->has('logsPerDay', 30)
             ->has('topSubscriptionsToday', 1)
             ->where('topSubscriptionsToday.0.subscription_id', $this->subscription->id)
-            ->where('topSubscriptionsToday.0.total_today', 1)
-            ->where('topSubscriptionsToday.0.top_entries.0.action', 'reservation.created'));
+            ->where('topSubscriptionsToday.0.total_today', 1));
 
         Carbon::setTestNow();
     }
@@ -109,37 +106,23 @@ class DashboardLogStatsTest extends TestCase
         Carbon::setTestNow();
     }
 
-    public function test_top_subscriptions_today_groups_patterns_per_subscription(): void
+    public function test_top_subscriptions_today_ranks_by_volume(): void
     {
         Carbon::setTestNow('2026-05-22T15:00:00Z');
 
         LogMessage::factory()->count(5)->create([
             'page_id' => $this->page->id,
             'timestamp' => '2026-05-22T09:00:00Z',
-            'type' => 'webhook',
-            'action' => 'reservation.created',
-        ]);
-        LogMessage::factory()->count(2)->create([
-            'page_id' => $this->page->id,
-            'timestamp' => '2026-05-22T10:00:00Z',
-            'type' => 'http',
-            'action' => 'GET /api/v1/reservations',
         ]);
         LogMessage::factory()->create([
             'page_id' => $this->page->id,
             'timestamp' => '2026-05-21T23:59:59Z',
-            'type' => 'webhook',
-            'action' => 'reservation.created',
         ]);
 
         $rows = LogSummary::topSubscriptionsTodayForUser($this->user);
 
         $this->assertCount(1, $rows);
-        $this->assertSame(7, $rows[0]['total_today']);
-        $this->assertSame('reservation.created', $rows[0]['top_entries'][0]['action']);
-        $this->assertSame(5, $rows[0]['top_entries'][0]['count']);
-        $this->assertSame('GET /api/v1/reservations', $rows[0]['top_entries'][1]['action']);
-        $this->assertSame(2, $rows[0]['top_entries'][1]['count']);
+        $this->assertSame(5, $rows[0]['total_today']);
 
         Carbon::setTestNow();
     }

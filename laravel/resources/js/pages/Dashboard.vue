@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Head, Link } from '@inertiajs/vue3';
+import { Head, Link, router } from '@inertiajs/vue3';
 import {
     Activity,
     AlertTriangle,
@@ -19,6 +19,8 @@ import {
     TrendingUp,
 } from 'lucide-vue-next';
 import {
+    BarController,
+    BarElement,
     CategoryScale,
     Chart,
     type ChartData,
@@ -29,7 +31,7 @@ import {
     PointElement,
     Tooltip as ChartTooltip,
 } from 'chart.js';
-import { Line } from 'vue-chartjs';
+import { Bar, Line } from 'vue-chartjs';
 import { computed, defineComponent, h, ref } from 'vue';
 import type { Component } from 'vue';
 import { Badge } from '@/components/ui/badge';
@@ -45,10 +47,12 @@ import { useChannel } from '@/composables/useRealtime';
 
 Chart.register(
     LineController,
+    BarController,
     CategoryScale,
     LinearScale,
     LineElement,
     PointElement,
+    BarElement,
     ChartTooltip,
     Legend,
 );
@@ -58,18 +62,11 @@ type LogDayPoint = {
     count: number;
 };
 
-type TopLogEntry = {
-    type: string;
-    action: string;
-    count: number;
-};
-
 type TopSubscriptionToday = {
     subscription_id: string;
     subscription_name: string;
     page_id: number;
     total_today: number;
-    top_entries: TopLogEntry[];
 };
 
 type DashSummary = {
@@ -293,10 +290,66 @@ const logsPerDayChartData = computed<ChartData<'line'>>(() => ({
 }));
 
 const logsTodayTotal = computed(() =>
-    props.logsPerDay.length > 0
-        ? (props.logsPerDay[props.logsPerDay.length - 1]?.count ?? 0)
-        : 0,
+    props.topSubscriptionsToday.reduce((sum, sub) => sum + sub.total_today, 0),
 );
+
+const subscriptionsTodayChartHeight = computed(() =>
+    Math.max(160, props.topSubscriptionsToday.length * 36),
+);
+
+const subscriptionsTodayChartData = computed<ChartData<'bar'>>(() => ({
+    labels: props.topSubscriptionsToday.map((sub) => sub.subscription_name),
+    datasets: [
+        {
+            label: 'Log entries today',
+            data: props.topSubscriptionsToday.map((sub) => sub.total_today),
+            backgroundColor: '#6366f1',
+            borderRadius: 4,
+            maxBarThickness: 28,
+        },
+    ],
+}));
+
+const subscriptionsTodayChartOptions = {
+    indexAxis: 'y' as const,
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+        legend: { display: false },
+        tooltip: {
+            callbacks: {
+                label: (ctx: { parsed: { x: number | null } }) =>
+                    `${(ctx.parsed.x ?? 0).toLocaleString()} entries`,
+            },
+        },
+    },
+    scales: {
+        x: {
+            beginAtZero: true,
+            grid: { display: false },
+            ticks: {
+                callback: (value: string | number) => Number(value).toLocaleString(),
+            },
+        },
+        y: {
+            grid: { display: false },
+            ticks: {
+                autoSkip: false,
+            },
+        },
+    },
+    onClick: (_event: unknown, elements: { index: number }[]) => {
+        const index = elements[0]?.index;
+        if (index === undefined) {
+            return;
+        }
+
+        const sub = props.topSubscriptionsToday[index];
+        if (sub) {
+            router.visit(`/logs/${sub.page_id}`);
+        }
+    },
+};
 
 const StatCard = defineComponent({
     name: 'StatCard',
@@ -421,9 +474,9 @@ const StatCard = defineComponent({
                         </CardTitle>
                         <CardDescription>
                             {{ logsTodayTotal.toLocaleString() }} entries today across
-                            {{ topSubscriptionsToday.length }} active subscription<span
+                            {{ topSubscriptionsToday.length }} subscription<span
                                 v-if="topSubscriptionsToday.length !== 1"
-                            >s</span>.
+                            >s</span>. Click a bar to open its log feed.
                         </CardDescription>
                     </CardHeader>
                     <CardContent>
@@ -433,53 +486,14 @@ const StatCard = defineComponent({
                         >
                             No logs ingested yet today.
                         </p>
-                        <div v-else class="space-y-4">
-                            <div
-                                v-for="sub in topSubscriptionsToday"
-                                :key="sub.subscription_id"
-                                class="border-border rounded-lg border p-3"
-                            >
-                                <div class="mb-2 flex items-start justify-between gap-2">
-                                    <div class="min-w-0">
-                                        <Link
-                                            :href="`/logs/${sub.page_id}`"
-                                            class="hover:text-primary truncate text-sm font-medium"
-                                        >
-                                            {{ sub.subscription_name }}
-                                        </Link>
-                                        <p class="text-muted-foreground text-xs tabular-nums">
-                                            {{ sub.total_today.toLocaleString() }} entries today
-                                        </p>
-                                    </div>
-                                    <Button as-child variant="ghost" size="sm" class="shrink-0">
-                                        <Link :href="`/subscriptions/${sub.subscription_id}/insights`">
-                                            Insights
-                                        </Link>
-                                    </Button>
-                                </div>
-                                <div
-                                    v-if="sub.top_entries.length === 0"
-                                    class="text-muted-foreground text-xs"
-                                >
-                                    No patterns to show.
-                                </div>
-                                <ol v-else class="space-y-1">
-                                    <li
-                                        v-for="(entry, idx) in sub.top_entries"
-                                        :key="`${entry.type}-${entry.action}-${idx}`"
-                                        class="flex items-center justify-between gap-2 text-xs"
-                                    >
-                                        <span class="min-w-0 truncate">
-                                            <span class="text-muted-foreground">{{ entry.type }}</span>
-                                            <span class="text-muted-foreground mx-1">·</span>
-                                            <span>{{ entry.action || '(no action)' }}</span>
-                                        </span>
-                                        <span class="text-muted-foreground shrink-0 tabular-nums">
-                                            {{ entry.count.toLocaleString() }}
-                                        </span>
-                                    </li>
-                                </ol>
-                            </div>
+                        <div
+                            v-else
+                            :style="{ height: `${subscriptionsTodayChartHeight}px` }"
+                        >
+                            <Bar
+                                :data="subscriptionsTodayChartData"
+                                :options="subscriptionsTodayChartOptions"
+                            />
                         </div>
                     </CardContent>
                 </Card>
