@@ -3,6 +3,7 @@ import { Head, Link } from '@inertiajs/vue3';
 import {
     Activity,
     AlertTriangle,
+    BarChart3,
     CheckCircle2,
     Cookie,
     Cpu,
@@ -15,7 +16,20 @@ import {
     Plug,
     Plus,
     Server,
+    TrendingUp,
 } from 'lucide-vue-next';
+import {
+    CategoryScale,
+    Chart,
+    type ChartData,
+    Legend,
+    LinearScale,
+    LineController,
+    LineElement,
+    PointElement,
+    Tooltip as ChartTooltip,
+} from 'chart.js';
+import { Line } from 'vue-chartjs';
 import { computed, defineComponent, h, ref } from 'vue';
 import type { Component } from 'vue';
 import { Badge } from '@/components/ui/badge';
@@ -28,6 +42,35 @@ import {
     CardTitle,
 } from '@/components/ui/card';
 import { useChannel } from '@/composables/useRealtime';
+
+Chart.register(
+    LineController,
+    CategoryScale,
+    LinearScale,
+    LineElement,
+    PointElement,
+    ChartTooltip,
+    Legend,
+);
+
+type LogDayPoint = {
+    day: string;
+    count: number;
+};
+
+type TopLogEntry = {
+    type: string;
+    action: string;
+    count: number;
+};
+
+type TopSubscriptionToday = {
+    subscription_id: string;
+    subscription_name: string;
+    page_id: number;
+    total_today: number;
+    top_entries: TopLogEntry[];
+};
 
 type DashSummary = {
     counts: { queued: number; running: number; completed_24h: number; failed: number };
@@ -97,6 +140,8 @@ const props = defineProps<{
     pages: PageRow[];
     serverStats: ServerStats | null;
     driftSignals: DriftSignal[];
+    logsPerDay: LogDayPoint[];
+    topSubscriptionsToday: TopSubscriptionToday[];
 }>();
 
 const liveStats = ref<ServerStats | null>(props.serverStats);
@@ -206,6 +251,53 @@ const healthBadge = computed(() => {
     return { variant: 'success' as const, label: 'Healthy' };
 });
 
+const lineChartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+        legend: { display: false },
+    },
+    scales: {
+        x: {
+            grid: { display: false },
+            ticks: { maxTicksLimit: 10 },
+        },
+        y: { beginAtZero: true },
+    },
+};
+
+function formatDayLabel(isoDay: string): string {
+    const d = new Date(`${isoDay}T00:00:00Z`);
+
+    if (Number.isNaN(d.getTime())) {
+        return isoDay;
+    }
+
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+const logsPerDayChartData = computed<ChartData<'line'>>(() => ({
+    labels: props.logsPerDay.map((p) => formatDayLabel(p.day)),
+    datasets: [
+        {
+            label: 'Log entries',
+            data: props.logsPerDay.map((p) => p.count),
+            borderColor: '#6366f1',
+            backgroundColor: 'rgba(99, 102, 241, 0.12)',
+            fill: true,
+            tension: 0.25,
+            pointRadius: 2,
+            pointHoverRadius: 4,
+        },
+    ],
+}));
+
+const logsTodayTotal = computed(() =>
+    props.logsPerDay.length > 0
+        ? (props.logsPerDay[props.logsPerDay.length - 1]?.count ?? 0)
+        : 0,
+);
+
 const StatCard = defineComponent({
     name: 'StatCard',
     props: {
@@ -298,6 +390,99 @@ const StatCard = defineComponent({
                     :icon="Cookie"
                     href="/logs"
                 />
+            </section>
+
+            <section class="grid gap-4 lg:grid-cols-5">
+                <Card class="lg:col-span-3">
+                    <CardHeader>
+                        <CardTitle class="flex items-center gap-2">
+                            <TrendingUp class="size-4" />
+                            Log volume
+                        </CardTitle>
+                        <CardDescription>
+                            Log entries ingested per day over the last 30 days (UTC).
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        <div v-if="logsPerDay.length === 0" class="text-muted-foreground text-sm">
+                            No log data yet.
+                        </div>
+                        <div v-else class="h-64">
+                            <Line :data="logsPerDayChartData" :options="lineChartOptions" />
+                        </div>
+                    </CardContent>
+                </Card>
+
+                <Card class="lg:col-span-2">
+                    <CardHeader>
+                        <CardTitle class="flex items-center gap-2">
+                            <BarChart3 class="size-4" />
+                            Today by subscription
+                        </CardTitle>
+                        <CardDescription>
+                            {{ logsTodayTotal.toLocaleString() }} entries today across
+                            {{ topSubscriptionsToday.length }} active subscription<span
+                                v-if="topSubscriptionsToday.length !== 1"
+                            >s</span>.
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        <p
+                            v-if="topSubscriptionsToday.length === 0"
+                            class="text-muted-foreground text-sm"
+                        >
+                            No logs ingested yet today.
+                        </p>
+                        <div v-else class="space-y-4">
+                            <div
+                                v-for="sub in topSubscriptionsToday"
+                                :key="sub.subscription_id"
+                                class="border-border rounded-lg border p-3"
+                            >
+                                <div class="mb-2 flex items-start justify-between gap-2">
+                                    <div class="min-w-0">
+                                        <Link
+                                            :href="`/logs/${sub.page_id}`"
+                                            class="hover:text-primary truncate text-sm font-medium"
+                                        >
+                                            {{ sub.subscription_name }}
+                                        </Link>
+                                        <p class="text-muted-foreground text-xs tabular-nums">
+                                            {{ sub.total_today.toLocaleString() }} entries today
+                                        </p>
+                                    </div>
+                                    <Button as-child variant="ghost" size="sm" class="shrink-0">
+                                        <Link :href="`/subscriptions/${sub.subscription_id}/insights`">
+                                            Insights
+                                        </Link>
+                                    </Button>
+                                </div>
+                                <div
+                                    v-if="sub.top_entries.length === 0"
+                                    class="text-muted-foreground text-xs"
+                                >
+                                    No patterns to show.
+                                </div>
+                                <ol v-else class="space-y-1">
+                                    <li
+                                        v-for="(entry, idx) in sub.top_entries"
+                                        :key="`${entry.type}-${entry.action}-${idx}`"
+                                        class="flex items-center justify-between gap-2 text-xs"
+                                    >
+                                        <span class="min-w-0 truncate">
+                                            <span class="text-muted-foreground">{{ entry.type }}</span>
+                                            <span class="text-muted-foreground mx-1">·</span>
+                                            <span>{{ entry.action || '(no action)' }}</span>
+                                        </span>
+                                        <span class="text-muted-foreground shrink-0 tabular-nums">
+                                            {{ entry.count.toLocaleString() }}
+                                        </span>
+                                    </li>
+                                </ol>
+                            </div>
+                        </div>
+                    </CardContent>
+                </Card>
             </section>
 
             <section v-if="liveStats">

@@ -7,6 +7,7 @@ use App\Models\Page as LogPage;
 use App\Services\AnomalyDetector;
 use App\Services\ServerMetrics;
 use App\Support\JobSummary;
+use App\Support\LogSummary;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -74,6 +75,8 @@ class DashboardController extends Controller
             'pages' => $pages,
             'serverStats' => $serverStats,
             'driftSignals' => $driftSignals,
+            'logsPerDay' => LogSummary::logsPerDayForUser($user),
+            'topSubscriptionsToday' => LogSummary::topSubscriptionsTodayForUser($user),
         ]);
     }
 }
