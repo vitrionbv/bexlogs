@@ -19,7 +19,7 @@ Schedule::command('scrape:enqueue')
 // container was OOM-killed or the stack got redeployed). One indexed
 // query per tick — cheap, and it gets stuck rows back into the flow
 // fast so scrape:enqueue can put fresh queued jobs in their place.
-Schedule::command('scrape:reap-stale --minutes=10')
+Schedule::command('scrape:reap-stale --minutes=30')
     ->everyMinute()
     ->withoutOverlapping();
 

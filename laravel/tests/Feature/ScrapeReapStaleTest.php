@@ -84,7 +84,7 @@ class ScrapeReapStaleTest extends TestCase
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
             'started_at' => now()->subMinutes(15),
-            'last_heartbeat_at' => now()->subMinutes(11),
+            'last_heartbeat_at' => now()->subMinutes(31),
         ]);
 
         $this->artisan('scrape:reap-stale')
@@ -95,7 +95,7 @@ class ScrapeReapStaleTest extends TestCase
         $this->assertSame(ScrapeJob::STATUS_FAILED, $job->status);
         $this->assertNotNull($job->completed_at);
         $this->assertSame(
-            'Worker did not send a heartbeat for over 10 minutes; job reaped as stale.',
+            'Worker did not send a heartbeat for over 30 minutes; job reaped as stale.',
             $job->error,
         );
         $this->assertSame('worker_reaped', $job->stats['stop_reason'] ?? null);
@@ -116,7 +116,7 @@ class ScrapeReapStaleTest extends TestCase
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
             'started_at' => now()->subMinutes(15),
-            'last_heartbeat_at' => now()->subMinutes(11),
+            'last_heartbeat_at' => now()->subMinutes(31),
             'stats' => [
                 'rows_received' => 50,
                 'rows_inserted' => 48,
@@ -165,7 +165,7 @@ class ScrapeReapStaleTest extends TestCase
 
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
-            'started_at' => now()->subMinutes(11),
+            'started_at' => now()->subMinutes(31),
             'last_heartbeat_at' => null,
         ]);
 
@@ -239,7 +239,7 @@ class ScrapeReapStaleTest extends TestCase
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
             'started_at' => now()->subMinutes(15),
-            'last_heartbeat_at' => now()->subMinutes(11),
+            'last_heartbeat_at' => now()->subMinutes(31),
         ]);
 
         $this->artisan('scrape:reap-stale')->assertSuccessful();
@@ -288,7 +288,7 @@ class ScrapeReapStaleTest extends TestCase
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
             'started_at' => now()->subMinutes(15),
-            'last_heartbeat_at' => now()->subMinutes(11),
+            'last_heartbeat_at' => now()->subMinutes(31),
         ]);
 
         $this->artisan('scrape:reap-stale')->assertSuccessful();
@@ -315,7 +315,7 @@ class ScrapeReapStaleTest extends TestCase
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
             'started_at' => now()->subMinutes(15),
-            'last_heartbeat_at' => now()->subMinutes(11),
+            'last_heartbeat_at' => now()->subMinutes(31),
             'stats' => ['rows_inserted' => 42, 'batches' => 3],
         ]);
 
@@ -362,7 +362,7 @@ class ScrapeReapStaleTest extends TestCase
         $job = $this->makeJob([
             'status' => ScrapeJob::STATUS_RUNNING,
             'started_at' => now()->subMinutes(15),
-            'last_heartbeat_at' => now()->subMinutes(11),
+            'last_heartbeat_at' => now()->subMinutes(31),
             'stats' => ['rows_inserted' => 7, 'batches' => 1],
         ]);
 
