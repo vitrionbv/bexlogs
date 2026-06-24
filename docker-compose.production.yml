@@ -302,9 +302,11 @@ services:
     # future leak — Chromium subprocess crash that tini somehow
     # misses, a runaway shell-out, anything — hits a hard cgroup
     # wall instead of OOMing the host's PID table. RSS is similarly
-    # bounded: Chromium + Playwright + node typically share
-    # ~600–900MB; 2g is generous and keeps the blast radius
-    # bounded if a page leaks DOM nodes / event listeners.
+    # bounded: each concurrent Playwright job runs its own Chromium
+    # (~300–500MB RSS in the cgroup). Six heavy jobs at once OOM'd
+    # the 2g cap on 2026-05-22; keep MAX_CONCURRENT_SCRAPES at 4
+    # and mem_limit at 3g so two EuroParcs backfills can coexist
+    # with a couple of scheduled scrapes without killing the worker.
     #
     # Operator note: the live PID count for this container is
     # readable inside it at `/sys/fs/cgroup/pids.current`, and the
@@ -313,7 +315,7 @@ services:
     # 0.6 to catch a creeping leak before it bites. Not wiring that
     # here — just leaving the breadcrumb.
     pids_limit: 1024
-    mem_limit: 2g
+    mem_limit: 3g
     depends_on:
       app:
         condition: service_healthy
@@ -321,7 +323,7 @@ services:
       LARAVEL_BASE_URL: http://app:80
       WORKER_API_TOKEN: ${WORKER_API_TOKEN:?WORKER_API_TOKEN must be set}
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-5000}
-      MAX_CONCURRENT_SCRAPES: ${MAX_CONCURRENT_SCRAPES:-8}
+      MAX_CONCURRENT_SCRAPES: ${MAX_CONCURRENT_SCRAPES:-4}
       MAX_PAGES_PER_JOB: ${MAX_PAGES_PER_JOB:-2000}
       BATCH_SIZE: ${BATCH_SIZE:-100}
       HEADLESS: "true"

@@ -3,6 +3,8 @@
 Self-hosted log explorer for the BookingExperts developer "Logboeken bekijken"
 page. Replaces the previous Electron desktop app.
 
+**Full documentation:** [`docs/README.md`](docs/README.md) — local setup, deployment, scraping pipeline, operations, and design decisions.
+
 ```
 ┌──────────────────────┐    pairing token + cookies     ┌────────────────────────┐
 │ Browser extension    │  ───────────────────────────▶ │ Laravel + PostgreSQL    │
@@ -134,7 +136,7 @@ LARAVEL_BASE_URL=http://localhost:8000
 WORKER_API_TOKEN=  # must match laravel/.env
 
 # How often each in-flight job pings /api/worker/jobs/{id}/heartbeat (ms).
-# Must stay below the `scrape:reap-stale --minutes` threshold (default 3 min).
-# See deploy/README.md → "Scrape job liveness — heartbeats and the reaper".
+# Must stay well below the `scrape:reap-stale --minutes` threshold (default 30 min).
+# See docs/scraping-pipeline.md → "Heartbeats and reaper".
 HEARTBEAT_INTERVAL_MS=30000
 ```
