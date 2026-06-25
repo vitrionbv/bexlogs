@@ -155,6 +155,8 @@ Optional:
 |----------|---------|
 | `HETZNER_S3_*` | Cold log archive |
 | `OPENROUTER_API_KEY` | AI agent |
+| `SENTRY_LARAVEL_DSN` | Error/performance monitoring (self-hosted Sentry) |
+| `SENTRY_DSN` | Scraper worker errors (self-hosted Sentry; job failures still go to Laravel `/fail`) |
 | `APP_IP_ALLOWLIST` | Restrict web/API by IP |
 | `NOTIFY_WEBHOOK` | CI failure notifications |
 
@@ -174,6 +176,9 @@ docker exec bexlogs-app-1 php artisan scrape:enqueue
 
 # Scraper polling
 docker logs --tail 20 bexlogs-scraper-1
+
+# Sentry verify (requires SENTRY_DSN on the scraper container)
+docker exec bexlogs-scraper-1 npm run sentry:verify
 
 # Scheduler ticking
 docker logs --tail 20 bexlogs-scheduler-1 | grep scrape

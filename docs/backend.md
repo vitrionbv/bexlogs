@@ -154,3 +154,11 @@ OpenSpout-based export for log data. Triggered from UI, processed via queue for 
 - Run: `composer test` (includes Pint lint check).
 
 CI uses PHP 8.5, Postgres 18, Redis 7.
+
+---
+
+## Error monitoring (Sentry)
+
+Optional. Set `SENTRY_LARAVEL_DSN` in `.env` to report exceptions and performance traces to the self-hosted Sentry instance (`sentry-backend.vitrion.dev`). Wired via `Sentry\Laravel\Integration` in `bootstrap/app.php`; the SDK is a no-op when the DSN is empty.
+
+Verify locally: `php artisan sentry:test`.

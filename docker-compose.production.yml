@@ -328,6 +328,7 @@ services:
       BATCH_SIZE: ${BATCH_SIZE:-100}
       HEADLESS: "true"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SENTRY_DSN: ${SENTRY_DSN:-}
     networks:
       - bexlogs
     # Process-liveness check. The scraper has no HTTP endpoint to

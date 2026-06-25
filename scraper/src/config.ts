@@ -54,6 +54,13 @@ const envSchema = z.object({
         .union([z.literal('true'), z.literal('false'), z.boolean()])
         .transform((v) => (typeof v === 'boolean' ? v : v === 'true'))
         .default(false),
+    // Self-hosted Sentry DSN for worker error reporting. When unset,
+    // src/instrument.ts skips Sentry.init (safe for local dev). Read
+    // directly from process.env at startup before this schema is parsed.
+    SENTRY_DSN: z
+        .union([z.string().url(), z.literal('')])
+        .optional()
+        .transform((v) => (v && v.length > 0 ? v : undefined)),
 });
 
 export const config = envSchema.parse(process.env);

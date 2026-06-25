@@ -11,13 +11,15 @@
         "scrape:once": "tsx src/cli/scrapeOnce.ts",
         "lint": "eslint src --ext .ts",
         "test": "tsx scripts/parse-fixtures.ts && tsx scripts/heartbeat-ticker-test.ts && tsx scripts/load-more-retry-test.ts && tsx scripts/load-more-signin-retry-test.ts && tsx scripts/token-echo-retry-test.ts && tsx scripts/initial-page-retry-test.ts && tsx scripts/launch-retry-test.ts",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "sentry:verify": "tsx scripts/sentry-verify.ts"
     },
     "dependencies": {
+        "@sentry/node": "^10.60.0",
+        "dotenv": "^16.4.7",
         "playwright": "^1.59.1",
         "undici": "^7.16.0",
-        "zod": "^3.24.1",
-        "dotenv": "^16.4.7"
+        "zod": "^3.24.1"
     },
     "devDependencies": {
         "@types/node": "^22.13.5",

@@ -229,6 +229,8 @@ These diverge when pagination walks beyond the requested filter window (BEX toke
 
 Six concurrent Chromium instances previously OOM-killed the 2g cgroup. See [Design decisions](./design-decisions.md).
 
+When `SENTRY_DSN` is set, the scraper reports worker-loop and fatal errors to self-hosted Sentry (`src/instrument.ts`). Scrape job failures are still persisted via `POST /api/worker/jobs/{id}/fail` — they are not double-reported to Sentry. Verify with `npm run sentry:verify` inside the scraper container.
+
 ---
 
 ## Manual backfill (production tinker pattern)

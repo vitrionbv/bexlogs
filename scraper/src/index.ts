@@ -1,3 +1,6 @@
+import './instrument.js';
+
+import * as Sentry from '@sentry/node';
 import { config } from './config.js';
 import { fetchNextJob } from './api.js';
 import { runScrapeJob } from './scrape.js';
@@ -37,6 +40,7 @@ async function loop(): Promise<void> {
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             log.error('worker loop error', { message });
+            Sentry.captureException(err);
             await sleep(config.POLL_INTERVAL_MS);
         }
     }
@@ -60,8 +64,10 @@ function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
 }
 
-loop().catch((err) => {
+loop().catch(async (err) => {
     const message = err instanceof Error ? err.message : String(err);
     log.error('fatal worker error', { message });
+    Sentry.captureException(err);
+    await Sentry.close(2000);
     process.exit(1);
 });
