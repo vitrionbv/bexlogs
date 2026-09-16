@@ -11,6 +11,10 @@
 !.env.example
 !.env.production.example
 
+# MCP local tokens (never commit)
+scripts/sentry-mcp.env
+scripts/github-mcp.env
+
 # Node
 node_modules/
 npm-debug.log

@@ -1,11 +1,12 @@
 {
   "mcpServers": {
     "sentry": {
-      "command": "sh",
-      "args": [
-        "-lc",
-        "exec npx @sentry/mcp-server@latest --access-token=\"$SENTRY_BACKEND_ACCESS_TOKEN\" --host=sentry-backend.vitrion.dev --disable-skills=seer"
-      ]
+      "command": "bash",
+      "args": ["${workspaceFolder}/scripts/run_sentry_mcp.sh"]
+    },
+    "github": {
+      "command": "bash",
+      "args": ["${workspaceFolder}/scripts/run_github_mcp.sh"]
     }
   }
 }
